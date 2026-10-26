@@ -1,0 +1,20 @@
+# Settings for setup.sh. Copy to setup.conf next to setup.sh.
+
+# Everything (runner, Bulava, claude, codex, tmux, git, the project's Docker stack) runs as the user
+# who owns this folder and runs `sudo ./setup.sh` from it; there is nothing to set. Setup creates no
+# users and changes nobody's sudo. The isolation boundary is the VM: the workers run as this user
+# and can read the runner's tokens.
+
+# Pinned tool versions. Change them here, re-run setup: the old version is replaced.
+CLAUDE_CODE_VERSION=2.1.295
+CODEX_VERSION=0.162.0
+CHROME_DEVTOOLS_MCP_VERSION=1.10.1   # the version Bulava's automation-mcp.json pins
+
+# Bulava engine (engine/SERVER.md): the public repository, installed to /opt/bulava.
+#   BULAVA_SOURCE  a git URL, or a directory here. Empty BULAVA_SOURCE skips the engine phases.
+#   BULAVA_REF     a branch the server follows, a tag, or a full commit to stay on.
+#                  With a branch, run `sudo ./setup.sh` between tasks to take its newest commit (the
+#                  engine and its install.sh); it refuses to swap the engine while a task is running.
+# `factory` is the branch where Bulava puts server fixes first (they reach main later).
+BULAVA_SOURCE=https://github.com/Stepanokdev/bulava
+BULAVA_REF=factory

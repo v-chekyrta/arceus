@@ -1,0 +1,77 @@
+// Ship the runner's and the engine's event streams to Loki. One line = one event. The label
+// `event` is the event type in both (the runner writes it as "event", Bulava as "kind"), `source`
+// says whose it is; task_id travels as structured metadata, not as a label.
+
+local.file_match "runner" {
+  path_targets = [{"__path__" = "/arceus-data/events.jsonl", "source" = "runner"}]
+}
+
+local.file_match "bulava" {
+  path_targets = [{"__path__" = "/bulava-state/tasks/*/events.jsonl", "source" = "bulava"}]
+}
+
+loki.source.file "runner" {
+  targets    = local.file_match.runner.targets
+  forward_to = [loki.process.runner.receiver]
+}
+
+loki.source.file "bulava" {
+  targets    = local.file_match.bulava.targets
+  forward_to = [loki.process.bulava.receiver]
+}
+
+loki.process "runner" {
+  stage.json {
+    expressions = {event = "event", task_id = "task_id", ts = "ts", state = "state", result = "result"}
+  }
+  // The level is set from the event type, so Grafana does not guess it from words in a ticket title.
+  // engine_step carries the engine's own step state: failed is an error, a wait or a retry a warning.
+  stage.template {
+    source   = "level"
+    template = "{{ if or (eq .event \"task_failed\") (eq .event \"tick_failed\") (eq .event \"reconcile_failed\") (eq .event \"review_poll_failed\") (and (eq .event \"engine_step\") (eq .state \"failed\")) (and (eq .event \"engine_call_finished\") (eq .result \"error\")) }}error{{ else if or (eq .event \"trigger_rejected\") (eq .event \"notify_pending\") (eq .event \"service_paused\") (eq .event \"request_failed\") (eq .event \"agent_quiet\") (eq .event \"progress_unreadable\") (and (eq .event \"engine_step\") (or (eq .state \"waiting\") (eq .state \"parked\") (eq .state \"retrying\") (eq .state \"unavailable\"))) }}warning{{ else }}info{{ end }}"
+  }
+  stage.labels {
+    values = {event = "", level = ""}
+  }
+  stage.structured_metadata {
+    values = {task_id = ""}
+  }
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+  stage.label_drop {
+    values = ["filename"]
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.process "bulava" {
+  stage.json {
+    expressions = {event = "kind", task_id = "task_id", ts = "at", state = "state"}
+  }
+  stage.template {
+    source   = "level"
+    template = "{{ if eq .state \"failed\" }}error{{ else if or (eq .state \"needs_input\") (eq .state \"blocked\") }}warning{{ else }}info{{ end }}"
+  }
+  stage.labels {
+    values = {event = "", level = ""}
+  }
+  stage.structured_metadata {
+    values = {task_id = ""}
+  }
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+  stage.label_drop {
+    values = ["filename"]
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://127.0.0.1:3100/loki/api/v1/push"
+  }
+}
