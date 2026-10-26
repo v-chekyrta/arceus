@@ -1,0 +1,639 @@
+"""SQLite state of the runner, with numbered migrations from the first version."""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import json
+import os
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
+# Append only: never edit a migration that has shipped, add the next one.
+MIGRATIONS: list[str] = [
+    # 1: who triggered which issue, and what the runner decided about it.
+    """
+    CREATE TABLE trigger_decisions (
+        issue_key        TEXT NOT NULL,
+        tag_activity_id  TEXT NOT NULL,
+        author           TEXT NOT NULL,
+        accepted         INTEGER NOT NULL CHECK (accepted IN (0, 1)),
+        tagged_at_ms     INTEGER NOT NULL,
+        announced        INTEGER NOT NULL DEFAULT 0 CHECK (announced IN (0, 1)),
+        decided_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (issue_key, tag_activity_id)
+    );
+    """,
+    # 2: tasks the runner took, and a journal of its external actions.
+    """
+    CREATE TABLE tasks (
+        task_id          TEXT PRIMARY KEY,
+        issue_db_id      TEXT NOT NULL,
+        state            TEXT NOT NULL,
+        summary          TEXT NOT NULL DEFAULT '',
+        tag_author       TEXT NOT NULL,
+        repo             TEXT NOT NULL,
+        repo_path        TEXT NOT NULL,
+        branch           TEXT NOT NULL,
+        base_branch      TEXT NOT NULL,
+        question_id      TEXT,
+        question_at_ms   INTEGER,
+        reason           TEXT,
+        mr_urls          TEXT NOT NULL DEFAULT '[]',
+        attempt_started  TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE INDEX tasks_state ON tasks (state);
+    CREATE TABLE actions (
+        idem_key         TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        kind             TEXT NOT NULL,
+        status           TEXT NOT NULL CHECK (status IN ('intent', 'done')),
+        result           TEXT,
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    """,
+]
+
+MIGRATIONS.append(
+    # 3: the other repositories of the group a task's agent may change, next to the one it starts in.
+    """
+    ALTER TABLE tasks ADD COLUMN extra_repos TEXT NOT NULL DEFAULT '[]';
+    """
+)
+
+MIGRATIONS.append(
+    # 4: the review loop after the MR. Every MR of a task, every signal from it (a review note, a
+    # failed pipeline, a conflict, a ticket comment) recorded once, and the batches sent to the agent.
+    """
+    CREATE TABLE task_mrs (
+        task_id          TEXT NOT NULL,
+        repo             TEXT NOT NULL,
+        project_id       INTEGER NOT NULL,
+        iid              INTEGER NOT NULL,
+        url              TEXT NOT NULL,
+        state            TEXT NOT NULL DEFAULT 'opened',
+        published_sha    TEXT NOT NULL,
+        handled_pipeline INTEGER,
+        handled_conflict TEXT,
+        PRIMARY KEY (task_id, repo)
+    );
+    CREATE TABLE signals (
+        id               TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        kind             TEXT NOT NULL CHECK (kind IN ('review', 'ci', 'conflict', 'ticket', 'moved')),
+        repo             TEXT,
+        discussion_id    TEXT,
+        author           TEXT NOT NULL,
+        body             TEXT NOT NULL,
+        seen_at          TEXT NOT NULL,
+        batch_id         TEXT,
+        replied          INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX signals_task ON signals (task_id, batch_id);
+    CREATE TABLE batches (
+        id               TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        source           TEXT NOT NULL,
+        author           TEXT NOT NULL,
+        text             TEXT NOT NULL,
+        ci_only          INTEGER NOT NULL,
+        created_at       TEXT NOT NULL,
+        sent_at          TEXT
+    );
+    ALTER TABLE tasks ADD COLUMN review_rounds INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE tasks ADD COLUMN ci_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE tasks ADD COLUMN published_at_ms INTEGER;
+    """
+)
+
+# Runner task states. Active ones hold the agent; the rest wait on people or are over.
+ACTIVE_STATES = ("claimed", "dispatched", "publishing")
+# security_hold: a text for the agent waits for a security reviewer (screening.py); nothing runs meanwhile.
+TASK_STATES = (*ACTIVE_STATES, "needs_input", "code_review", "security_hold", "failed", "done", "stopped")
+
+
+class AlreadyRunning(Exception):
+    pass
+
+
+class InstanceLock:
+    """One runner per state directory. Held for the whole life of the process."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = os.read(fd, 64).decode(errors="replace").strip()
+            os.close(fd)
+            raise AlreadyRunning(f"another runner holds {self.path} (pid {holder or '?'})") from None
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+
+@dataclass(frozen=True)
+class TriggerDecision:
+    issue_key: str
+    tag_activity_id: str
+    author: str
+    accepted: bool
+    announced: bool
+
+
+class Store:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA synchronous=FULL")
+        os.chmod(path, 0o600)
+        self.migrate()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    @property
+    def version(self) -> int:
+        return self.conn.execute("PRAGMA user_version").fetchone()[0]
+
+    def migrate(self) -> None:
+        current = self.version
+        if current > len(MIGRATIONS):
+            raise RuntimeError(f"{self.path} is schema v{current}, this runner knows only v{len(MIGRATIONS)}")
+        for n in range(current, len(MIGRATIONS)):
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                # executescript() would COMMIT first and break atomicity, so statements go one by one.
+                for stmt in _split(MIGRATIONS[n]):
+                    self.conn.execute(stmt)
+                self.conn.execute(f"PRAGMA user_version = {n + 1}")
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    def trigger_decision(self, issue_key: str, tag_activity_id: str) -> TriggerDecision | None:
+        row = self.conn.execute(
+            "SELECT * FROM trigger_decisions WHERE issue_key = ? AND tag_activity_id = ?",
+            (issue_key, tag_activity_id),
+        ).fetchone()
+        if not row:
+            return None
+        return TriggerDecision(row["issue_key"], row["tag_activity_id"], row["author"], bool(row["accepted"]),
+                               bool(row["announced"]))
+
+    def record_trigger(self, issue_key: str, tag_activity_id: str, author: str, accepted: bool,
+                       tagged_at_ms: int) -> TriggerDecision:
+        """Store the decision once and return what is stored (the first decision wins)."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO trigger_decisions (issue_key, tag_activity_id, author, accepted, tagged_at_ms)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (issue_key, tag_activity_id, author, int(accepted), tagged_at_ms),
+        )
+        stored = self.trigger_decision(issue_key, tag_activity_id)
+        assert stored is not None
+        return stored
+
+    def mark_announced(self, issue_key: str, tag_activity_id: str) -> None:
+        """The event for this decision is in events.jsonl. Until then it is announced again on every poll."""
+        self.conn.execute(
+            "UPDATE trigger_decisions SET announced = 1 WHERE issue_key = ? AND tag_activity_id = ?",
+            (issue_key, tag_activity_id),
+        )
+
+
+MIGRATIONS.append(
+    # 5: a failed task can be picked up again. The moment it failed bounds the comments that count.
+    """
+    ALTER TABLE tasks ADD COLUMN failed_at_ms INTEGER;
+    """
+)
+
+MIGRATIONS.append(
+    # 6: review rounds the agent answered without changing code. They have a budget of their own,
+    # so questions about the implementation do not use up the rounds that fix it.
+    """
+    ALTER TABLE tasks ADD COLUMN review_answers INTEGER NOT NULL DEFAULT 0;
+    """
+)
+
+MIGRATIONS.append(
+    # 7: how far the engine's step journal of a task's current attempt was written to events.jsonl
+    # (progress.py), so a restart goes on from there instead of writing the attempt's steps again.
+    """
+    CREATE TABLE progress_cursors (
+        task_id          TEXT PRIMARY KEY,
+        dispatch_id      TEXT NOT NULL,
+        last_ms          INTEGER NOT NULL,
+        at_last_ms       INTEGER NOT NULL
+    );
+    """
+)
+
+MIGRATIONS.append(
+    # 8: the security screen (screening.py). One verdict per exact text under the screen's policy
+    # version (a rejection applies everywhere), and the holds a reviewer decides: an approval is for
+    # that task only. Neither keeps the text itself; `author` of a hold is a JSON list of logins.
+    # A review batch keeps everyone whose words it carries, earlier notes of its threads included.
+    """
+    CREATE TABLE screenings (
+        digest           TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        kind             TEXT NOT NULL,
+        verdict          TEXT NOT NULL CHECK (verdict IN ('allow', 'review', 'block', 'rejected')),
+        categories       TEXT NOT NULL DEFAULT '[]',
+        reason           TEXT NOT NULL DEFAULT '',
+        model            TEXT NOT NULL DEFAULT '',
+        policy           TEXT NOT NULL,
+        screened_at      TEXT NOT NULL,
+        decided_by       TEXT,
+        decided_at       TEXT
+    );
+    CREATE TABLE security_holds (
+        task_id          TEXT NOT NULL,
+        digest           TEXT NOT NULL,
+        kind             TEXT NOT NULL,
+        author           TEXT NOT NULL,
+        resume_state     TEXT NOT NULL,
+        ref              TEXT,
+        status           TEXT NOT NULL CHECK (status IN ('open', 'allowed', 'rejected')),
+        held_at          TEXT NOT NULL,
+        decided_by       TEXT,
+        decided_at       TEXT,
+        PRIMARY KEY (task_id, digest)
+    );
+    ALTER TABLE batches ADD COLUMN authors TEXT NOT NULL DEFAULT '[]';
+    """
+)
+
+MIGRATIONS.append(
+    # 9: a person closing one MR of the task is a signal for the agent (take that repository's changes
+    # out), not the end of the task. SQLite cannot change a CHECK, so the table is rebuilt as it is.
+    """
+    CREATE TABLE signals_v9 (
+        id               TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        kind             TEXT NOT NULL CHECK (kind IN ('review', 'ci', 'conflict', 'ticket', 'moved', 'closed')),
+        repo             TEXT,
+        discussion_id    TEXT,
+        author           TEXT NOT NULL,
+        body             TEXT NOT NULL,
+        seen_at          TEXT NOT NULL,
+        batch_id         TEXT,
+        replied          INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO signals_v9 (id, task_id, kind, repo, discussion_id, author, body, seen_at, batch_id, replied)
+        SELECT id, task_id, kind, repo, discussion_id, author, body, seen_at, batch_id, replied FROM signals;
+    DROP TABLE signals;
+    ALTER TABLE signals_v9 RENAME TO signals;
+    CREATE INDEX signals_task ON signals (task_id, batch_id);
+    """
+)
+
+
+TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
+               "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
+               "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
+               "review_answers")
+
+
+@dataclass(frozen=True)
+class Task:
+    task_id: str
+    issue_db_id: str
+    state: str
+    summary: str
+    tag_author: str
+    repo: str
+    repo_path: str
+    branch: str
+    base_branch: str
+    question_id: str | None
+    question_at_ms: int | None
+    reason: str | None
+    mr_urls: str
+    attempt_started: str | None
+    extra_repos: str  # JSON list of paths below the group, e.g. ["acme-theme"]
+    review_rounds: int = 0  # review rounds after the first MR that ended in published code
+    ci_attempts: int = 0    # CI-only repairs in a row, reset when the pipeline passes
+    published_at_ms: int | None = None  # the MR comment, or the last `/continue`: later comments are review
+    failed_at_ms: int | None = None     # when the task failed: a later `/continue` from a person resumes it
+    review_answers: int = 0  # review rounds answered without a code change
+
+    @property
+    def active(self) -> bool:
+        return self.state in ACTIVE_STATES
+
+
+class TaskStore(Store):
+    """Tasks and the action journal, on top of the trigger decisions."""
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """A state change and the intents it implies land together or not at all."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.conn.execute("COMMIT")
+
+    def task(self, task_id: str) -> Task | None:
+        row = self.conn.execute(f"SELECT {', '.join(TASK_FIELDS)} FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        return Task(*row) if row else None
+
+    def tasks(self, *states: str) -> list[Task]:
+        q = f"SELECT {', '.join(TASK_FIELDS)} FROM tasks"
+        args: tuple = ()
+        if states:
+            q += f" WHERE state IN ({', '.join('?' * len(states))})"
+            args = states
+        return [Task(*r) for r in self.conn.execute(q + " ORDER BY created_at", args).fetchall()]
+
+    def create_task(self, **fields) -> Task:
+        unknown = set(fields) - set(TASK_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown task fields {unknown}")
+        cols = ", ".join(fields)
+        self.conn.execute(f"INSERT OR IGNORE INTO tasks ({cols}) VALUES ({', '.join('?' * len(fields))})",
+                          tuple(fields.values()))
+        task = self.task(fields["task_id"])
+        assert task is not None
+        return task
+
+    def update_task(self, task_id: str, **fields) -> Task:
+        unknown = set(fields) - set(TASK_FIELDS)
+        if unknown or "task_id" in fields:
+            raise ValueError(f"cannot update {unknown or 'task_id'}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(
+            f"UPDATE tasks SET {sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE task_id = ?",
+            (*fields.values(), task_id),
+        )
+        task = self.task(task_id)
+        assert task is not None
+        return task
+
+    def accepted_untaken(self) -> list[TriggerDecision]:
+        """Accepted triggers whose issue the runner has not taken yet, oldest tag first."""
+        rows = self.conn.execute(
+            "SELECT d.* FROM trigger_decisions d LEFT JOIN tasks t ON t.task_id = d.issue_key"
+            " WHERE d.accepted = 1 AND t.task_id IS NULL ORDER BY d.tagged_at_ms"
+        ).fetchall()
+        return [TriggerDecision(r["issue_key"], r["tag_activity_id"], r["author"], True, bool(r["announced"]))
+                for r in rows]
+
+    # -- how far a task's engine steps were written out (progress.py) --
+
+    def progress_cursor(self, task_id: str) -> tuple[str, int, int] | None:
+        row = self.conn.execute("SELECT dispatch_id, last_ms, at_last_ms FROM progress_cursors WHERE task_id = ?",
+                                (task_id,)).fetchone()
+        return (row["dispatch_id"], row["last_ms"], row["at_last_ms"]) if row else None
+
+    def save_progress_cursor(self, task_id: str, dispatch_id: str, last_ms: int, at_last_ms: int) -> None:
+        self.conn.execute(
+            "INSERT INTO progress_cursors (task_id, dispatch_id, last_ms, at_last_ms) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT (task_id) DO UPDATE SET dispatch_id = excluded.dispatch_id, last_ms = excluded.last_ms,"
+            " at_last_ms = excluded.at_last_ms",
+            (task_id, dispatch_id, last_ms, at_last_ms))
+
+    # -- action journal: an external effect is marked before and after it happens --
+
+    def action(self, idem_key: str) -> tuple[str, str | None] | None:
+        row = self.conn.execute("SELECT status, result FROM actions WHERE idem_key = ?", (idem_key,)).fetchone()
+        return (row["status"], row["result"]) if row else None
+
+    def action_intent(self, idem_key: str, task_id: str, kind: str, payload: str | None = None) -> None:
+        """Record what is about to happen; `payload` is what is needed to redo it (the comment text)."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO actions (idem_key, task_id, kind, status, result) VALUES (?, ?, ?, 'intent', ?)",
+            (idem_key, task_id, kind, payload),
+        )
+
+    def pending_continues(self) -> list[tuple[str, str, str | None]]:
+        """`/continue` requests recorded but not yet taken by Bulava: (key, task id, payload)."""
+        return [(k, t, p) for k, t, kind, p in self.pending_actions() if kind == "continue"]
+
+    def pending_actions(self) -> list[tuple[str, str, str, str | None]]:
+        rows = self.conn.execute(
+            "SELECT idem_key, task_id, kind, result FROM actions WHERE status = 'intent' ORDER BY updated_at"
+        ).fetchall()
+        return [(r["idem_key"], r["task_id"], r["kind"], r["result"]) for r in rows]
+
+    def action_done(self, idem_key: str, result: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE actions SET status = 'done', result = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            " WHERE idem_key = ?",
+            (result, idem_key),
+        )
+
+    # -- the security screen (screening.py) --
+
+    def screening(self, digest: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM screenings WHERE digest = ?", (digest,)).fetchone()
+
+    def save_screening(self, digest: str, task_id: str, kind: str, verdict: str, categories: list[str], reason: str,
+                       model: str, policy: str, at: str) -> sqlite3.Row:
+        """The first verdict for a text wins: a second screening of it never replaces a rejection."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO screenings (digest, task_id, kind, verdict, categories, reason, model, policy,"
+            " screened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (digest, task_id, kind, verdict, json.dumps(categories), reason, model, policy, at))
+        row = self.screening(digest)
+        assert row is not None
+        return row
+
+    def decide_screening(self, digest: str, verdict: str, by: str, at: str) -> None:
+        self.conn.execute("UPDATE screenings SET verdict = ?, decided_by = ?, decided_at = ? WHERE digest = ?",
+                          (verdict, by, at, digest))
+
+    def open_hold(self, task_id: str, digest: str, kind: str, author: str, resume_state: str, ref: str | None,
+                  at: str) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO security_holds (task_id, digest, kind, author, resume_state, ref, status, held_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'open', ?)", (task_id, digest, kind, author, resume_state, ref, at))
+
+    def hold(self, task_id: str, digest: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM security_holds WHERE task_id = ? AND digest = ?",
+                                 (task_id, digest)).fetchone()
+
+    def open_hold_of(self, task_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM security_holds WHERE task_id = ? AND status = 'open'"
+                                 " ORDER BY held_at DESC LIMIT 1", (task_id,)).fetchone()
+
+    def close_hold(self, task_id: str, digest: str, status: str, by: str, at: str) -> None:
+        self.conn.execute("UPDATE security_holds SET status = ?, decided_by = ?, decided_at = ?"
+                          " WHERE task_id = ? AND digest = ?", (status, by, at, task_id, digest))
+
+
+@dataclass(frozen=True)
+class TaskMR:
+    task_id: str
+    repo: str
+    project_id: int
+    iid: int
+    url: str
+    state: str
+    published_sha: str
+    handled_pipeline: int | None
+    handled_conflict: str | None
+
+
+@dataclass(frozen=True)
+class Signal:
+    id: str
+    task_id: str
+    kind: str
+    repo: str | None
+    discussion_id: str | None
+    author: str
+    body: str
+    seen_at: str
+    batch_id: str | None
+    replied: bool
+
+
+@dataclass(frozen=True)
+class Batch:
+    id: str
+    task_id: str
+    source: str
+    author: str
+    text: str
+    ci_only: bool
+    created_at: str
+    sent_at: str | None
+    authors: str = "[]"  # JSON: everyone whose words are in `text`, earlier notes of its threads included
+
+
+class ReviewStore(TaskStore):
+    """The review loop's records, next to the tasks."""
+
+    def task_mrs(self, task_id: str) -> list[TaskMR]:
+        rows = self.conn.execute("SELECT * FROM task_mrs WHERE task_id = ? ORDER BY repo", (task_id,)).fetchall()
+        return [TaskMR(**dict(r)) for r in rows]
+
+    def upsert_mr(self, task_id: str, repo: str, project_id: int, iid: int, url: str, sha: str) -> None:
+        self.conn.execute(
+            "INSERT INTO task_mrs (task_id, repo, project_id, iid, url, published_sha) VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (task_id, repo) DO UPDATE SET iid = excluded.iid, url = excluded.url,"
+            " published_sha = excluded.published_sha",
+            (task_id, repo, project_id, iid, url, sha))
+
+    def drop_mr(self, task_id: str, repo: str) -> None:
+        self.conn.execute("DELETE FROM task_mrs WHERE task_id = ? AND repo = ?", (task_id, repo))
+
+    def update_mr(self, task_id: str, repo: str, **fields) -> None:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(f"UPDATE task_mrs SET {sets} WHERE task_id = ? AND repo = ?", (*fields.values(), task_id, repo))
+
+    def add_signal(self, sig_id: str, task_id: str, kind: str, author: str, body: str, seen_at: str,
+                   repo: str | None = None, discussion_id: str | None = None) -> bool:
+        """Record a signal once. False if it was seen before (a repeated poll)."""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO signals (id, task_id, kind, repo, discussion_id, author, body, seen_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (sig_id, task_id, kind, repo, discussion_id, author, body, seen_at))
+        return cur.rowcount == 1
+
+    def signals(self, task_id: str, batch_id: str | None = "", unbatched: bool = False) -> list[Signal]:
+        if unbatched:
+            rows = self.conn.execute("SELECT * FROM signals WHERE task_id = ? AND batch_id IS NULL ORDER BY seen_at, id",
+                                     (task_id,)).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM signals WHERE task_id = ? AND batch_id = ? ORDER BY seen_at, id",
+                                     (task_id, batch_id)).fetchall()
+        return [Signal(**{**dict(r), "replied": bool(r["replied"])}) for r in rows]
+
+    def batch(self, batch_id: str) -> Batch | None:
+        r = self.conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        return Batch(**{**dict(r), "ci_only": bool(r["ci_only"])}) if r else None
+
+    def open_batch(self, task_id: str) -> Batch | None:
+        """A batch made but not yet accepted by the engine (busy, or a crash before the answer)."""
+        r = self.conn.execute("SELECT id FROM batches WHERE task_id = ? AND sent_at IS NULL ORDER BY created_at",
+                              (task_id,)).fetchone()
+        return self.batch(r["id"]) if r else None
+
+    def last_sent_batch(self, task_id: str) -> Batch | None:
+        # A batch dropped before sending is marked `stale`, which is not a time and sorts after every one.
+        r = self.conn.execute("SELECT id FROM batches WHERE task_id = ? AND sent_at IS NOT NULL AND sent_at != 'stale'"
+                              " ORDER BY sent_at DESC LIMIT 1", (task_id,)).fetchone()
+        return self.batch(r["id"]) if r else None
+
+    def make_batch(self, batch_id: str, task_id: str, source: str, author: str, text: str, ci_only: bool,
+                   created_at: str, signal_ids: list[str], authors: list[str] = ()) -> Batch:
+        with self.transaction():
+            self.conn.execute("INSERT INTO batches (id, task_id, source, author, text, ci_only, created_at, authors)"
+                              " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (batch_id, task_id, source, author, text,
+                                                                   int(ci_only), created_at, json.dumps(list(authors))))
+            for sid in signal_ids:
+                self.conn.execute("UPDATE signals SET batch_id = ? WHERE id = ?", (batch_id, sid))
+        return self.batch(batch_id)
+
+    def batch_sent(self, batch_id: str, at: str) -> None:
+        self.conn.execute("UPDATE batches SET sent_at = ? WHERE id = ?", (at, batch_id))
+
+    def consume_signal(self, sig_id: str, task_id: str, kind: str, author: str, body: str, at: str,
+                       how: str) -> None:
+        """A comment already used another way (an answer to the agent's question): never a review."""
+        self.add_signal(sig_id, task_id, kind, author, body, at)
+        self.conn.execute("UPDATE signals SET batch_id = ? WHERE id = ? AND batch_id IS NULL", (how, sig_id))
+
+    def signal(self, sig_id: str) -> Signal | None:
+        r = self.conn.execute("SELECT * FROM signals WHERE id = ?", (sig_id,)).fetchone()
+        return Signal(**{**dict(r), "replied": bool(r["replied"])}) if r else None
+
+    def withdraw_signal(self, sig_id: str) -> None:
+        """A signal that no longer holds, before it reached the agent: as if it was never seen.
+
+        A batch that holds it and is not sent yet is dropped; its other signals wait for the next one.
+        """
+        with self.transaction():
+            row = self.conn.execute("SELECT s.batch_id FROM signals s LEFT JOIN batches b ON b.id = s.batch_id"
+                                    " WHERE s.id = ? AND (s.batch_id IS NULL OR (b.id IS NOT NULL AND b.sent_at IS NULL))",
+                                    (sig_id,)).fetchone()
+            if row is None:
+                return  # unknown, or the agent has it already
+            if row["batch_id"]:
+                self.conn.execute("UPDATE batches SET sent_at = 'stale' WHERE id = ?", (row["batch_id"],))
+                self.conn.execute("UPDATE signals SET batch_id = NULL WHERE batch_id = ? AND id != ?",
+                                  (row["batch_id"], sig_id))
+            self.conn.execute("DELETE FROM signals WHERE id = ?", (sig_id,))
+
+    def drop_signals(self, ids: list[str], why: str) -> None:
+        for sid in ids:
+            self.conn.execute("UPDATE signals SET batch_id = ? WHERE id = ? AND batch_id IS NULL", (why, sid))
+
+    def mark_replied(self, sig_id: str) -> None:
+        self.conn.execute("UPDATE signals SET replied = 1 WHERE id = ?", (sig_id,))
+
+    def has_pending_review(self) -> bool:
+        """Anything from an open MR waiting for the agent: it goes before new tasks."""
+        return self.conn.execute(
+            "SELECT 1 FROM signals s JOIN tasks t ON t.task_id = s.task_id"
+            " WHERE t.state = 'code_review' AND s.batch_id IS NULL"
+            " UNION SELECT 1 FROM batches b JOIN tasks t ON t.task_id = b.task_id"
+            " WHERE t.state = 'code_review' AND b.sent_at IS NULL LIMIT 1").fetchone() is not None
+
+
+def _split(script: str) -> list[str]:
+    return [s.strip() for s in script.split(";") if s.strip()]
