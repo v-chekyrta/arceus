@@ -8,6 +8,7 @@ reach Grafana through Loki; this file is only the current picture.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from prometheus_client import CollectorRegistry, Gauge, start_http_server
@@ -46,6 +47,15 @@ class Metrics:
         self.agent_quiet = Gauge("runner_agent_quiet_seconds", "How long the agent has written nothing while the "
                                  "step is its own; absent while the gate, Codex or a usage limit has the turn",
                                  ["task_id"], registry=r)
+        self.cleanup_ok = Gauge("runner_cleanup_last_success_seconds", "When the last successful cleanup pass "
+                                "started (epoch), by scope: full or independent (while a task works)", ["scope"],
+                                registry=r)
+        self.cleanup_last = Gauge("runner_cleanup_last_run_seconds", "When the last cleanup pass started (epoch), "
+                                  "with its status (succeeded, partial, failed, interrupted) and mode",
+                                  ["status", "mode"], registry=r)
+        self.cleanup_unknown = Gauge("runner_cleanup_unknown_items", "Leftovers the last pass could not put down "
+                                     "to any task: reported, never removed", registry=r)
+        self.cleanup_freed = Gauge("runner_cleanup_freed_bytes", "Disk space the last acting pass freed", registry=r)
         self.observed = Gauge("runner_engine_observed_seconds", "When the runner last read a running task's engine "
                               "files (epoch)", ["task_id"], registry=r)
 
@@ -88,6 +98,25 @@ class Metrics:
 
         self.update_usage(cfg.paths.bulava_state)
         self.update_progress(runner)
+        self.update_cleanup(getattr(runner, "cleanup", None))
+
+    def update_cleanup(self, cleanup) -> None:
+        self.cleanup_ok.clear()
+        self.cleanup_last.clear()
+        if not cleanup:
+            return
+        runs = cleanup.last_runs()
+        for scope in ("full", "independent"):
+            r = runs.get(f"ok:{scope}")
+            if r:
+                self.cleanup_ok.labels(scope).set(_epoch(r["started_at"]))
+        last = runs.get("last")
+        if last:
+            self.cleanup_last.labels(last["status"], last["mode"]).set(_epoch(last["started_at"]))
+            summary = json.loads(last["summary"] or "{}")
+            self.cleanup_unknown.set(len(summary.get("unknown") or []))
+            if "freed_bytes" in summary:
+                self.cleanup_freed.set(summary["freed_bytes"])
 
     def update_progress(self, runner) -> None:
         if getattr(runner, "last_tick", None):
@@ -124,3 +153,7 @@ class Metrics:
                     resets = part.get("resets_at")
                     if isinstance(resets, (int, float)) and resets > 0:
                         self.usage_resets.labels(provider, window).set(resets)
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
