@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,17 +65,26 @@ class Git:
         self.auth = auth
         self.author_name = author_name
         self.author_email = author_email
+        self.deadline: float | None = None  # time.monotonic() no command may outlive (cleanup's time budget)
 
-    def _run(self, args: list[str], cwd: Path | None, network: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+    def _run(self, args: list[str], cwd: Path | None, network: bool = False, check: bool = True,
+             read_only: bool = False) -> subprocess.CompletedProcess:
         env = base_env()
+        if read_only:
+            env["GIT_OPTIONAL_LOCKS"] = "0"  # `git status` would otherwise refresh the index
         if network and self.auth:
             env.update(self.auth.env())
+        timeout = NETWORK_TIMEOUT if network else LOCAL_TIMEOUT
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise GitError(f"git {args[0]}: out of time")
         try:
             res = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True,
-                                 timeout=NETWORK_TIMEOUT if network else LOCAL_TIMEOUT,
-                                 preexec_fn=_workspace_umask)
+                                 timeout=timeout, preexec_fn=_workspace_umask)
         except subprocess.TimeoutExpired:
-            raise GitError(f"git {args[0]}: timed out") from None
+            late = self.deadline is not None and time.monotonic() >= self.deadline
+            raise GitError(f"git {args[0]}: timed out" + (", out of time" if late else "")) from None
         if check and res.returncode != 0:
             raise GitError(f"git {' '.join(args[:2])}: {self._scrub(res.stderr.strip())[-500:]}")
         return res
@@ -237,6 +247,51 @@ class Git:
                    if "\t" in line and line.split()[1] == "blob"]
         if tracked:
             self._run(["checkout", "--quiet", "HEAD", "--", *tracked], home)
+
+    # -- cleanup (cleanup.py) -------------------------------------------------------------------
+
+    def dirty_files(self, repo: Path) -> list[str]:
+        """What `git status` lists: changed tracked files and untracked ones that are not ignored."""
+        entries = iter(self._run(["status", "--porcelain", "--untracked-files=normal", "-z"], repo,
+                                 read_only=True).stdout.split("\0"))
+        files = []
+        for e in entries:
+            if len(e) > 3:
+                files.append(e[3:])
+                if "R" in e[:2] or "C" in e[:2]:
+                    next(entries, None)  # a rename's or copy's source path follows as an entry of its own
+        return files
+
+    def stash_all(self, repo: Path, message: str) -> str | None:
+        """Changed and untracked files (never ignored ones: caches, builds) into a stash. Its commit, or None when
+        there was nothing to stash (git then says so and makes none: the newest stash is an older one)."""
+        def top() -> str | None:
+            return self._run(["rev-parse", "--verify", "--quiet", "refs/stash"], repo, check=False).stdout.strip() or None
+        before = top()
+        self._run(["stash", "push", "--quiet", "--include-untracked", "-m", message], repo)
+        after = top()
+        return after if after != before else None
+
+    def local_branches(self, repo: Path, prefix: str) -> dict[str, str]:
+        out = self._run(["for-each-ref", "--format=%(refname:short) %(objectname)",
+                         f"refs/heads/{prefix.rstrip('/')}"],
+                        repo).stdout
+        return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+
+    def worktree_branches(self, repo: Path) -> set[str]:
+        """Branches checked out in any worktree of the repository: `update-ref -d` would pull them from under it."""
+        out = self._run(["worktree", "list", "--porcelain"], repo, read_only=True).stdout
+        return {line.split(" ", 1)[1].removeprefix("refs/heads/") for line in out.splitlines()
+                if line.startswith("branch ")}
+
+    def on_remote(self, repo: Path, sha: str) -> bool:
+        """Every commit of `sha` is in some branch of GitLab, as last fetched."""
+        out = self._run(["rev-list", "--count", sha, "--not", "--remotes=origin"], repo).stdout.strip()
+        return out == "0"
+
+    def delete_branch_at(self, repo: Path, branch: str, sha: str) -> None:
+        """Delete the branch only if it still points at `sha`: a commit made since keeps it."""
+        self._run(["update-ref", "-d", f"refs/heads/{branch}", sha], repo)
 
     def push_sha(self, repo: Path, sha: str, branch: str) -> None:
         """Push exactly this commit to the branch. No force: a diverged remote branch is an error."""

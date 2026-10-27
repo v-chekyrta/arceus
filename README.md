@@ -14,7 +14,7 @@ runner + Bulava events ──▶ Loki ─┐
 runner metrics, VM ──▶ Prometheus ┴──▶ Grafana
 ```
 
-- **Runner** (`runner/`, Python, a systemd service). The deterministic bridge. It polls YouTrack for tickets tagged `agent` by someone on the project's allowlist, prepares the repositories, starts the task in Bulava, follows it with `night-shift task show`, and when Codex has passed the work it makes sure GitLab holds exactly the reviewed commit, opens and describes the merge request and moves the ticket to Code Review. It then watches the MR: review comments that mention the bot, red CI and conflicts go back to the agent, which either fixes the code or answers the question in its thread, and each reviewed fix is published to the same MR. Questions the agent cannot answer go to the ticket as comments; the answer goes back to the agent. All of its state is in SQLite, and every external step can be repeated after a crash without doing anything twice.
+- **Runner** (`runner/`, Python, a systemd service). The deterministic bridge. It polls YouTrack for tickets tagged `agent` by someone on the project's allowlist, prepares the repositories, starts the task in Bulava, follows it with `night-shift task show`, and when Codex has passed the work it makes sure GitLab holds exactly the reviewed commit, opens and describes the merge request and moves the ticket to Code Review. It then watches the MR: review comments that mention the bot, red CI and conflicts go back to the agent, which either fixes the code or answers the question in its thread, and each reviewed fix is published to the same MR. Questions the agent cannot answer go to the ticket as comments; the answer goes back to the agent. Between tasks it clears what the agents left behind (stopped containers, test volumes, orphaned dev servers, uncommitted files, old screenshots), but only what it can tie to a task that is over; the rest it reports. All of its state is in SQLite, and every external step can be repeated after a crash without doing anything twice.
 - **Bulava** ([Stepanokdev/bulava](https://github.com/Stepanokdev/bulava), branch `factory`, `engine/SERVER.md` is the contract). The engine that runs the agent: a Claude Code session in tmux, Codex as reviewer, the task record that outlives sessions, usage limits, the server profile that keeps the agent away from credentials.
 - **Setup** (`setup/`). One idempotent script that prepares the VM: packages, Docker, Chrome, pinned `claude`/`codex`/`chrome-devtools-mcp`, the Bulava engine, the runner, the systemd units and the observability stack. `--check` reports what is not done without changing anything.
 - **Observability** (`observability/`). Grafana with Prometheus and Loki on the VM, reached through an SSH tunnel: what the agent is doing now, what happened to every ticket, and the VM's resources.
@@ -41,7 +41,7 @@ Not there yet:
 
 | Path | What |
 |---|---|
-| [`runner/`](runner) | the runner: `arceus-runner check | doctor | probe-bulava | run`, tests in `runner/tests` |
+| [`runner/`](runner) | the runner: `arceus-runner check | doctor | probe-bulava | cleanup | run`, tests in `runner/tests` |
 | [`setup/`](setup) | `setup.sh`, `setup.conf.example` and checks; **[setup/README.md](setup/README.md) is the operator's guide** |
 | [`config/`](config) | example `config.yaml`, `secrets.env` and `bulava.env` |
 | [`observability/`](observability) | Docker Compose stack and the generator of the Grafana dashboards |

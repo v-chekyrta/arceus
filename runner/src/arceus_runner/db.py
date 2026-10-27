@@ -167,6 +167,22 @@ class Store:
         os.chmod(path, 0o600)
         self.migrate()
 
+    @classmethod
+    def read_only(cls, path: Path):
+        """The runner's database for a command that only looks: no migration, no write, no file created."""
+        if not path.exists():
+            raise FileNotFoundError(f"{path}: no runner database yet")
+        self = cls.__new__(cls)
+        self.path = path
+        self.conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=30)
+        self.conn.row_factory = sqlite3.Row
+        if self.version != len(MIGRATIONS):
+            v = self.version
+            self.conn.close()
+            raise RuntimeError(f"{path} is schema v{v}, this runner knows v{len(MIGRATIONS)}: start this "
+                               "version of the runner once first")
+        return self
+
     def close(self) -> None:
         self.conn.close()
 
@@ -309,10 +325,59 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 10: cleanup (cleanup.py). Each pass and what it did to each leftover; who held the shared workspace
+    # when, so a container or a process can be put down to the task that made it.
+    """
+    CREATE TABLE cleanups (
+        id               TEXT PRIMARY KEY,
+        trigger          TEXT NOT NULL,
+        scope            TEXT NOT NULL CHECK (scope IN ('full', 'independent')),
+        mode             TEXT NOT NULL CHECK (mode IN ('report', 'act')),
+        status           TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'partial', 'failed', 'interrupted')),
+        started_at       TEXT NOT NULL,
+        finished_at      TEXT,
+        summary          TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX cleanups_started ON cleanups (started_at);
+    CREATE TABLE cleanup_items (
+        run_id           TEXT NOT NULL,
+        kind             TEXT NOT NULL,
+        ref              TEXT NOT NULL,
+        action           TEXT NOT NULL,
+        result           TEXT NOT NULL,
+        task_id          TEXT,
+        detail           TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (run_id, kind, ref)
+    );
+    CREATE TABLE workspace_holds (
+        task_id          TEXT NOT NULL,
+        started_at       TEXT NOT NULL,
+        ended_at         TEXT
+    );
+    CREATE INDEX workspace_holds_open ON workspace_holds (ended_at);
+    CREATE TABLE cleanup_projects (
+        name             TEXT PRIMARY KEY,
+        task_id          TEXT,
+        seen_at          TEXT NOT NULL
+    );
+    """
+)
+
+MIGRATIONS.append(
+    # 11: a hold is known only up to the last tick that saw it. While the runner is down nobody records who
+    # works in the workspace, so what is made then is put down to no task.
+    """
+    ALTER TABLE workspace_holds ADD COLUMN seen_at TEXT;
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
                "review_answers")
+TASK_COLUMNS = (*TASK_FIELDS, "updated_at")  # read: the last change is set by the store itself, never written
 
 
 @dataclass(frozen=True)
@@ -337,6 +402,7 @@ class Task:
     published_at_ms: int | None = None  # the MR comment, or the last `/continue`: later comments are review
     failed_at_ms: int | None = None     # when the task failed: a later `/continue` from a person resumes it
     review_answers: int = 0  # review rounds answered without a code change
+    updated_at: str = ""     # when the record last changed: for a task that is over, when it ended
 
     @property
     def active(self) -> bool:
@@ -358,11 +424,11 @@ class TaskStore(Store):
         self.conn.execute("COMMIT")
 
     def task(self, task_id: str) -> Task | None:
-        row = self.conn.execute(f"SELECT {', '.join(TASK_FIELDS)} FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        row = self.conn.execute(f"SELECT {', '.join(TASK_COLUMNS)} FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
         return Task(*row) if row else None
 
     def tasks(self, *states: str) -> list[Task]:
-        q = f"SELECT {', '.join(TASK_FIELDS)} FROM tasks"
+        q = f"SELECT {', '.join(TASK_COLUMNS)} FROM tasks"
         args: tuple = ()
         if states:
             q += f" WHERE state IN ({', '.join('?' * len(states))})"
@@ -483,6 +549,84 @@ class TaskStore(Store):
     def close_hold(self, task_id: str, digest: str, status: str, by: str, at: str) -> None:
         self.conn.execute("UPDATE security_holds SET status = ?, decided_by = ?, decided_at = ?"
                           " WHERE task_id = ? AND digest = ?", (status, by, at, task_id, digest))
+
+    # -- cleanup (cleanup.py) --
+
+    def hold_workspace(self, task_id: str | None, at: str, began: str | None = None) -> None:
+        """`task_id` works in the shared workspace (None: nobody). A change: the hold before it ends at `at`, the
+        new one starts at `began` (`at` when not given); in between nobody is known to hold it. The same task
+        again: its hold is seen up to `began`."""
+        began = began or at
+        with self.transaction():
+            row = self.conn.execute("SELECT rowid, task_id FROM workspace_holds WHERE ended_at IS NULL"
+                                    " ORDER BY started_at DESC LIMIT 1").fetchone()
+            if row and row["task_id"] == task_id:
+                self.conn.execute("UPDATE workspace_holds SET seen_at = ? WHERE rowid = ?", (began, row["rowid"]))
+                return
+            self.conn.execute("UPDATE workspace_holds SET ended_at = ? WHERE ended_at IS NULL", (at,))
+            if task_id:
+                self.conn.execute("INSERT INTO workspace_holds (task_id, started_at, seen_at) VALUES (?, ?, ?)",
+                                  (task_id, began, began))
+
+    def close_open_holds(self) -> None:
+        """At start: a hold left open by a crash or a stop ended when a tick last saw it, not now."""
+        self.conn.execute("UPDATE workspace_holds SET ended_at = COALESCE(seen_at, started_at) WHERE ended_at IS NULL")
+
+    def workspace_holds(self) -> list[tuple[str, str, str]]:
+        """(task id, from, to), oldest first. An open hold reaches as far as the last tick that saw it."""
+        rows = self.conn.execute("SELECT task_id, started_at, COALESCE(ended_at, seen_at, started_at) AS until"
+                                 " FROM workspace_holds ORDER BY started_at")
+        return [(r["task_id"], r["started_at"], r["until"]) for r in rows.fetchall()]
+
+    def cleanup_projects(self) -> dict[str, tuple[str | None, str]]:
+        """Compose projects seen as the workspace's: the one task that labelled all their containers, and when
+        they were last seen so."""
+        return {r["name"]: (r["task_id"], r["seen_at"])
+                for r in self.conn.execute("SELECT name, task_id, seen_at FROM cleanup_projects")}
+
+    def remember_projects(self, projects: dict[str, str | None], at: str) -> None:
+        """Kept after their containers are gone, so their networks stay tied to the workspace. Two tasks seen
+        for one project: no single task owns it."""
+        with self.transaction():
+            for name, task_id in projects.items():
+                self.conn.execute(
+                    "INSERT INTO cleanup_projects (name, task_id, seen_at) VALUES (?, ?, ?) ON CONFLICT (name) DO UPDATE"
+                    " SET task_id = CASE WHEN cleanup_projects.task_id IS excluded.task_id THEN excluded.task_id"
+                    " ELSE NULL END, seen_at = excluded.seen_at", (name, task_id, at))
+
+    def cleanup_started(self, run_id: str, trigger: str, scope: str, mode: str, at: str) -> None:
+        self.conn.execute("INSERT INTO cleanups (id, trigger, scope, mode, status, started_at)"
+                          " VALUES (?, ?, ?, ?, 'running', ?)", (run_id, trigger, scope, mode, at))
+
+    def cleanup_item(self, run_id: str, kind: str, ref: str, action: str, result: str, task_id: str | None,
+                     detail: dict) -> None:
+        self.conn.execute(
+            "INSERT INTO cleanup_items (run_id, kind, ref, action, result, task_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (run_id, kind, ref) DO UPDATE SET action = excluded.action, result = excluded.result,"
+            " detail = excluded.detail", (run_id, kind, ref, action, result, task_id, json.dumps(detail, default=str)))
+
+    def cleanup_finished(self, run_id: str, status: str, at: str, summary: dict) -> None:
+        self.conn.execute("UPDATE cleanups SET status = ?, finished_at = ?, summary = ? WHERE id = ?",
+                          (status, at, json.dumps(summary, default=str), run_id))
+
+    def cleanup_runs(self, limit: int = 50) -> list[sqlite3.Row]:
+        """The latest passes first."""
+        return self.conn.execute("SELECT * FROM cleanups ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+
+    def cleanup_items(self, run_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM cleanup_items WHERE run_id = ? ORDER BY kind, ref", (run_id,)).fetchall()
+
+    def forget_cleanups(self, before: str) -> None:
+        with self.transaction():
+            self.conn.execute("DELETE FROM cleanup_items WHERE run_id IN (SELECT id FROM cleanups WHERE started_at < ?)",
+                              (before,))
+            self.conn.execute("DELETE FROM cleanups WHERE started_at < ?", (before,))
+
+    def interrupt_cleanups(self, at: str) -> list[str]:
+        """Passes a crash or a stop cut short: never counted as done. Returns their ids."""
+        ids = [r["id"] for r in self.conn.execute("SELECT id FROM cleanups WHERE status = 'running'").fetchall()]
+        self.conn.execute("UPDATE cleanups SET status = 'interrupted', finished_at = ? WHERE status = 'running'", (at,))
+        return ids
 
 
 @dataclass(frozen=True)

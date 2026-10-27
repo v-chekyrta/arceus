@@ -295,6 +295,37 @@ class SecurityConfig(Strict):
     timeout: Duration = timedelta(minutes=3)
 
 
+class CleanupProtect(Strict):
+    """What cleanup never touches, besides the observability stack and anything labelled arceus.keep=true."""
+    compose_projects: list[str] = []  # e.g. the project's dev stack: [omnis-dev]
+    containers: list[str] = []        # container names
+    volumes: list[str] = []           # volume names
+
+
+class CleanupConfig(Strict):
+    """cleanup.py: what agents leave behind (containers, test data, dirty trees, dev servers), removed when
+    it provably belongs to a task that is over. Everything else is only reported."""
+    enabled: bool = True
+    # report: work out and log what would go, change nothing. act: remove it. `mode: observe` is always report.
+    mode: Literal["report", "act"] = "report"
+    idle_after: Duration = timedelta(minutes=15)   # the workspace free and no work waiting this long: a pass
+    min_interval: Duration = timedelta(hours=6)    # never more often than this on idle alone
+    force_every: Duration = timedelta(hours=24)    # a pass at least this often, busy or not
+    retry_after: Duration = timedelta(hours=1)     # after a pass with errors (doubles each time), and on low disk
+    max_duration: Duration = timedelta(minutes=10)
+    stopped_after: Duration = timedelta(minutes=30)  # an exited container this long is a leftover, not a step
+    keep_media: Duration = timedelta(days=14)     # .arceus/media/<KEY> after the task is over
+    keep_notes: Duration = timedelta(days=90)     # .arceus/notes/<KEY>: reviewers ask weeks later
+    stash: bool = True       # uncommitted leftovers on a finished task's branch go to `git stash`
+    branches: bool = True    # local branches of finished tasks, when GitLab has their commits
+    processes: bool = True   # dev servers whose agent session is gone
+    # advise: Claude (no tools) comments on what the rules cannot place. YAML reads a bare `off` as false.
+    llm: Annotated[Literal["off", "advise"], BeforeValidator(lambda v: "off" if v is False else v)] = "off"
+    llm_model: str = Field(default="auto", pattern=MODEL_NAME)
+    llm_timeout: Duration = timedelta(minutes=3)
+    protect: CleanupProtect = CleanupProtect()
+
+
 class MetricsConfig(Strict):
     enabled: bool = True
     address: str = "127.0.0.1"  # Prometheus scrapes it on the same machine; never open it outside
@@ -325,6 +356,7 @@ class Config(Strict):
     health: HealthConfig = HealthConfig()
     bulava: BulavaConfig = BulavaConfig()
     security: SecurityConfig = SecurityConfig()
+    cleanup: CleanupConfig = CleanupConfig()
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
 

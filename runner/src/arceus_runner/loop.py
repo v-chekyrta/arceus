@@ -23,8 +23,9 @@ from datetime import UTC, datetime
 
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, gitlab_client, token_expiry, youtrack_client
+from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Docker, Situation
 from arceus_runner.config import Config, Schedule, Secrets
-from arceus_runner.db import InstanceLock, ReviewStore, TaskStore
+from arceus_runner.db import ACTIVE_STATES, InstanceLock, ReviewStore, TaskStore
 from arceus_runner.delivery import Delivery
 from arceus_runner.review import ReviewLoop
 from arceus_runner.engine import Engine
@@ -80,6 +81,7 @@ class Runner:
         git: Git | None = None,
         metrics: Metrics | None = None,
         classify: Classify | None = None,
+        cleanup: Cleanup | None = None,
     ):
         self.cfg = cfg
         self.metrics = metrics
@@ -101,6 +103,7 @@ class Runner:
         self.progress = ProgressWatcher(cfg.paths.bulava_state, cfg.paths.workspace, store, events, now,
                                         quiet_after=cfg.limits.agent_quiet_after) if self.delivery else None
         self.last_tick: float | None = None  # wall clock of the last finished tick, for the metrics
+        self.cleanup = cleanup
         self.engine = engine
         self.health: dict[str, str] = {}
         self.next_due: dict[str, float] = {"local": 0.0, "youtrack": 0.0, "gitlab": 0.0, "doctor": 0.0,
@@ -218,6 +221,7 @@ class Runner:
     def tick(self) -> None:
         """Run every poll that is due. Each one schedules its own next time."""
         now = self.mono()
+        started = self.now()
         local_due = now >= self.next_due["local"]
         gitlab_due = now >= self.next_due["gitlab"]
         # The next time is set in `finally`: an unexpected error must not turn into a hot loop.
@@ -245,9 +249,20 @@ class Runner:
             # Reconcile with `task show` every poll_local, then take new work if nothing is running.
             self.delivery.reconcile()
             can_take = self.can_take()
+            self.clean_up(can_take, started)  # before new work: an overdue pass goes ahead of the next ticket
             if can_take:
                 self.delivery.send_continue()  # a resumed task is new work for the workspace
             self.delivery.maybe_start(can_take)
+        elif local_due:
+            self.clean_up(False, started)  # observe: nothing runs; the pass only reports
+        if self.cleanup and local_due:
+            # Who holds the workspace: a change happened somewhere in this tick, so the hold before ends at its
+            # start and the new one starts now; what was made in between is nobody's.
+            try:
+                self.cleanup.note_holder(next(iter(self.store.tasks(*ACTIVE_STATES)), None), started,
+                                         began=self.cleanup.now())
+            except Exception as e:
+                self.events.emit("cleanup_failed", error=f"{type(e).__name__}: {e}")
         if self.progress and (local_due or now >= self.next_due["progress"]):
             # What the running task is doing: the engine's steps and the agent's transcript (files only).
             try:
@@ -258,6 +273,22 @@ class Runner:
         if self.metrics:
             self.metrics.update(self)
 
+    def clean_up(self, can_take: bool, since: datetime | None = None) -> None:
+        """A cleanup pass if one is due (cleanup.py). In the tick itself, so nothing switches the workspace
+        meanwhile; it does not depend on health, which is often what low disk has broken."""
+        if not self.cleanup:
+            return
+        holder = next(iter(self.store.tasks(*ACTIVE_STATES)), None)
+        waiting = bool(self.delivery and can_take and (
+            any(d.issue_key not in self.delivery._skipped for d in self.store.accepted_untaken())
+            or self.delivery._continues_waiting()
+            or (hasattr(self.store, "has_pending_review") and self.store.has_pending_review())))
+        try:
+            self.cleanup.maybe_run(Situation(holder, waiting, self.health.get("disk_free") in ("warn", "fail"),
+                                             since))
+        except Exception as e:  # cleanup must never stop the work it cleans up after
+            self.events.emit("cleanup_failed", error=f"{type(e).__name__}: {e}")
+
     def can_take(self) -> bool:
         """New work only when nothing is failing and both trackers answer."""
         return (all(s != "fail" for s in self.health.values())
@@ -266,6 +297,16 @@ class Runner:
     def seconds_to_next(self) -> float:
         due = [t for k, t in self.next_due.items() if k not in ("doctor", "token")]  # ride on other polls
         return max(0.0, min(due) - self.mono())
+
+
+def make_cleanup(cfg: Config, store: TaskStore, events: EventLog, engine: Engine | None) -> Cleanup:
+    advise = None
+    if cfg.cleanup.llm == "advise":
+        advise = ClaudeAdvisor(classifier_env((engine or Engine(cfg)).token_env()), cfg.cleanup.llm_model,
+                               cfg.cleanup.llm_timeout.total_seconds())
+    # Local git only (status, stash, branches): no credentials.
+    git = Git(None, cfg.gitlab.git_author.name, cfg.gitlab.git_author.email)
+    return Cleanup(cfg, store, events, docker=Docker(), git=git, engine=engine, advise=advise)
 
 
 def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
@@ -295,7 +336,11 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         if cfg.metrics.enabled:
             metrics = Metrics()
             stack.callback(metrics.serve(cfg.metrics.address, cfg.metrics.port))
-        runner = Runner(cfg, store, events, yc, gc, engine=engine, git=git, metrics=metrics, classify=classify)
+        cleanup = make_cleanup(cfg, store, events, engine) if cfg.cleanup.enabled else None
+        if cleanup:
+            cleanup.recover()
+        runner = Runner(cfg, store, events, yc, gc, engine=engine, git=git, metrics=metrics, classify=classify,
+                        cleanup=cleanup)
 
         def _stop(signum, _frame):
             stop.set()

@@ -100,6 +100,22 @@ security:
   model: auto                          # the classifier's model: auto | sonnet | opus | an exact id
   timeout: 3m
 
+# What agents leave behind: containers, test volumes, dev servers, files in the repositories, old media.
+# A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than
+# limits.continue_window): by the label arceus.task=<KEY> the agent puts on it, by its place
+# (.arceus/<kind>/<KEY>, a task branch), or because it was made while that task held the workspace.
+# Anything else is only reported: `arceus-runner cleanup` shows the plan, `cleanup --last` the last pass.
+cleanup:
+  mode: report                         # report: log what would go | act: remove it. Start with report.
+  idle_after: 15m                      # a pass once the workspace is free and no work waits this long
+  min_interval: 6h                     # but not more often than this
+  force_every: 24h                     # at least this often; while a task works, only what cannot be its own
+  keep_media: 14d                      # .arceus/media/<KEY> after the task is over
+  keep_notes: 90d                      # .arceus/notes/<KEY>: reviewers ask about decisions weeks later
+  llm: off                             # advise: Claude (no tools) comments on what nobody owns; never removes
+  protect:                             # never touched, besides arceus-observability and arceus.keep=true
+    compose_projects: []               # e.g. the dev stack's compose project, if it lives in the workspace
+
 paths:
   workspace: ~/arceus/workspace
   bulava: /opt/bulava/engine           # the engine folder (bin/dispatch.sh is in it)

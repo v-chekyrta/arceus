@@ -114,6 +114,11 @@ def timeseries(title, targets, pos, *, unit="none", bars=False, single=True, des
 RUNNER_LINE = (' | json | line_format "{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .stage}}  {{.}} · {{$.state}}{{else}}{{with .state}}  {{.}}{{end}}{{end}}'
                '{{with .author}}  by {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{with .note}}  — {{.}}{{end}}'
                '{{with .summary}}  «{{.}}»{{end}}{{with .url}}  {{.}}{{end}}"')
+# "cleanup_item  remove container web-db-1 → done  — exited, made by OMD-12, which is over".
+CLEANUP_LINE = (' | json | line_format "{{.event}}{{with .status}}  {{.}}{{end}}{{with .trigger}}  {{.}}{{end}}'
+                '{{with .scope}} · {{.}}{{end}}{{with .action}}  {{.}} {{$.kind}} {{$.name}} → {{$.result}}{{end}}'
+                '{{with .why}}  — {{.}}{{end}}{{with .kept}}  (kept: {{.}}){{end}}{{with .error}}  error: {{.}}{{end}}'
+                '{{with .reason}}  — {{.}}{{end}}{{with .deferred}}  — deferred: {{.}}{{end}}"')
 BULAVA_LINE = (' | json | line_format "{{.kind}}  {{.task_id}}  attempt {{.attempt}}  state {{.state}}'
                '{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}"')
 # The running task, step by step: the runner's own steps, the engine's steps it carries over from the
@@ -411,6 +416,25 @@ def resources_dashboard():
                    desc="Packets per second. Errors should stay at zero: a steady line explains timeouts to GitLab, "
                         "YouTrack or the model APIs. A low, flat drop rate is usually broadcast traffic nobody listens "
                         "to; a jump during a task is not."),
+
+        row("Cleanup", 58),
+        stat("Last full cleanup", 'time() - runner_cleanup_last_success_seconds{scope="full"}', grid(0, 59, 6, 4),
+             unit="s", steps=[(None, "text"), (26 * 3600, WARNING), (50 * 3600, CRITICAL)], no_value="None yet",
+             desc="Since the last full pass that finished without errors. One runs at least daily, in the first free "
+                  "moment; amber past 26 h, red past 50 h."),
+        stat("Last pass", "runner_cleanup_last_run_seconds", grid(6, 59, 6, 4), color="text",
+             name="{{status}} · {{mode}}", no_value="None yet",
+             desc="partial: some removals failed and are retried later (see the log). report: the pass only logs "
+                  "what it would remove (cleanup.mode: report, or the runner in observe)."),
+        stat("Not put down to a task", "runner_cleanup_unknown_items", grid(12, 59, 6, 4), decimals=0, zero=True,
+             steps=[(None, "text"), (1, WARNING)],
+             desc="Leftovers the last pass found but could not tie to a finished task, so it left them: the dev "
+                  "stack, a person's work, or something to add to cleanup.protect. `arceus-runner cleanup --last` "
+                  "lists them."),
+        stat("Freed by the last pass", "runner_cleanup_freed_bytes", grid(18, 59, 6, 4), unit="bytes", color="text",
+             no_value="Nothing removed yet", desc="Free disk space after the last acting pass minus before it."),
+        logs("Cleanup", '{source="runner", event=~"cleanup_.*"}' + CLEANUP_LINE, grid(0, 63, 24, 10),
+             desc="What each pass removed, kept on a second look, failed to remove, or deferred, and why."),
     ]
     return dashboard("arceus-resources", "Arceus · resources", panels, time="now-24h", refresh="1m",
                      annotations=[TASK_MARKS],

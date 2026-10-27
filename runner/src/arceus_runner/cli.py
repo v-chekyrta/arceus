@@ -1,4 +1,4 @@
-"""Command line: arceus-runner check | run | probe-bulava | doctor."""
+"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup."""
 
 from __future__ import annotations
 
@@ -12,10 +12,11 @@ from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
 from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, load_config, load_secrets
-from arceus_runner.db import AlreadyRunning
+from arceus_runner.db import ACTIVE_STATES, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.engine import Engine
 from arceus_runner.health import engine_doctor, local_checks
-from arceus_runner.loop import LiveModeUnavailable, require_mode_ready, run
+from arceus_runner.events import EventLog
+from arceus_runner.loop import LiveModeUnavailable, make_cleanup, require_mode_ready, run
 
 EXIT_OK = 0
 EXIT_CHECK_FAILED = 1
@@ -113,6 +114,136 @@ def cmd_run(args) -> int:
     return run(cfg, secrets, once=args.once)
 
 
+def cmd_cleanup(args) -> int:
+    """What a full cleanup pass would do now, the last pass (both read only), or (--act) a pass now."""
+    cfg = load_config(_config_path(args.config))
+    if args.act:
+        return _cleanup_now(cfg, args.json)
+    try:
+        store = ReviewStore.read_only(cfg.paths.db)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"cleanup: {e}", file=sys.stderr)
+        return EXIT_CHECK_FAILED
+    try:
+        if args.last:
+            runs = store.cleanup_runs(1)
+            if not runs:
+                print("no cleanup pass yet")
+                return EXIT_OK
+            r = runs[0]
+            summary = json.loads(r["summary"] or "{}")
+            planned, unknown = _last_items(store, r["id"], summary)
+            if args.json:
+                print(json.dumps({**dict(r), "summary": {**summary, "planned": planned, "unknown": unknown}},
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(f"{r['id']}: {r['status']} ({r['trigger']}, {r['scope']}, {r['mode']}), "
+                      f"started {r['started_at']}, finished {r['finished_at'] or '-'}")
+                _print_cleanup(planned, unknown, summary.get("errors") or [], summary.get("images_in_use"),
+                               summary.get("unknown_bytes"))
+            return EXIT_OK
+        cleanup = make_cleanup(cfg, store, QuietEvents(), None)
+        items, errors = cleanup.plan("full")
+        if args.json:
+            print(json.dumps({"mode": cleanup.mode, "errors": errors, "items": [
+                {"kind": i.kind, "name": i.name, "action": i.action, "why": i.why, "task": i.task} for i in items]},
+                ensure_ascii=False, indent=2))
+        else:
+            print(f"A full pass now (cleanup.mode: {cleanup.mode}; nothing is changed by this command):")
+            _print_cleanup([vars(i) for i in items if i.action != "report"],
+                           [{**vars(i), "bytes": i.detail.get("bytes")} for i in items if i.action == "report"], errors,
+                           cleanup.images_in_use)
+        return EXIT_OK if not errors else EXIT_CHECK_FAILED
+    finally:
+        store.close()
+
+
+def _cleanup_now(cfg: Config, as_json: bool) -> int:
+    """A full pass by hand. The runner's lock first: it must not work in the workspace (or migrate) meanwhile."""
+    if cfg.mode == "observe":
+        print("cleanup: the runner is in mode: observe, which removes nothing; `cleanup` alone shows the plan",
+              file=sys.stderr)
+        return EXIT_CHECK_FAILED
+    lock = InstanceLock(cfg.paths.db.with_suffix(".lock"))
+    lock.acquire()
+    try:
+        store = ReviewStore(cfg.paths.db)
+        events = EventLog(cfg.paths.events, cfg.project)
+        try:
+            active = store.tasks(*ACTIVE_STATES)
+            if active:
+                print(f"cleanup: {active[0].task_id} holds the workspace ({active[0].state}); not now", file=sys.stderr)
+                return EXIT_CHECK_FAILED
+            engine = Engine(cfg) if bulava_mod.probe(cfg.paths.bulava).installed else None
+            cleanup = make_cleanup(cfg, store, events, engine)
+            cleanup.mode = "act"  # asked for by a person, whatever cleanup.mode says
+            cleanup.recover()
+            busy = cleanup.engine_busy()
+            if busy:
+                print(f"cleanup: {busy}; not now", file=sys.stderr)
+                return EXIT_CHECK_FAILED
+            result = cleanup.run("full", "manual")
+            result["planned"], result["unknown"] = _last_items(store, result["run"], result)
+        finally:
+            events.close()
+            store.close()
+    finally:
+        lock.release()
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(f"{result['run']}: {result['status']}")
+        _print_cleanup(result["planned"], result["unknown"], result["errors"], result.get("images_in_use"),
+                       result.get("unknown_bytes"))
+    return EXIT_OK if result["status"] == "succeeded" else EXIT_CHECK_FAILED
+
+
+def _last_items(store, run_id: str, summary: dict) -> tuple[list[dict], list[dict]]:
+    """A pass's planned and unplaced items. The summary lists only the first of each; when it cut a list, the
+    whole of it comes from cleanup_items, where every item of the pass is."""
+    planned, unknown = summary.get("planned") or [], summary.get("unknown") or []
+    if summary.get("planned_total", 0) <= len(planned) and summary.get("unknown_total", 0) <= len(unknown):
+        return planned, unknown
+    planned, unknown = [], []
+    for row in store.cleanup_items(run_id):
+        detail = json.loads(row["detail"] or "{}")
+        entry = {"kind": row["kind"], "name": detail.get("name", row["ref"]), "why": detail.get("why", "")}
+        if row["action"] == "report":
+            unknown.append({**entry, **{k: detail[k] for k in ("bytes", "advice") if detail.get(k) is not None}})
+        else:
+            planned.append({**entry, "action": row["action"], "result": row["result"]})
+    return planned, unknown
+
+
+class QuietEvents:
+    """A plan only reads and writes no events; the runner may be writing events.jsonl meanwhile."""
+
+    def emit(self, *_args, **_fields) -> dict:
+        return {}
+
+
+def _print_cleanup(planned: list[dict], unknown: list[dict], errors: list[str], images_in_use: int | None = None,
+                   unknown_bytes: int | None = None) -> None:
+    if not planned and not unknown and not errors:
+        print("  nothing to clean up")
+    for i in planned:
+        result = f" [{i['result']}]" if i.get("result") not in (None, "planned") else ""
+        print(f"  {i['action']:<7} {i['kind']:<9} {i['name']}: {i['why']}{result}")
+    if unknown:
+        print("Not put down to any task (reported, never removed):")
+        for i in unknown:
+            advice = i.get("advice") or (i.get("detail") or {}).get("advice")
+            note = f"  [Claude: {advice['verdict']}, {advice['reason']}]" if advice else ""
+            print(f"  {i['kind']:<9} {i['name']}: {i['why']}{note}")
+        total = unknown_bytes if unknown_bytes is not None else sum(i.get("bytes") or 0 for i in unknown)
+        if total:
+            print(f"  about {total / 1000**3:.1f} GB in all, where the size is known")
+    if images_in_use:
+        print(f"Images that containers use ({images_in_use}) are not listed.")
+    for e in errors:
+        print(f"  error: {e}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="arceus-runner", description="Arceus bridge: YouTrack, GitLab and Bulava")
     p.add_argument("--version", action="version", version=__version__)
@@ -132,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="local health: disk, RAM, CLIs, and the engine's doctor (Claude/Codex sign-in)")
     d.add_argument("--json", action="store_true")
     d.set_defaults(fn=cmd_doctor)
+
+    k = sub.add_parser("cleanup", help="what a cleanup pass would remove now and why (changes nothing)")
+    k.add_argument("--last", action="store_true", help="the last pass the runner made")
+    k.add_argument("--act", action="store_true", help="make a full pass now (stop the runner first)")
+    k.add_argument("--json", action="store_true")
+    k.set_defaults(fn=cmd_cleanup)
 
     b = sub.add_parser("probe-bulava", help="which agreed contracts the installed engine advertises")
     b.add_argument("--root", help="engine directory (default: paths.bulava from config)")
