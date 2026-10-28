@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -418,13 +419,18 @@ def test_a_required_check_that_cannot_finish_stops_the_task_for_a_person(w, monk
     try:
         state = run_until(w, "ACME-1", ("code_review", "failed", "needs_input"))
         steps = obs.steps()
-        assert [s for s in steps if s["stage"] == "gate.check" and s["state"] == "failed"], \
-            "a check that timed out did not show as failed"
+        # What the engine keeps, not its step journal: that is deleted with the instance when the engine
+        # stops it, and can be gone before the runner reads the gate's last steps.
+        readings = obs.checks()["readings"]
+        assert len(readings) == 1 and sorted(c["kind"] for c in readings[0]["checks"] if c["state"] == "failed") \
+            == ["code", "security"], f"the checks that timed out did not show as failed: {readings}"
+        assert [s for s in steps if s["stage"] == "gate.check"], "the checks never started"
         assert state == "failed", f"a required check that did not run let the task go on to {state}"
-        assert w.store.task("ACME-1").reason.startswith("an independent Claude check"), w.store.task("ACME-1").reason
+        assert w.store.task("ACME-1").reason.startswith("a required pre-review check"), w.store.task("ACME-1").reason
         assert not [s for s in steps if s["stage"] == "gate.review"], "Codex reviewed work whose checks never ran"
         assert w.gl.mrs == [] and w.remote_branch(w.store.task("ACME-1").branch) is None
-        assert any("independent Claude check" in t for t in w.bot_comments(db)), "the ticket does not say why"
+        assert any("a required pre-review check" in t for t in w.bot_comments(db)), "the ticket does not say why"
+        assert not [t for t in w.bot_comments(db) if re.search(r"Codex|Claude|Bulava", t)], "the ticket names a model"
     finally:
         subprocess.run([*keeper, "set-environment", "-gu", "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT"])
         obs.write({"ticket_comments": w.bot_comments(db)})

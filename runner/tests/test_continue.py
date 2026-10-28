@@ -235,7 +235,7 @@ def test_a_continue_bulava_refuses_is_said_once_and_not_retried(w):
     for _ in range(4):
         w.tick()
     assert len(sends(w)) == 1 and w.store.task("ACME-1").state == "failed"
-    assert len([c for c in w.bot_comments() if "Bulava did not accept the request to continue" in c]) == 1
+    assert len([c for c in w.bot_comments() if "the execution engine did not accept the request to continue" in c]) == 1
     assert not w.store.pending_continues()
 
 

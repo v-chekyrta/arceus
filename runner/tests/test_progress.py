@@ -219,6 +219,38 @@ def test_a_task_that_stops_running_is_dropped(w):
     assert p.snapshot() == []
 
 
+def test_the_steps_that_ended_an_attempt_are_read_once_after_it_stops_running(w):
+    """The runner can see the engine's verdict and fail the task in one tick, before the next look: the
+    gate's last steps must still reach the timeline, once, and nothing after the task is dropped."""
+    w.step("gate.check", "running", 1000)
+    p = w.watcher()
+    p.poll()
+    w.step("gate.check", "failed", 2000)
+    w.step("run", "needs-user", 3000)
+    w.store.update_task("ACME-1", state="failed")
+    p.poll()
+    p.poll()
+    w.step("late", "noise", 4000)
+    p.poll()
+    assert [(s["stage"], s["state"]) for s in w.emitted("engine_step")] == [
+        ("gate.check", "running"), ("gate.check", "failed"), ("run", "needs-user")]
+    assert p.snapshot() == []
+
+
+def test_a_journal_the_engine_deleted_with_the_instance_is_not_an_error_and_nothing_is_made_up(w):
+    w.step("gate.check", "running", 1000)
+    p = w.watcher()
+    p.poll()
+    w.step("gate.check", "failed", 2000)
+    for f in w.instance.iterdir():
+        f.unlink()
+    w.instance.rmdir()
+    w.store.update_task("ACME-1", state="failed")
+    p.poll()
+    assert [(s["stage"], s["state"]) for s in w.emitted("engine_step")] == [("gate.check", "running")]
+    assert not w.emitted("progress_unreadable") and p.snapshot() == []
+
+
 def test_metrics_show_the_step_activity_and_the_last_tick(w):
     w.transcript(tool("Read", file_path="x"), mtime=T0)
     w.step("gate.verify", "running", 1_792_929_000_000)

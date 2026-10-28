@@ -132,7 +132,13 @@ class ProgressWatcher:
     def poll(self) -> None:
         active = {t.task_id for t in self.store.tasks("dispatched")}
         for gone in set(self.tasks) - active:
-            del self.tasks[gone]  # over, or waiting on a person: nothing runs, nothing to show
+            # Over, or waiting on a person: nothing runs, nothing more to show. The steps the engine wrote
+            # since the last look (the gate's verdict that ended the attempt) are read once more first.
+            try:
+                self._last_steps(self.tasks[gone])
+            except OSError as e:
+                self.events.emit("progress_unreadable", task_id=gone, reason=str(e))
+            del self.tasks[gone]
         for task_id in sorted(active):
             try:
                 self._look(self.tasks.setdefault(task_id, TaskProgress(task_id)))
@@ -162,6 +168,14 @@ class ProgressWatcher:
             self._read_transcript(p, instance)
             p.observed_at = self.now().timestamp()
         self._maybe_report_activity(p)
+
+    def _last_steps(self, p: TaskProgress) -> None:
+        """The steps of the attempt being watched that came after the last look; no activity, no new attempt."""
+        attempts = (self._task_record(p.task_id) or {}).get("attempts") or []
+        last = attempts[-1] if attempts else {}
+        instance = Path(last.get("instance") or "")
+        if p.dispatch_id and last.get("dispatch_id") == p.dispatch_id and last.get("instance") and instance.is_dir():
+            self._read_steps(p, instance)
 
     def _restore(self, p: TaskProgress) -> None:
         """After a restart: go on from the last step written, never write the attempt's steps again."""

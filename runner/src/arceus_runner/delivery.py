@@ -14,7 +14,6 @@ missing instead of doing anything twice:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import unicodedata
@@ -23,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from arceus_runner import media
+from arceus_runner.replies import unattributed
 from arceus_runner.config import Config
 from arceus_runner.db import ACTIVE_STATES, TaskStore, Task, TriggerDecision
 from arceus_runner.engine import Engine, EngineError, Reply
@@ -40,9 +40,9 @@ START_REFUSED = {
     79: "the repository has files too large for a checkpoint",
 }
 FAIL_REASONS = {
-    "debt": "Codex did not accept the work",
-    "codex_unavailable": "Codex is unavailable",
-    "needs-user": "Codex handed the decision to a person",
+    "debt": "the work did not pass review",
+    "codex_unavailable": "the review step is unavailable",
+    "needs-user": "the review asked for a person's decision",
     "scope_violation": "the agent went outside the task's scope",
     "stalled": "the agent's session stopped at its prompt without finishing, again after being asked to finish",
 }
@@ -96,7 +96,7 @@ def _parse_ts(value: str | None) -> datetime | None:
 
 
 def _short(text: str, limit: int = 1500) -> str:
-    text = (text or "").strip()
+    text = unattributed(text).strip()
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -450,7 +450,7 @@ class Delivery:
         elif reply.rc == 6:
             self.events.emit("dispatch_busy", task_id=task.task_id, reason=reply.why())
         else:
-            self.fail(task, START_REFUSED.get(reply.rc) or f"Bulava did not accept the task ({reply.why()})")
+            self.fail(task, START_REFUSED.get(reply.rc) or f"the execution engine did not accept the task ({reply.why()})")
 
     # -- following a task -----------------------------------------------------------------------
 
@@ -475,7 +475,7 @@ class Delivery:
             task = self.store.update_task(task.task_id, state="dispatched",
                                           attempt_started=task.attempt_started or self.now().isoformat())
         if show is None:
-            self.fail(task, "Bulava does not know this task (the engine's state was lost)")
+            self.fail(task, "the execution engine lost track of this task (its state was lost)")
             return
 
         state = show.get("state")
@@ -495,7 +495,7 @@ class Delivery:
             # succeeded_no_change / succeeded_research, reviewed by Codex: a result, nothing to push.
             summary = (show.get("outcome") or {}).get("summary") or "No code changes were needed."
             self.comment_once(task, f"done:{len(attempts)}",
-                              f"The agent finished without changing code, and Codex accepted the result.\n\n{_short(summary)}")
+                              f"Arceus finished without code changes; the result passed review.\n\n{_short(summary)}")
             self.store.update_task(task.task_id, state="done", reason="no code changes")
             self.events.emit("task_done", task_id=task.task_id)
         elif state in ("needs_input", "blocked"):
@@ -516,20 +516,24 @@ class Delivery:
                 # Codex passed it; Bulava's own verifier did not prove it with a build/test run.
                 failed, unproven = self._verifier_gaps(receipt)
                 if failed or (not unproven and "[VERIFIER OVERRIDE]" in receipt["review_why"]):
-                    verdict = "but checks run by Bulava's verifier failed"
+                    verdict = "but the automated checks failed"
                 elif unproven:
-                    verdict = "but Bulava's verifier could not confirm it (its checks were inconclusive)"
+                    verdict = "but the automated checks were inconclusive"
                 else:
-                    verdict = "but Bulava's verifier did not confirm it with the project's build and tests"
-                self.fail(task, f"Codex accepted the change, {verdict}, so it was not published",
+                    verdict = "but the automated checks did not confirm it with the project's build and tests"
+                self.fail(task, f"The change passed review, {verdict}, so it was not published",
                           self._debt_details(task, receipt, outcome, failed + unproven), attempt=len(attempts))
                 return
             review_why = receipt.get("review_why") or ""
             if why == "needs-user" and CHECK_FAILED in review_why:
                 # bulava.claude_checks.required: the engine stopped before Codex, so it is not Codex's decision.
-                self.fail(task, "an independent Claude check (code or security review) did not run, and "
-                                "config.yaml requires it, so Codex did not review the work",
-                          review_why, attempt=len(attempts))
+                # The gate's own words stay in the event log; the ticket gets which checks did not run.
+                self.events.emit("required_check_missed", task_id=task.task_id, review_why=review_why)
+                kinds = re.search(rf"{CHECK_FAILED} \(([^)]*)\)", review_why)
+                self.fail(task, "a required pre-review check (code or security) did not run, "
+                                "so the work was not reviewed",
+                          f"Checks that did not run: {kinds.group(1) if kinds else 'code or security'}.",
+                          attempt=len(attempts))
                 return
             reason = FAIL_REASONS.get(why) or FAIL_REASONS.get(outcome.get("reason") or "") or why
             self.fail(task, reason, outcome.get("summary") or "", attempt=len(attempts))
@@ -609,20 +613,20 @@ class Delivery:
         return failed, unproven
 
     def _debt_details(self, task: Task, receipt: dict, outcome: dict, gaps: list[str] = ()) -> str:
-        """Where the unpublished work is and what Codex noted, for the person who decides next."""
+        """Where the unpublished work is and what the review noted, for the person who decides next."""
         home = self.cfg.paths.workspace.resolve()
         changed = [Path(r["path"]).name for r in receipt.get("repos") or []
                    if r.get("reviewed_sha") and r.get("reviewed_sha") != r.get("base_sha")
                    and Path(r["path"]).resolve() != home]
         lines = []
         if gaps:
-            lines += ["Verifier checks that did not pass:", *(f"- {g}" for g in gaps[:8]), ""]
+            lines += ["Automated checks that did not pass:", *(f"- {g}" for g in gaps[:8]), ""]
         lines += [f"The work is committed on branch `{task.branch}` in: {', '.join(changed) or 'no repository'}."]
-        notes = [f.get("text", "") for f in receipt.get("findings") or [] if f.get("text")]
+        notes = [unattributed(f.get("text", "")).strip() for f in receipt.get("findings") or [] if f.get("text")]
         if notes:
-            lines += ["", "Codex noted:", *(f"- {n}" for n in notes[:5])]
+            lines += ["", "Review notes:", *(f"- {n}" for n in notes[:5])]
         if outcome.get("summary"):
-            lines += ["", f"Agent's summary: {outcome['summary']}"]
+            lines += ["", f"Summary of the work: {unattributed(outcome['summary']).strip()}"]
         return "\n".join(lines)
 
     def _limits_exhausted(self) -> list[str]:
@@ -676,7 +680,7 @@ class Delivery:
         if reply.rc == 6:
             self.events.emit("send_busy", task_id=task.task_id, reason=reply.why())
             return False
-        self.fail(task, f"Bulava did not accept the follow-up ({reply.why()})")
+        self.fail(task, f"the execution engine did not accept the follow-up ({reply.why()})")
         return False
 
     # -- outcomes -------------------------------------------------------------------------------
@@ -684,15 +688,19 @@ class Delivery:
     def fail(self, task: Task, reason: str, details: str = "", attempt: int | None = None,
              also: Callable[[], None] | None = None) -> None:
         """`also` runs inside the same transaction: what has to land with the failure or not at all."""
+        # A failure outside an attempt is numbered among the task's failure comments, never named by its
+        # words: a new wording in a later version must not make the same failure a new comment. A failure
+        # recorded before is never named again (its intent keeps its own kind), and one that never reached
+        # the transaction below gets the same number when it is seen again.
         kind = f"failed:{attempt}" if attempt is not None else \
-            "failed:" + hashlib.sha1(f"{reason}\n{details}\n{task.attempt_started}".encode()).hexdigest()[:10]
+            f"failed:n{self.store.count_actions(f'{task.task_id}:comment:failed:') + 1}"
         if task.state in ("dispatched", "needs_input") and task.branch:
             self._save_progress(task)
-        body = f"The agent could not take this ticket to a merge request: {reason}."
+        body = f"Arceus could not take this ticket to a merge request: {reason}."
         if details:
             body += f"\n\n{_short(details)}"
         if task.branch:
-            body += (f"\n\nTo have the agent pick this up again, reply with a comment that starts with "
+            body += (f"\n\nTo have Arceus pick this up again, reply with a comment that starts with "
                      f"`{CONTINUE}`, followed by anything it should know (what was fixed, what to do "
                      f"differently). Its branches and commits are kept.")
         # Our own state first: it must not depend on YouTrack being up. The comment and the tag go
@@ -871,7 +879,7 @@ class Delivery:
         else:
             self.store.action_done(key, "refused")
             self.comment_once(task, f"continue-refused:{data['comment']}",
-                              f"@{data['author']}, Bulava did not accept the request to continue: {reply.why()}.")
+                              f"@{data['author']}, the execution engine did not accept the request to continue: {reply.why()}.")
 
     def _resumed(self, task: Task, key: str, data: dict, state: str, attempt) -> None:
         """The task runs again: a person's request overrides the review and CI budgets it ran out of."""
@@ -952,7 +960,7 @@ class Delivery:
                 self.git.fetch_branch(path, branch)
                 if self.git.is_ancestor(path, sha, remote):
                     # Someone (the agent, or a person) pushed more on top of what Codex reviewed.
-                    return ("the branch on GitLab has commits Codex did not review",
+                    return ("the branch on GitLab has commits that were not reviewed",
                             f"reviewed {sha[:12]}, on GitLab {remote[:12]}; the branch is left as it is, no MR opened")
             except GitError:
                 pass
@@ -1010,8 +1018,8 @@ class Delivery:
             try:
                 if path.exists() and self.git.branch_exists(path, task.branch) \
                         and self.git.current_branch(path) == task.branch and self.git.has_unpushed(path):
-                    problems.append(f"{self._repo_name(path)}: has commits on {task.branch}, but Bulava did not "
-                                    "report on this repository")
+                    problems.append(f"{self._repo_name(path)}: has commits on {task.branch}, but the execution engine "
+                                    "did not report on this repository")
             except GitError as e:
                 problems.append(f"{self._repo_name(path)}: {e}")
         if problems:
@@ -1117,8 +1125,8 @@ class Delivery:
         follow_up = task.review_rounds or task.ci_attempts
         self.store.update_task(task.task_id, mr_urls=json.dumps(sorted(set(urls) | set(json.loads(task.mr_urls)))))
         shas = "-".join(r["reviewed_sha"][:10] for _, r in plan)
-        head = ("The agent addressed the review and Codex accepted the changes. Same MR, updated branch:"
-                if follow_up else "The agent finished and Codex accepted the changes. Merge request:")
+        head = ("Arceus addressed the review comments; the updated changes passed review. Same MR, updated branch:"
+                if follow_up else "Arceus finished the work; the changes passed review. Merge request:")
         body = head + "\n" + "\n".join(f"- {u}" for u in urls)
         if dropped:
             body += "\n\nNo longer part of this task (its changes were taken back out, the MR is closed):\n" + \
@@ -1258,16 +1266,14 @@ class Delivery:
         others = [m.url for m in self.store.task_mrs(task.task_id) if m.repo != self._repo_name(path)]
         parts = [f"Ticket: [{task.task_id}]({self.cfg.youtrack.url}/issue/{task.task_id}) — {task.summary}"]
         if outcome:
-            parts += ["", "## What was done", outcome.strip()]
+            parts += ["", "## What was done", unattributed(outcome).strip()]
         if commits:
             parts += ["", "## Commits", *(f"- {c}" for c in commits)]
         if shots:
             parts += ["", media_section(shots)]
         parts += ["", "## Checks",
-                  f"Codex accepted commit `{r['reviewed_sha'][:12]}`. The code was written by the Arceus agent "
-                  "(Claude Code); the runner pushed the branch and opened this MR. Merging is up to people."]
-        if task.review_rounds or task.ci_attempts:
-            parts.append(f"Review rounds: {task.review_rounds}, CI repair attempts: {task.ci_attempts}.")
+                  f"Commit `{r['reviewed_sha'][:12]}` passed review. Arceus pushed the branch and opened this MR; "
+                  "merging is up to the team."]
         if others:
             parts += ["", "## Other MRs of this task", *(f"- {u}" for u in others)]
         return "\n".join(parts)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -273,8 +274,10 @@ def test_debt_is_not_published(w):
     w.tick()
     assert w.remote_branch("agent/ACME-1-fix-login-page") is None and w.gl.mrs == []
     task = w.store.task("ACME-1")
-    assert (task.state, task.reason) == ("failed", "Codex did not accept the work")
-    assert any("Codex: tests are missing" in t for t in w.bot_comments())
+    assert (task.state, task.reason) == ("failed", "the work did not pass review")
+    [note] = [t for t in w.bot_comments() if "did not pass review" in t]
+    assert "tests are missing" in note       # what the review found is kept, who said it is not
+    assert not re.search(r"Codex|Claude|Bulava", note)
 
 
 def test_question_goes_to_the_ticket_and_the_answer_back(w):
@@ -624,7 +627,7 @@ def test_a_changed_repository_missing_from_bulavas_report_blocks_publication(w):
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "failed" and w.gl.mrs == [] and w.remote_branch(task.branch) is None
-    assert any("acme-theme: has commits on agent/ACME-1-fix-login-page, but Bulava did not report" in c
+    assert any("acme-theme: has commits on agent/ACME-1-fix-login-page, but the execution engine did not report" in c
                for c in w.bot_comments())
 
 
@@ -717,7 +720,7 @@ def test_commits_pushed_on_top_of_the_reviewed_one_are_named_not_overwritten(w):
     w.settle("ACME-1", "waiting_review", reviewed=reviewed)
     w.tick()
     task = w.store.task("ACME-1")
-    assert task.state == "failed" and task.reason == "the branch on GitLab has commits Codex did not review"
+    assert task.state == "failed" and task.reason == "the branch on GitLab has commits that were not reviewed"
     assert w.gl.mrs == []
 
 
@@ -852,8 +855,8 @@ def test_debt_after_a_codex_pass_says_so_instead_of_blaming_codex(w):
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "failed"
-    assert task.reason.startswith("Codex accepted the change, but Bulava's verifier did not confirm it")
-    [note] = [t for t in w.bot_comments() if "Codex accepted the change" in t]
+    assert task.reason.startswith("The change passed review, but the automated checks did not confirm it")
+    [note] = [t for t in w.bot_comments() if "The change passed review" in t]
     assert "acme-platform" in note and "/oauth/ is not proxied" in note and "Error pages added" in note
     assert "inconclusive" not in note
     assert w.gl.mrs == []
@@ -882,8 +885,8 @@ def test_debt_from_a_failed_verifier_check_names_the_check_and_its_cause(w):
                                "make: *** [Makefile:13: test-lint] Error 127\n"})
     w.tick()
     task = w.store.task("ACME-1")
-    assert task.reason == "Codex accepted the change, but checks run by Bulava's verifier failed, so it was not published"
-    [note] = [t for t in w.bot_comments() if "Codex accepted the change" in t]
+    assert task.reason == "The change passed review, but the automated checks failed, so it was not published"
+    [note] = [t for t in w.bot_comments() if "The change passed review" in t]
     assert "- `omnis: make test` failed (exit 2): make: pylint: No such file or directory" in note
     assert "Vitest" not in note and "inconclusive" not in note
     assert w.gl.mrs == []
@@ -899,8 +902,8 @@ def test_debt_from_an_inconclusive_verifier_says_inconclusive(w):
         {"criterion": "make test", "status": "inconclusive", "exit_code": 142, "note": "timed out after 600s"},
     ], {})
     w.tick()
-    [note] = [t for t in w.bot_comments() if "Codex accepted the change" in t]
-    assert "its checks were inconclusive" in note
+    [note] = [t for t in w.bot_comments() if "The change passed review" in t]
+    assert "the automated checks were inconclusive" in note
     assert "- `make test` was inconclusive: timed out after 600s" in note
     assert w.gl.mrs == []
 
@@ -1139,9 +1142,13 @@ def test_a_required_check_that_did_not_run_is_not_called_codex_s_decision(w):
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "failed"
-    assert task.reason.startswith("an independent Claude check (code or security review) did not run")
+    assert task.reason.startswith("a required pre-review check (code or security) did not run")
     assert w.remote_branch("agent/ACME-1-fix-login-page") is None and w.gl.mrs == []
-    assert any("independent check failed (security)" in t for t in w.bot_comments())
+    [note] = [t for t in w.bot_comments() if "pre-review check" in t]
+    assert "Checks that did not run: security." in note
+    assert not re.search(r"Codex|Claude|Bulava|SUPERVISOR_|independent check failed", note)
+    [missed] = [e for e in read_events(w.cfg.paths.events) if e["event"] == "required_check_missed"]
+    assert missed["review_why"].startswith("independent check failed (security)")  # the gate's words stay inside
 
 
 def test_a_person_asked_by_codex_is_still_codex_s_decision(w):
@@ -1149,4 +1156,47 @@ def test_a_person_asked_by_codex_is_still_codex_s_decision(w):
     w.agent_commits()
     w.settle("ACME-1", "failed", review="failed", state_reason="needs-user")
     w.tick()
-    assert w.store.task("ACME-1").reason == "Codex handed the decision to a person"
+    assert w.store.task("ACME-1").reason == "the review asked for a person's decision"
+
+
+def test_a_model_or_engine_label_at_a_line_start_goes_and_the_same_word_in_the_text_stays():
+    from arceus_runner.replies import unattributed
+    assert unattributed("Codex: tests are missing") == "tests are missing"
+    assert unattributed("- Codex: a\n- **Claude Code:** b\n1. [Bulava]: c\nClaude: d") == "- a\n- b\n1. c\nd"
+    assert unattributed("Ran `codex exec`: fine\nuse the Codex API: it works") == \
+        "Ran `codex exec`: fine\nuse the Codex API: it works"
+
+
+def test_a_labelled_summary_and_review_notes_are_published_without_the_label(w):
+    take(w)
+    w.agent_commits()
+    w.settle("ACME-1", "failed", review="debt", state_reason="debt",
+             outcome={"result": "succeeded_changes", "summary": "Codex: tests are missing"})
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(
+        review_why="STATE: COMPLETE\nVERDICT: PASS\n\nChecked.",
+        findings=[{"kind": "note", "text": "**Claude Code:** the fixture is stale"}]))
+    w.tick()
+    [note] = [t for t in w.bot_comments() if "The change passed review" in t]
+    assert "Summary of the work: tests are missing" in note and "- the fixture is stale" in note
+    assert not re.search(r"Codex|Claude|Bulava", note)
+
+
+def test_a_failure_recorded_by_an_earlier_version_is_posted_once_with_its_own_key(w):
+    """An upgrade while a failure comment waits: the old intent (hashed from its old words) is finished as it
+    was written, the new code does not post the same failure again under a new key, and a failure the new
+    code records is numbered, not named by its words."""
+    take(w)
+    old = "failed:0123456789"
+    body = "The agent could not take this ticket to a merge request: Codex did not accept the work."
+    with w.store.transaction():
+        w.store.update_task("ACME-1", state="failed", reason="Codex did not accept the work")
+        w.store.action_intent(f"ACME-1:comment:{old}", "ACME-1", "comment", json.dumps({"kind": old, "text": body}))
+    w.tick()
+    w.tick()
+    posted = [t for t in w.bot_comments() if "could not take this ticket" in t]
+    assert posted == [f"{body}\n\n[arceus:{old}]"]
+    w.runner.delivery.fail(w.store.task("ACME-1"), "a later failure")
+    w.tick()
+    numbered = [t for t in w.bot_comments() if "[arceus:failed:n" in t]
+    assert len(numbered) == 1 and numbered[0].endswith("[arceus:failed:n2]")   # numbered after the old one
+    assert len([t for t in w.bot_comments() if "could not take this ticket" in t]) == 2
