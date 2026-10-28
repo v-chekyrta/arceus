@@ -192,8 +192,9 @@ def state_timeline(title, expr, pos, pairs, desc=""):
         "gridPos": pos, "targets": [{"refId": "A", "expr": expr, "datasource": PROM, "legendFormat": title}],
         "options": {"showValue": "never", "mergeValues": True, "alignValue": "left", "rowHeight": 0.8,
                     "legend": {"showLegend": False}, "tooltip": {"mode": "single"}},
-        "fieldConfig": {"defaults": {"mappings": mapping(pairs), "color": {"mode": "thresholds"},
-                                     "thresholds": {"mode": "absolute", "steps": [{"color": MUTED, "value": None}]},
+        # A fixed colour, not thresholds: with thresholds and mergeValues Grafana turns every value into its
+        # threshold band, so a single base step merges the whole range into one "-∞+" state and hides the mappings.
+        "fieldConfig": {"defaults": {"mappings": mapping(pairs), "color": {"mode": "fixed", "fixedColor": MUTED},
                                      "custom": {"lineWidth": 0, "fillOpacity": 80}}, "overrides": []},
     }
 

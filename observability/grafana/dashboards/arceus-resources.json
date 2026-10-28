@@ -615,16 +615,8 @@
             }
           ],
           "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#898781",
-                "value": null
-              }
-            ]
+            "mode": "fixed",
+            "fixedColor": "#898781"
           },
           "custom": {
             "lineWidth": 0,
