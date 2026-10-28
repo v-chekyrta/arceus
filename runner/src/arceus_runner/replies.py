@@ -20,6 +20,18 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+
+# "Codex: tests are missing", "- **Claude Code:** …": who said a line, at its start. The public text speaks as
+# Arceus, so the label goes and the line stays; the same words inside the text are content and are kept.
+_ATTRIBUTION = re.compile(r"(?im)^([ \t]*(?:[-*•][ \t]+|\d+[.)][ \t]+)?)(?:\*\*|\[)?"
+                          r"(?:codex|claude(?:[ \t]+code)?|bulava)(?:[ \t]*(?::\*\*|\*\*:|\]:?|:))[ \t]*")
+
+
+def unattributed(text: str) -> str:
+    """The text without the model or engine labels that start its lines (_ATTRIBUTION)."""
+    return _ATTRIBUTION.sub(r"\1", text or "")
+
+
 REPLIES_DIR = Path(".arceus") / "replies"
 NOTES_DIR = Path(".arceus") / "notes"
 MAX_FILE_BYTES = 256 * 1024

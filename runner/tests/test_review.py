@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import UTC, datetime, timedelta
 
@@ -64,7 +65,7 @@ def test_mr_description_says_what_was_done(w):
     [mr] = w.gl.mrs
     assert "Added the login fix and a test" in mr["description"]
     assert "add feature.txt" in mr["description"]           # the commit list
-    assert "/issue/ACME-1" in mr["description"] and "Codex accepted commit" in mr["description"]
+    assert "/issue/ACME-1" in mr["description"] and "passed review. Arceus pushed the branch" in mr["description"]
 
 
 def test_a_review_note_goes_to_the_agent_once_after_quiet(w):
@@ -98,7 +99,11 @@ def test_the_fix_is_published_to_the_same_mr_and_the_thread_is_answered(w):
                if n["author"]["username"] == w.gl.username]
     assert len(replies) == 1 and sha[:12] in replies[0]["body"]
     assert "add fix.txt" in w.gl.mrs[0]["description"] and "Renamed as asked" in w.gl.mrs[0]["description"]
-    assert any("The agent addressed the review" in t for t in w.bot_comments())
+    assert any("Arceus addressed the review comments" in t for t in w.bot_comments())
+    # What the runner posts speaks as Arceus: no model or engine names, no round counters.
+    public = [*w.bot_comments(), w.gl.mrs[0]["description"], *(n["body"] for x in w.gl.discussions[1]
+                                                               for n in x["notes"] if n["author"]["username"] == w.gl.username)]
+    assert not [t for t in public if re.search(r"Codex|Claude|Bulava|Review rounds|CI repair", t)]
     later(w)
     later(w)
     assert len(sends(w)) == 1                                 # the bot's own reply is not a new review
@@ -173,8 +178,11 @@ def test_ci_repairs_stop_at_the_limit_with_one_escalation(w):
         if pid == 80:
             sha = fix_and_settle(w)
     task = w.store.task("ACME-1")
-    assert len(sends(w)) == 1 and task.state == "failed" and "CI was not fixed" in task.reason
-    assert len([t for t in w.bot_comments() if "CI was not fixed" in t]) == 1
+    assert len(sends(w)) == 1 and task.state == "failed" and "CI was still failing" in task.reason
+    [note] = [t for t in w.bot_comments() if "CI was still failing" in t]
+    assert not re.search(r"\d+ attempts|\(\d+\)", note)       # no counters on the ticket
+    [hit] = w.events_named("limit_reached")
+    assert (hit["limit"], hit["used"], hit["max"]) == ("ci_fix_attempts", 1, 1)
 
 
 def test_review_rounds_stop_at_the_limit(w):
@@ -188,7 +196,11 @@ def test_review_rounds_stop_at_the_limit(w):
     w.tick()
     later(w)
     task = w.store.task("ACME-1")
-    assert len(sends(w)) == 1 and task.state == "failed" and "limit of review rounds" in task.reason
+    assert len(sends(w)) == 1 and task.state == "failed" and "review rounds allowed" in task.reason
+    [note] = [t for t in w.bot_comments() if "review rounds allowed" in t]
+    assert not re.search(r"\(\d+\)|rounds: \d", note)
+    [hit] = w.events_named("limit_reached")
+    assert (hit["limit"], hit["used"], hit["max"]) == ("review_rounds", 1, 1)
 
 
 def test_only_a_confirmed_conflict_is_repaired(w):
@@ -481,7 +493,7 @@ def test_a_mixed_batch_spends_the_ci_budget_too(w):
     w.tick()
     later(w)
     task = w.store.task("ACME-1")
-    assert len(sends(w)) == 1 and task.state == "failed" and "CI was not fixed" in task.reason
+    assert len(sends(w)) == 1 and task.state == "failed" and "CI was still failing" in task.reason
 
 
 def test_a_ticket_moved_on_by_hand_stops_watching_but_is_not_done(w):
@@ -593,7 +605,7 @@ def test_the_agent_gets_the_whole_thread_with_the_new_note_marked(w):
     d = w.gl.note(1, "reviewer", "Why do the retries live in the client?", path="app/api.py", line=42,
                   commit="3f2a9c1e5b7d" + "0" * 28)
     w.gl.note(1, "anna", "I wondered the same", discussion=d)
-    w.gl.note(1, w.gl.username, "Fixed in 9c1e00000000. Codex reviewed the change.\n\n<!-- arceus:note-0-1 -->",
+    w.gl.note(1, w.gl.username, "Fixed in 9c1e00000000.\n\n<!-- arceus:note-0-1 -->",
               discussion=d)
     w.gl.note(1, "reviewer", f"{BOT} I meant the choice of approach, not a fix", discussion=d)
     later(w)
@@ -692,7 +704,11 @@ def test_questions_do_not_use_up_the_review_rounds_but_have_a_limit_of_their_own
     later(w)
     later(w)
     task = w.store.task("ACME-1")
-    assert len(sends(w)) == 2 and task.state == "failed" and "answered without a code change (2)" in task.reason
+    assert len(sends(w)) == 2 and task.state == "failed" and "answered without a code change are used up" in task.reason
+    [note] = [t for t in w.bot_comments() if "answered without a code change are used up" in t]
+    assert not re.search(r"\(\d+\)", note)
+    [hit] = w.events_named("limit_reached")
+    assert (hit["limit"], hit["used"], hit["max"]) == ("review_answers", 2, 2)
 
 
 def test_a_long_thread_keeps_its_first_note_and_the_newest():

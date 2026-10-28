@@ -55,6 +55,6 @@ cd runner && uv venv && uv pip install -e '.[test]' && .venv/bin/pytest -q -n au
 ARCEUS_REAL_ENGINE=/opt/bulava/engine .venv/bin/pytest -q   # on a machine with Bulava installed
 ```
 
-`./verify.sh` from the root runs all of it at once: the runner's tests, the setup and sandbox script tests, and, when the sandbox container is up, the runner's tests on Linux, the runner against the real engine and the invariants of the latest live report of each scenario. No model is called. A checkout without `sandbox/` skips that part and prints that it did.
+`./verify.sh` from the root runs the runner's tests and the setup script's test. No model is called. The sandbox and its live scenarios are not part of it: they are for work on the pipeline itself and are run by hand (`sandbox/sandbox.sh test`, `sandbox/sandbox.sh live`).
 
 Where a local `sandbox/` exists, the same runs in a container before anything reaches the VM; `sandbox/README.md` there says how.

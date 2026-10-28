@@ -499,6 +499,11 @@ class TaskStore(Store):
         """`/continue` requests recorded but not yet taken by Bulava: (key, task id, payload)."""
         return [(k, t, p) for k, t, kind, p in self.pending_actions() if kind == "continue"]
 
+    def count_actions(self, prefix: str) -> int:
+        """How many actions have an idempotency key that starts with `prefix`, done or not."""
+        return self.conn.execute("SELECT COUNT(*) FROM actions WHERE substr(idem_key, 1, ?) = ?",
+                                 (len(prefix), prefix)).fetchone()[0]
+
     def pending_actions(self) -> list[tuple[str, str, str, str | None]]:
         rows = self.conn.execute(
             "SELECT idem_key, task_id, kind, result FROM actions WHERE status = 'intent' ORDER BY updated_at"

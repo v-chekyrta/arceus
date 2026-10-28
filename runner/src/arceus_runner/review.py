@@ -296,16 +296,22 @@ class ReviewLoop:
             has_ci = any(s.kind == "ci" for s in pending)
             lim = self.cfg.limits
             if has_ci and task.ci_attempts >= lim.max_ci_fix_attempts:
-                self.d.fail(task, f"CI was not fixed in {lim.max_ci_fix_attempts} attempts in a row; a person is needed",
+                self.events.emit("limit_reached", task_id=task.task_id, limit="ci_fix_attempts",
+                                 used=task.ci_attempts, max=lim.max_ci_fix_attempts)
+                self.d.fail(task, "CI was still failing after the allowed number of repair attempts; a person is needed",
                             self._compose(task, pending)[:1500])
                 return
             if not ci_only and task.review_rounds >= lim.max_review_rounds:
-                self.d.fail(task, f"the limit of review rounds ({lim.max_review_rounds}) is used up; a person is needed",
+                self.events.emit("limit_reached", task_id=task.task_id, limit="review_rounds",
+                                 used=task.review_rounds, max=lim.max_review_rounds)
+                self.d.fail(task, "the review rounds allowed for this task are used up; a person is needed",
                             self._compose(task, pending)[:1500])
                 return
             if not ci_only and task.review_answers >= lim.max_review_answers:
-                self.d.fail(task, f"the limit of review rounds answered without a code change "
-                                  f"({lim.max_review_answers}) is used up; a person is needed",
+                self.events.emit("limit_reached", task_id=task.task_id, limit="review_answers",
+                                 used=task.review_answers, max=lim.max_review_answers)
+                self.d.fail(task, "the review rounds that may be answered without a code change are used up; "
+                                  "a person is needed",
                             self._compose(task, pending)[:1500])
                 return
             ids = [s.id for s in pending]
@@ -355,7 +361,7 @@ class ReviewLoop:
         elif reply.rc == 6:
             self.events.emit("review_busy", task_id=task.task_id, batch=batch.id)  # kept, sent next tick
         else:
-            self.d.fail(task, f"Bulava did not accept the review follow-up ({reply.why()})")
+            self.d.fail(task, f"the execution engine did not accept the review follow-up ({reply.why()})")
 
     def _threads(self, task: Task, signals: list[Signal]) -> tuple[list[str], list[str]]:
         """Each MR thread addressed to the agent in this round, whole: the earlier notes are its context.
@@ -478,7 +484,7 @@ class ReviewLoop:
                 self.store.mark_replied(s.id)  # two notes in one thread get one reply
                 continue
             answered.add(key)
-            self._reply_once(task, s, mrs[s.repo], body(answers.get(key), s.repo)[:8000])
+            self._reply_once(task, s, mrs[s.repo], replies.unattributed(body(answers.get(key), s.repo))[:8000])
 
     def after_publish(self, task: Task, published: dict[str, str]) -> None:
         """Answer in each thread of the last round: the agent's answer, and the commit if it changed code."""
@@ -490,9 +496,9 @@ class ReviewLoop:
         def body(answer: replies.Reply | None, repo: str) -> str:
             sha = (published.get(repo) or mrs[repo].published_sha)[:12]
             if answer is None:
-                return f"Fixed in {sha}. Codex reviewed the change."
+                return f"Fixed in {sha}."
             if answer.changed:
-                return f"{answer.text}\n\nChanged in {sha}. Codex reviewed the change."
+                return f"{answer.text}\n\nChanged in {sha}."
             return answer.text
 
         self._answer_threads(task, batch, body)
@@ -500,7 +506,8 @@ class ReviewLoop:
     def answered_without_changes(self, task: Task, summary: str) -> None:
         """The agent decided nothing had to change: its answers go to the threads, the task stays in Code Review."""
         batch = self.store.last_sent_batch(task.task_id)
-        text = f"The agent looked into this and did not change the code: {summary.strip() or 'no explanation given'}"
+        text = ("The agent looked into this and did not change the code: "
+                f"{replies.unattributed(summary).strip() or 'no explanation given'}")
         if batch:
             self._answer_threads(task, batch, lambda answer, repo: answer.text if answer else text[:3000])
             if not batch.ci_only:

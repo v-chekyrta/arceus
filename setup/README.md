@@ -152,7 +152,7 @@ A `config.yaml` written from an earlier example has `required: false` in it, and
 What to know:
 
 - **Spent rounds stop the checks for the task.** Once the findings have gone back `rounds` times, the engine does not run the checks again for that task. Fixes after MR comments and red CI then go to Codex alone, and Codex is shown the last reading.
-- **A check that did not run** (time, a Claude limit, no answer, the network, a write) is shown as `gate.check failed` in the engine steps (Grafana, `engine_step`). With `required: true` the task then fails before Codex, nothing is published, and the ticket says "an independent Claude check (code or security review) did not run"; `/continue` runs it again. With `required: false` the work goes on to Codex alone, and only the engine steps show it.
+- **A check that did not run** (time, a Claude limit, no answer, the network, a write) is shown as `gate.check failed` in the engine steps (Grafana, `engine_step`). With `required: true` the task then fails before Codex, nothing is published, and the ticket says "a required pre-review check (code or security) did not run"; `/continue` runs it again. With `required: false` the work goes on to Codex alone, and only the engine steps show it.
 - **Time and quota.** Two more Claude sessions per review on the same subscription, up to `timeout` each, inside the review gate's hour, together with the build and Codex. A diff over 400 000 characters is cut, and the checks read the rest from the files.
 - **A start that waits for its session.** The engine rolls a start back when the new session's hooks do not confirm the run in time (`SUPERVISOR_HANDSHAKE_WAIT`, 5 s in the engine), and the ticket then fails. A cold Claude on a busy machine is slower than that, so the runner passes `bulava.start_handshake_wait` (30 s by default, 5 s–2 m).
 - **The agent's model and depth.** Both checks run on `bulava.claude_model` and `bulava.claude_effort`, the ones the task started with; there is no setting of their own. With `auto` no `--model` is passed (the Claude CLI's default for the server's account) and the engine's `high` is the depth. A change in `config.yaml` reaches new tasks only.
@@ -230,7 +230,7 @@ The runner. Bulava refuses `git push` inside a run, so the agent only commits; o
 - the ticket, with a link;
 - **What was done**: the agent's own summary of the attempt (the `summary` it reports to Bulava);
 - **Commits**: the task branch's commits since its base;
-- **Checks**: which commit Codex accepted, how many review and CI rounds there were;
+- **Checks**: which commit passed review (no model or tool names, no round counters: those stay in the metrics);
 - the other MRs of the same task, when it changed more than one repository.
 
 After every review round the description is rewritten to match the branch.
