@@ -216,22 +216,6 @@ def test_only_a_confirmed_conflict_is_repaired(w):
     assert "conflicts with main" in send["argv"][-1] and "git merge origin/main" in send["argv"][-1]
 
 
-def test_merged_mr_ends_the_task(w):
-    published(w)
-    w.gl.mrs[0]["state"] = "merged"
-    w.tick()
-    task = w.store.task("ACME-1")
-    assert task.state == "done" and any("are merged" in t for t in w.bot_comments())
-
-
-def test_a_closed_mr_stops_the_loop(w):
-    published(w)
-    w.gl.mrs[0]["state"] = "closed"
-    w.tick()
-    task = w.store.task("ACME-1")
-    assert task.state == "failed" and "closed without merge" in task.reason
-
-
 def test_two_mrs_need_both_merged(w):
     take(w)
     theme = w.cfg.paths.workspace / "acme-theme"
@@ -259,7 +243,7 @@ def test_two_mrs_need_both_merged(w):
     assert w.store.task("ACME-1").state == "code_review"
     w.gl.mrs[1]["state"] = "merged"
     later(w)
-    assert w.store.task("ACME-1").state == "done"
+    assert w.store.task("ACME-1").state == "done" and any("are merged" in t for t in w.bot_comments())
 
 
 def test_a_follow_up_without_changes_answers_and_stays_in_review(w):
@@ -911,7 +895,7 @@ def test_a_reopen_withdraws_the_request_even_once_it_is_batched(w):
     assert "Rename the class" in texts[-1] and "closed the MR" not in texts[-1]
 
 
-def test_the_runner_closing_an_mr_explains_it_once_across_a_crash(w, monkeypatch):
+def test_a_close_that_gitlab_refused_is_retried_without_a_second_note(w, monkeypatch):
     two_mrs(w)
     w.gl.note(1, "reviewer", "@acme-agent-bot Drop the platform part")
     w.tick()

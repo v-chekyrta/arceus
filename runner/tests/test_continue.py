@@ -84,14 +84,19 @@ def test_only_a_new_continue_from_someone_allowed_counts(w):
 
 def test_a_continue_waits_while_bulava_is_busy_and_is_not_lost(w):
     failed(w)
-    w.yt.comment("2-1", "j.doe", "/continue")
+    w.yt.comment("2-1", "j.doe", "/continue  please retry ")
     w.set_engine(lambda s: s["next_rc"].update({"worker-send": 6}))
     w.tick()  # seen on the YouTrack poll, sent right after: Bulava is busy
     assert w.store.task("ACME-1").state == "failed" and w.store.pending_continues()
     w.restart()
     w.tick()
-    assert w.store.task("ACME-1").state == "dispatched" and not w.store.pending_continues()
-    assert len([s for s in sends(w) if s["argv"]]) == 2  # the refused one, then the accepted one
+    task = w.store.task("ACME-1")
+    assert task.state == "dispatched" and not w.store.pending_continues()
+    refused, accepted = [s for s in sends(w) if s["argv"]]
+    # What was kept across the restart is the request itself: its words, its author and when it was made.
+    assert accepted["argv"][-1].endswith("please retry") and flag(accepted["argv"], "--author") == "j.doe"
+    [comment] = [c for c in w.yt.comments["2-1"] if c["text"].startswith("/continue")]
+    assert task.published_at_ms == comment["created"]
 
 
 def test_a_pending_continue_goes_before_a_new_ticket(w):
@@ -215,17 +220,6 @@ def test_continue_window_is_honoured(w):
     for _ in range(3):
         w.tick()
     assert sends(w) == [] and w.store.task("ACME-1").state == "failed"
-
-
-def test_journal_payload_is_what_is_needed_to_send_later(w):
-    failed(w)
-    w.yt.comment("2-1", "j.doe", "/continue  please retry ")
-    w.set_engine(lambda s: s["next_rc"].update({"worker-send": 6}))
-    w.tick()
-    [(key, task_id, payload)] = w.store.pending_continues()
-    [comment] = [c for c in w.yt.comments["2-1"] if c["text"].startswith("/continue")]
-    assert task_id == "ACME-1" and json.loads(payload) == {
-        "comment": key.rsplit(":", 1)[1], "author": "j.doe", "created": comment["created"], "text": "please retry"}
 
 
 def test_a_continue_bulava_refuses_is_said_once_and_not_retried(w):

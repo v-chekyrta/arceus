@@ -53,25 +53,6 @@ class FakeClock:
         self.t += seconds
 
 
-class Recorder:
-    """A MockTransport handler that records requests and dispatches to a function."""
-
-    def __init__(self, handler):
-        self.handler = handler
-        self.requests: list[httpx.Request] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        return self.handler(request)
-
-    @property
-    def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self)
-
-    def paths(self) -> list[str]:
-        return [r.url.path for r in self.requests]
-
-
 def json_response(data, status: int = 200, headers: dict | None = None) -> httpx.Response:
     return httpx.Response(status, content=json.dumps(data).encode(), headers={"content-type": "application/json",
                                                                                **(headers or {})})
