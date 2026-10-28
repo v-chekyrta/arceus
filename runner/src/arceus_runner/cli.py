@@ -1,4 +1,4 @@
-"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup."""
+"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind."""
 
 from __future__ import annotations
 
@@ -8,15 +8,18 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
+
 from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
-from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, load_config, load_secrets
+from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, is_legacy, load_config, load_secrets
 from arceus_runner.db import ACTIVE_STATES, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.engine import Engine
 from arceus_runner.health import claude_checks, engine_doctor, local_checks
 from arceus_runner.events import EventLog
-from arceus_runner.loop import LiveModeUnavailable, make_cleanup, require_mode_ready, run
+from arceus_runner.integrations import build_code_host, build_tracker
+from arceus_runner.loop import IntegrationChanged, LiveModeUnavailable, make_cleanup, require_mode_ready, run
 
 EXIT_OK = 0
 EXIT_CHECK_FAILED = 1
@@ -48,6 +51,10 @@ def _print_checks(checks: list[Check], as_json: bool) -> bool:
 def cmd_check(args) -> int:
     cfg, secrets = _load(args)
     checks = [Check("config", "ok", str(_config_path(args.config)))]
+    if is_legacy(yaml.safe_load(_config_path(args.config).read_text(encoding="utf-8"))):
+        checks.append(Check("config.layout", "warn", "the youtrack: and gitlab: sections are the layout before "
+                                                     "tracker: and code_host:; they still load as before. To move "
+                                                     "on, see config/config.example.yaml"))
     try:
         require_mode_ready(cfg, bulava_mod.probe(cfg.paths.bulava))
         checks.append(Check("config.mode", "ok", cfg.mode))
@@ -124,6 +131,25 @@ def cmd_run(args) -> int:
             print("runner not started: fix the checks above", file=sys.stderr)
             return EXIT_CHECK_FAILED
     return run(cfg, secrets, once=args.once)
+
+
+def cmd_rebind(args) -> int:
+    """Bind runner.db to the tracker or code host config.yaml names now: the same one under a new address."""
+    cfg, secrets = _load(args)
+    lock = InstanceLock(cfg.paths.db.with_suffix(".lock"))
+    lock.acquire()  # the runner must be stopped: it checks the binding when it starts
+    try:
+        store = ReviewStore(cfg.paths.db)
+        try:
+            adapter = build_tracker(cfg, secrets) if args.role == "tracker" else build_code_host(cfg, secrets)
+            adapter.client.close()
+            was = store.rebind_integration(args.role, adapter.identity())
+        finally:
+            store.close()
+    finally:
+        lock.release()
+    print(f"{args.role}: {was or 'not bound'} -> {adapter.identity()}")
+    return EXIT_OK
 
 
 def cmd_cleanup(args) -> int:
@@ -257,12 +283,14 @@ def _print_cleanup(planned: list[dict], unknown: list[dict], errors: list[str], 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="arceus-runner", description="Arceus bridge: YouTrack, GitLab and Bulava")
+    p = argparse.ArgumentParser(prog="arceus-runner",
+                                description="Arceus bridge between an issue tracker, a code host and Bulava")
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("--config", help=f"config.yaml (default: $ARCEUS_RUNNER_CONFIG or {DEFAULT_CONFIG})")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("check", help="validate config.yaml and secrets, then check them against YouTrack/GitLab/Slack")
+    c = sub.add_parser("check", help="validate config.yaml and secrets, then check them against the tracker, "
+                                     "the code host and Slack")
     c.add_argument("--offline", action="store_true", help="only validate the files, no network")
     c.add_argument("--json", action="store_true")
     c.set_defaults(fn=cmd_check)
@@ -285,6 +313,11 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("engine-env", help="the check settings for bulava-engine.service (setup.sh writes them there)")
     e.set_defaults(fn=cmd_engine_env)
 
+    rb = sub.add_parser("rebind", help="bind runner.db to the tracker or code host config.yaml names now "
+                                       "(the same one under a new address; stop the runner first)")
+    rb.add_argument("role", choices=["tracker", "code_host"])
+    rb.set_defaults(fn=cmd_rebind)
+
     b = sub.add_parser("probe-bulava", help="which agreed contracts the installed engine advertises")
     b.add_argument("--root", help="engine directory (default: paths.bulava from config)")
     b.add_argument("--json", action="store_true")
@@ -300,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
         for problem in e.problems:
             print(f"config: {problem}", file=sys.stderr)
         return EXIT_CONFIG
-    except LiveModeUnavailable as e:
+    except (LiveModeUnavailable, IntegrationChanged) as e:
         print(f"config: {e}", file=sys.stderr)
         return EXIT_CONFIG
     except AlreadyRunning as e:

@@ -4,7 +4,7 @@ You run unattended on the project's server, fed tickets by the Arceus runner. Th
 
 **The workspace** is the folder your session starts in: it holds the project's repositories, one folder each, and an `AGENTS.md` that gives its absolute path and lists the repositories. Below, `<workspace>` stands for that absolute path and `<ticket key>` for the ticket you work on (for example `ABC-12`). Wherever a path is asked for, write the real one out in full.
 
-- **Language.** Commit messages, your run summary (it becomes the merge request description) and anything that ends up in GitLab or YouTrack are written in English, whatever language the ticket or a comment uses.
+- **Language.** Commit messages, your run summary (it becomes the merge request description) and anything that ends up in the merge requests or on the ticket are written in English, whatever language the ticket or a comment uses.
 - **Dev servers.** Start long-running processes (`manage.py runserver`, `npm run dev`, a static file server) with the Bash tool's `run_in_background`, not with `&` inside a command. Stop them by PID, or with a pattern that cannot match your own command line: `pkill -f "[m]anage.py runserver"`. A plain `pkill -f "manage.py runserver"` also matches the shell running it and kills your own command (exit code 143/144).
 - **Screenshots.** Files the engine's tools save under `~/.claude/supervisor/reports/` can be opened with Read; look at them to check visual work.
 - **Visual proof for reviewers.** When your change is something people see (a page, a component, an error screen, an email), leave proof of it for the merge request and the ticket. You cannot upload anything yourself; the runner does it when it publishes your work.

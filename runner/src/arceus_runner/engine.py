@@ -1,7 +1,7 @@
 """The Bulava engine's command line, as engine/SERVER.md defines it.
 
 Bulava's processes get their own environment: the engine settings plus
-bulava.env (the Claude token). The runner's GitLab, YouTrack and Slack tokens
+bulava.env (the Claude token). The runner's tracker, code host and Slack tokens
 are never in it.
 """
 
@@ -151,10 +151,10 @@ class Engine:
             raise EngineError(f"{Path(args[0]).name}: {e}") from None
 
     def dispatch(self, *, task_id: str, message_id: str, author: str, branch: str, base: str, repo: Path,
-                 text: str, clearance: Clearance, extra_dirs: Path | None = None) -> Reply:
+                 text: str, clearance: Clearance, source: str = "tracker", extra_dirs: Path | None = None) -> Reply:
         _require(clearance, text, task_id)
         return self._call("dispatch", task_id, message_id, [
-            str(self.bin / "dispatch.sh"), "--task-id", task_id, "--message-id", message_id, "--source", "youtrack",
+            str(self.bin / "dispatch.sh"), "--task-id", task_id, "--message-id", message_id, "--source", source,
             "--author", author, "--branch", branch, "--base", base, "--dirty", "fail", str(repo), text], extra_dirs)
 
     def send(self, *, task_id: str, message_id: str, source: str, author: str, repo: Path, text: str,

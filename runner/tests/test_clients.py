@@ -4,19 +4,24 @@ from datetime import date
 
 import httpx
 
-from arceus_runner.checks import _guard, check_gitlab, check_youtrack, gitlab_client, youtrack_client
-from arceus_runner.gitlab import GitLab
-from arceus_runner.youtrack import YouTrack, query_value
+from arceus_runner.checks import _guard, check_tracker
+from arceus_runner.gitlab import GitLab, check_gitlab, gitlab_client
+from arceus_runner.integrations import build_tracker
+from arceus_runner.youtrack import YouTrack, query_value, youtrack_client
 
 from .fakes import FakeGitLab, FakeYouTrack
 
 
 def yt(cfg, secrets, fake) -> YouTrack:
-    return YouTrack(youtrack_client(cfg, secrets, transport=httpx.MockTransport(fake)))
+    return YouTrack(youtrack_client(cfg.tracker, secrets.tracker, cfg.http, transport=httpx.MockTransport(fake)))
 
 
 def gl(cfg, secrets, fake) -> GitLab:
-    return GitLab(gitlab_client(cfg, secrets, transport=httpx.MockTransport(fake)))
+    return GitLab(gitlab_client(cfg.code_host, secrets.code_host, cfg.http, transport=httpx.MockTransport(fake)))
+
+
+def check_youtrack(cfg, secrets, fake):
+    return check_tracker(cfg, build_tracker(cfg, secrets, transport=httpx.MockTransport(fake)))
 
 
 def test_more_than_42_issues_are_all_read(cfg, secrets):
@@ -61,11 +66,11 @@ def test_youtrack_check_reports_each_mistake_separately(cfg, secrets):
     fake.states = ["Open", "In Progress", "Code Review"]  # queued state "To Do" is missing
     fake.tags.discard("agent-failed")
     fake.users.discard("a.smith")
-    results = {c.name: c for c in check_youtrack(cfg, yt(cfg, secrets, fake))}
+    results = {c.name: c for c in check_youtrack(cfg, secrets, fake)}
     failed = sorted(n for n, c in results.items() if c.status == "fail")
     assert failed == [
         "security.reviewers.a.smith",  # a reviewer must be a real user too
-        "youtrack.allowed_users.a.smith",
+        "tracker.allowed_users.a.smith",
         "youtrack.states.queued",
         "youtrack.tags.failed",
     ]
@@ -73,25 +78,25 @@ def test_youtrack_check_reports_each_mistake_separately(cfg, secrets):
 
 
 def test_youtrack_check_wrong_bot(cfg, secrets):
-    results = {c.name: c for c in check_youtrack(cfg, yt(cfg, secrets, FakeYouTrack(login="someone")))}
-    assert results["youtrack.bot_login"].status == "fail"
-    assert "token belongs to 'someone'" in results["youtrack.bot_login"].detail
+    results = {c.name: c for c in check_youtrack(cfg, secrets, FakeYouTrack(login="someone"))}
+    assert results["youtrack.bot_user"].status == "fail"
+    assert "token belongs to 'someone'" in results["youtrack.bot_user"].detail
 
 
 def test_youtrack_check_auth_failure(cfg, secrets):
     fake = FakeYouTrack()
     fake.fail["/api/users/me"] = 401
-    [c] = check_youtrack(cfg, yt(cfg, secrets, fake))
+    [c] = check_youtrack(cfg, secrets, fake)
     assert (c.name, c.status) == ("youtrack.auth", "fail")
-    assert secrets.youtrack not in c.detail
+    assert secrets.tracker not in c.detail
 
 
 def test_gitlab_check(cfg, secrets):
     fake = FakeGitLab()
     fake.repos = ["acme-theme", "acme-infra"]
     fake.token = {"scopes": ["read_api"], "expires_at": "2026-10-30"}
-    results = {c.name: c for c in check_gitlab(cfg, gl(cfg, secrets, fake), today=date(2026, 10, 23))}
-    assert results["gitlab.bot_username"].status == "ok"
+    results = {c.name: c for c in check_gitlab(cfg.code_host, gl(cfg, secrets, fake), 14, today=date(2026, 10, 23))}
+    assert results["gitlab.bot_user"].status == "ok"
     assert "gitlab.default_repo" not in results
     assert results["gitlab.token_scopes"].status == "fail"
     assert (results["gitlab.token_expiry"].status, results["gitlab.token_expiry"].detail) == (
@@ -101,15 +106,14 @@ def test_gitlab_check(cfg, secrets):
 def test_gitlab_check_expired_token(cfg, secrets):
     fake = FakeGitLab()
     fake.token = {"scopes": ["api"], "expires_at": "2026-10-01"}
-    results = {c.name: c for c in check_gitlab(cfg, gl(cfg, secrets, fake), today=date(2026, 10, 23))}
+    results = {c.name: c for c in check_gitlab(cfg.code_host, gl(cfg, secrets, fake), 14, today=date(2026, 10, 23))}
     assert results["gitlab.token_expiry"].status == "fail"
 
 
 def test_error_bodies_are_scrubbed_of_our_tokens(cfg, secrets):
     fake = FakeYouTrack()
     fake.fail["/api/admin/projects"] = 422  # the fake echoes the Authorization header
-    client = yt(cfg, secrets, fake)
-    [result] = _guard("youtrack", lambda: check_youtrack(cfg, client))
+    [result] = _guard("youtrack", lambda: check_youtrack(cfg, secrets, fake))
     assert (result.name, result.status) == ("youtrack.request", "fail")
     text = result.detail
-    assert "HTTP 422" in text and secrets.youtrack not in text
+    assert "HTTP 422" in text and secrets.tracker not in text

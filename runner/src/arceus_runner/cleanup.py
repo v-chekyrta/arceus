@@ -1021,7 +1021,7 @@ class Cleanup:
 
     def _plan_repos(self, owners: Owners) -> list[Item]:
         ws, items = self.cfg.paths.workspace, []
-        prefix = self.cfg.gitlab.branch_prefix
+        prefix = self.cfg.code_host.branch_prefix
         for repo in self._repos():
             name = str(repo.relative_to(ws))
             branch = self.git.current_branch(repo)
@@ -1045,13 +1045,13 @@ class Cleanup:
                         continue
                     if self.git.on_remote(repo, sha) or self._published(owner, name, sha):
                         items.append(Item("branch", f"{repo}:{b}", f"{name}: {b}", "delete",
-                                          f"{owner} is over and GitLab has its commits", task=owner,
+                                          f"{owner} is over and the code host has its commits", task=owner,
                                           detail={"sha": sha, "repo": name}))
         return items
 
     def _published(self, key: str, repo: str, sha: str) -> bool:
         """The branch is exactly what was published to an MR that people merged (a squash merge leaves the
-        commits nowhere on GitLab, and a deleted source branch takes the ref)."""
+        commits nowhere on the code host, and a deleted source branch takes the ref)."""
         task = self.store.task(key)
         if not task or task.state != "done" or not hasattr(self.store, "task_mrs"):
             return False
@@ -1204,17 +1204,17 @@ class Cleanup:
                 return self._kept(it, "checked out")
             if self.git.local_branches(Path(repo), branch).get(branch) != it.detail["sha"]:
                 return self._kept(it, "it moved")
-            # The plan read GitLab as last fetched: a branch deleted or force-pushed there since may have taken
+            # The plan read the code host as last fetched: a branch deleted or force-pushed there since may have taken
             # these commits. Fetched now, with --prune, or the branch stays.
             try:
                 self.git.fetch(Path(repo))
             except GitError as e:
                 if OUT_OF_TIME in str(e):
                     raise
-                return self._kept(it, f"GitLab could not be read: {str(e)[:120]}")
+                return self._kept(it, f"the code host could not be read: {str(e)[:120]}")
             if not (self.git.on_remote(Path(repo), it.detail["sha"]) or self._published(it.task, it.detail.get("repo", ""),
                                                                                          it.detail["sha"])):
-                return self._kept(it, "GitLab no longer has its commits")
+                return self._kept(it, "the code host no longer has its commits")
             self.git.delete_branch_at(Path(repo), branch, it.detail["sha"])
             return "done"
         if it.kind == "folder":

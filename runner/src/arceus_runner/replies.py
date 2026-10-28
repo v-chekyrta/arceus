@@ -1,6 +1,6 @@
 """The agent's answers to the MR threads of a review round, one per thread.
 
-The agent has no GitLab credentials, so it cannot post in a thread itself. The follow-up names
+The agent has no code host credentials, so it cannot post in a thread itself. The follow-up names
 each thread addressed to it (`T1`, `T2`, …) and the file to answer in,
 `.arceus/replies/<ticket key>/<batch id>.json` in the workspace:
 

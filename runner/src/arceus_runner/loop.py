@@ -1,15 +1,18 @@
 """The main loop.
 
-`observe` polls YouTrack, works out which issues are queued and who queued
-them, checks health and writes what it would do to events.jsonl. It sends only
-GET requests and changes nothing in YouTrack, GitLab or the workspace.
+`observe` polls the issue tracker, works out which issues are queued and who
+queued them, checks health and writes what it would do to events.jsonl. It sends
+only GET requests and changes nothing in the tracker, the code host or the workspace.
 
 `live` does the same and then delivers (delivery.py): takes one queued ticket at
 a time, runs it in Bulava, publishes the reviewed commit as an MR, carries
 questions to the ticket and answers back.
 
 Every service has its own next-poll time: a paused or slow
-GitLab does not delay YouTrack, and the other way round.
+code host does not delay the tracker, and the other way round.
+
+The tracker and the code host are whatever config.yaml names (integrations.py); this module
+never knows which.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from arceus_runner import bulava as bulava_mod
-from arceus_runner.checks import Check, gitlab_client, token_expiry, youtrack_client
+from arceus_runner.checks import Check
 from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Docker, Situation
 from arceus_runner.config import Config, Schedule, Secrets
 from arceus_runner.db import ACTIVE_STATES, InstanceLock, ReviewStore, TaskStore
@@ -30,14 +33,13 @@ from arceus_runner.delivery import Delivery
 from arceus_runner.review import ReviewLoop
 from arceus_runner.engine import Engine
 from arceus_runner.events import EventLog
-from arceus_runner.gitlab import GitLabReview
-from arceus_runner.gitops import Git, GitAuth, write_git_credentials
+from arceus_runner.gitops import Git, write_git_credentials
 from arceus_runner.health import engine_doctor, local_checks
 from arceus_runner.metrics import Metrics
 from arceus_runner.progress import ProgressWatcher
 from arceus_runner.screening import ClaudeClassifier, Classify, classifier_env
 from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError, TransientError
-from arceus_runner.youtrack import Issue, YouTrackWriter
+from arceus_runner.integrations import CodeHost, Issue, IssueTracker, build_code_host, build_tracker
 
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 DOCTOR_EVERY = 600
@@ -46,6 +48,23 @@ TOKEN_CHECK_EVERY = 3600
 
 class LiveModeUnavailable(Exception):
     pass
+
+
+class IntegrationChanged(Exception):
+    pass
+
+
+def bind_integrations(store: TaskStore, tracker: IssueTracker, host: CodeHost) -> None:
+    """runner.db holds tasks, journaled writes and review signals of one tracker and one code host. Another
+    one in config.yaml would get them: a pending comment posted on a stranger's issue, an MR id read in
+    another repository. The first start binds the database; a different integration later is refused."""
+    for role, identity in (("tracker", tracker.identity()), ("code_host", host.identity())):
+        bound = store.bind_integration(role, identity)
+        if bound != identity:
+            raise IntegrationChanged(
+                f"{store.path} belongs to {role} {bound!r}, config.yaml now names {identity!r}. Its tasks and "
+                "pending writes are for the first one. Point paths.db at a new file for the new one; if it is the "
+                f"same {role} under a new address, run: arceus-runner rebind {role}")
 
 
 def require_mode_ready(cfg: Config, probe: bulava_mod.Probe) -> None:
@@ -75,8 +94,8 @@ class Runner:
         cfg: Config,
         store: TaskStore,
         events: EventLog,
-        yt_client: ServiceClient,
-        gl_client: ServiceClient,
+        tracker: IssueTracker,
+        code_host: CodeHost,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         mono: Callable[[], float] = time.monotonic,
         engine: Engine | None = None,
@@ -92,14 +111,12 @@ class Runner:
         self.events = events
         self.now = now
         self.mono = mono
-        self.yt_client = yt_client
-        self.gl_client = gl_client
-        self.yt = YouTrackWriter(yt_client)
-        self.gl = GitLabReview(gl_client)
+        self.tracker = tracker
+        self.code_host = code_host
         self.delivery: Delivery | None = None
         if cfg.mode == "live":
             assert engine is not None and git is not None and classify is not None
-            self.delivery = Delivery(cfg, store, events, self.yt, self.gl, engine, git, classify, now=now)
+            self.delivery = Delivery(cfg, store, events, tracker, code_host, engine, git, classify, now=now)
             self.review = ReviewLoop(self.delivery)
             self.delivery.review = self.review
         self.progress = ProgressWatcher(cfg.paths.bulava_state, cfg.paths.workspace, store, events, now,
@@ -108,7 +125,7 @@ class Runner:
         self.cleanup = cleanup
         self.engine = engine
         self.health: dict[str, str] = {}
-        self.next_due: dict[str, float] = {"local": 0.0, "youtrack": 0.0, "gitlab": 0.0, "doctor": 0.0,
+        self.next_due: dict[str, float] = {"local": 0.0, "tracker": 0.0, "code_host": 0.0, "doctor": 0.0,
                                            "token": 0.0, "progress": 0.0}
         self._unknown_trigger: set[str] = set()
 
@@ -147,25 +164,26 @@ class Runner:
         screening = self.delivery.gate.health() if self.delivery else None
         self._record_health(checks + getattr(self, "_doctor", []) + ([screening] if screening else []))
 
-    def poll_gitlab(self) -> None:
-        # GitLab as a health signal: reachable, token accepted, and (hourly) not about to expire.
+    def poll_code_host(self) -> None:
+        # The code host as a health signal: reachable, token accepted, and (hourly) not about to expire.
+        host = self.code_host
         try:
-            self.gl.me()
-            checks = [Check("service.gitlab", "ok", "reachable")]
+            host.ping()
+            checks = [Check(f"service.{host.client.name}", "ok", "reachable")]
             if self.mono() >= self.next_due["token"]:
-                checks.append(token_expiry(self.cfg, self.gl))
+                expiry = host.token_check(self.cfg.health.token_expiry_warn_days)
+                checks += [expiry] if expiry else []
                 self.next_due["token"] = self.mono() + TOKEN_CHECK_EVERY
         except ServiceError as e:
-            self._service_failed(self.gl_client, e)
+            self._service_failed(host.client, e)
             return
         self._record_health(checks)
 
-    def poll_youtrack(self) -> None:
-        c = self.cfg.youtrack
+    def poll_tracker(self) -> None:
         try:
-            issues = self.yt.queued_issues(c.project, c.tags.queue, c.state_field, c.states.queued)
+            issues = self.tracker.queued()
         except ServiceError as e:
-            self._service_failed(self.yt_client, e)
+            self._service_failed(self.tracker.client, e)
             return
         for issue in issues:
             try:
@@ -174,17 +192,18 @@ class Runner:
                 # One broken or deleted issue is skipped; the rest are still processed.
                 self.events.emit("issue_skipped", task_id=issue.key, reason=str(e))
             except ServiceError as e:
-                self._service_failed(self.yt_client, e)
+                self._service_failed(self.tracker.client, e)
                 return
-        self._record_health([Check("service.youtrack", "ok", f"{len(issues)} queued")])
+        self._record_health([Check(f"service.{self.tracker.client.name}", "ok", f"{len(issues)} queued")])
         if self.delivery:
             self.delivery.check_answers()
             self.delivery.check_continue()
             self.delivery.gate.check_decisions()
 
     def _observe_issue(self, issue: Issue) -> None:
-        c = self.cfg.youtrack
-        setter = self.yt.tag_setter(issue.db_id, c.tags.queue)
+        c = self.cfg.tracker
+        # Who queued it is the authorization of the whole run: only the tracker's own record of it counts.
+        setter = self.tracker.trigger(issue)
         if setter is None:
             # The search says the tag is there, the history does not say who set it.
             if issue.key not in self._unknown_trigger:
@@ -192,8 +211,9 @@ class Runner:
                 self.events.emit("trigger_unknown", task_id=issue.key,
                                  reason="tag present but its author is not in the issue history; not taken")
             return
-        decision = self.store.record_trigger(issue.key, setter.activity_id, setter.author,
-                                             setter.author in c.allowed_users, setter.timestamp)
+        decision = self.store.record_trigger(issue.key, setter.id, setter.author,
+                                             bool(setter.author) and setter.author in c.allowed_users,
+                                             setter.timestamp)
         if decision.announced:
             return
         # Event first, then the mark: a crash in between repeats the event, it never loses it.
@@ -207,9 +227,9 @@ class Runner:
             action="none: observe mode" if self.cfg.mode == "observe" else None,
             reason=None if decision.accepted else f"tag set by {decision.author}, who is not in allowed_users",
         )
-        self.store.mark_announced(issue.key, setter.activity_id)
+        self.store.mark_announced(issue.key, setter.id)
         if self.delivery and not decision.accepted:
-            self.delivery.notice_rejected(issue.db_id, issue.key, decision.author, setter.activity_id)
+            self.delivery.notice_rejected(issue.db_id, issue.key, decision.author, setter.id)
 
     # -- scheduling -----------------------------------------------------------
 
@@ -225,7 +245,7 @@ class Runner:
         now = self.mono()
         started = self.now()
         local_due = now >= self.next_due["local"]
-        gitlab_due = now >= self.next_due["gitlab"]
+        host_due = now >= self.next_due["code_host"]
         # The next time is set in `finally`: an unexpected error must not turn into a hot loop.
         if local_due:
             try:
@@ -233,8 +253,8 @@ class Runner:
             finally:
                 self.next_due["local"] = self.mono() + self.cfg.schedule.poll_local.total_seconds()
         for name, client, poll in (
-            ("youtrack", self.yt_client, self.poll_youtrack),
-            ("gitlab", self.gl_client, self.poll_gitlab),
+            ("tracker", self.tracker.client, self.poll_tracker),
+            ("code_host", self.code_host.client, self.poll_code_host),
         ):
             if now < self.next_due[name]:
                 continue
@@ -244,8 +264,8 @@ class Runner:
                     poll()
             finally:
                 self.next_due[name] = self.mono() + self._interval(client)
-        if self.delivery and gitlab_due and self.gl_client.available() and self.yt_client.available():
-            # The open MRs: review notes, CI, conflicts, merges (on GitLab's poll cadence).
+        if self.delivery and host_due and self.code_host.client.available() and self.tracker.client.available():
+            # The open MRs: review notes, CI, conflicts, merges (on the code host's poll cadence).
             self.review.poll()
         if self.delivery and local_due:
             # Reconcile with `task show` every poll_local, then take new work if nothing is running.
@@ -282,7 +302,7 @@ class Runner:
             return
         holder = next(iter(self.store.tasks(*ACTIVE_STATES)), None)
         waiting = bool(self.delivery and can_take and (
-            any(d.issue_key not in self.delivery._skipped for d in self.store.accepted_untaken())
+            any(not self.delivery.skipped(d) for d in self.store.accepted_untaken())
             or self.delivery._continues_waiting()
             or (hasattr(self.store, "has_pending_review") and self.store.has_pending_review())))
         try:
@@ -292,9 +312,9 @@ class Runner:
             self.events.emit("cleanup_failed", error=f"{type(e).__name__}: {e}")
 
     def can_take(self) -> bool:
-        """New work only when nothing is failing and both trackers answer."""
+        """New work only when nothing is failing and both the tracker and the code host answer."""
         return (all(s != "fail" for s in self.health.values())
-                and self.yt_client.available() and self.gl_client.available())
+                and self.tracker.client.available() and self.code_host.client.available())
 
     def seconds_to_next(self) -> float:
         due = [t for k, t in self.next_due.items() if k not in ("doctor", "token")]  # ride on other polls
@@ -307,7 +327,7 @@ def make_cleanup(cfg: Config, store: TaskStore, events: EventLog, engine: Engine
         advise = ClaudeAdvisor(classifier_env((engine or Engine(cfg)).token_env()), cfg.cleanup.llm_model,
                                cfg.cleanup.llm_timeout.total_seconds())
     # Local git only (status, stash, branches): no credentials.
-    git = Git(None, cfg.gitlab.git_author.name, cfg.gitlab.git_author.email)
+    git = Git(None, cfg.code_host.git_author.name, cfg.code_host.git_author.email)
     return Cleanup(cfg, store, events, docker=Docker(), git=git, engine=engine, advise=advise)
 
 
@@ -323,17 +343,17 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         stack.callback(store.close)
         events = EventLog(cfg.paths.events, cfg.project, redact=secrets.values())
         stack.callback(events.close)
-        yc = youtrack_client(cfg, secrets)
-        stack.callback(yc.close)
-        gc = gitlab_client(cfg, secrets)
-        stack.callback(gc.close)
+        tracker = build_tracker(cfg, secrets)
+        stack.callback(tracker.client.close)
+        host = build_code_host(cfg, secrets)
+        stack.callback(host.client.close)
+        bind_integrations(store, tracker, host)
         engine = git = classify = None
         if cfg.mode == "live":
             engine = Engine(cfg, events=events)
             classify = ClaudeClassifier(classifier_env(engine.token_env()), cfg.security.model,
                                         cfg.security.timeout.total_seconds())
-            git = Git(GitAuth(cfg.gitlab.url, cfg.gitlab.bot_username, secrets.gitlab),
-                      cfg.gitlab.git_author.name, cfg.gitlab.git_author.email)
+            git = Git(host.git_auth(), cfg.code_host.git_author.name, cfg.code_host.git_author.email)
         metrics = None
         if cfg.metrics.enabled:
             metrics = Metrics()
@@ -341,8 +361,8 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         cleanup = make_cleanup(cfg, store, events, engine) if cfg.cleanup.enabled else None
         if cleanup:
             cleanup.recover()
-        runner = Runner(cfg, store, events, yc, gc, engine=engine, git=git, metrics=metrics, classify=classify,
-                        cleanup=cleanup)
+        runner = Runner(cfg, store, events, tracker, host, engine=engine, git=git, metrics=metrics,
+                        classify=classify, cleanup=cleanup)
 
         def _stop(signum, _frame):
             stop.set()
@@ -351,10 +371,12 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
             previous = signal.signal(sig, _stop)
             stack.callback(signal.signal, sig, previous)
 
-        events.emit("runner_started", mode=cfg.mode, db_schema=store.version, bulava=probe.as_dict())
-        # Plain git works for the runner and the agent: the bot's credentials for the GitLab host only.
-        if write_git_credentials(cfg.gitlab.url, cfg.gitlab.bot_username, secrets.gitlab):
-            events.emit("git_credentials_written", host=cfg.gitlab.url)
+        events.emit("runner_started", mode=cfg.mode, db_schema=store.version, bulava=probe.as_dict(),
+                    tracker=tracker.identity(), code_host=host.identity())
+        # Plain git works for the runner and the agent: the bot's credentials for the code host only.
+        auth = host.git_auth()
+        if write_git_credentials(auth.base_url, auth.username, auth.token):
+            events.emit("git_credentials_written", host=auth.base_url)
         stack.callback(lambda: events.emit("runner_stopped", reason="signal" if stop.is_set() else "exit"))
         while not stop.is_set():
             try:

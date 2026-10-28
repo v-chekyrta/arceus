@@ -1,27 +1,36 @@
-"""GitLab REST client: only the calls the runner needs."""
+"""GitLab as Arceus's code host: the provider that ships with it (integrations.CodeHost).
+
+Three layers, top to bottom: the `code_host: {type: gitlab}` config section (GitLabConfig), the
+adapter the runner's flow calls (GitLabHost), and the REST client with only the calls it needs
+(GitLab, GitLabWriter, GitLabReview). A new host can follow the same shape.
+"""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime
 from urllib.parse import quote
 
-from arceus_runner.http import ServiceClient
+from pydantic import Field, field_validator
+
+from arceus_runner.checks import Check, Status
+from arceus_runner.config import CodeHostConfig, HttpConfig, _url
+from arceus_runner.gitops import GitAuth
+from arceus_runner.http import AuthError, ServiceClient, ServiceError
+from arceus_runner.integrations import (
+    CIStatus,
+    CodeHostType,
+    FailedJob,
+    Id,
+    MergeRequest,
+    MRStatus,
+    Note,
+    Repo,
+)
 
 PAGE = 100
 UPLOAD_TIMEOUT = 120  # seconds: a recording is megabytes, more than the usual read timeout allows
-
-
-@dataclass(frozen=True)
-class Repo:
-    id: int
-    path: str  # last path segment
-    relative_path: str  # path below the configured group, e.g. "sub/repo"
-    default_branch: str | None
-    archived: bool
-    http_url: str
-    description: str = ""
 
 
 class GitLab:
@@ -74,31 +83,14 @@ class GitLab:
         return out
 
 
-def resolve_repo(repos: list[Repo], name: str) -> tuple[Repo | None, str | None]:
-    """Find a repository by its path below the group, or by its short path if that is unique."""
-    exact = [r for r in repos if r.relative_path == name]
-    if exact:
-        return exact[0], None
-    short = [r for r in repos if r.path == name]
-    if len(short) == 1:
-        return short[0], None
-    if len(short) > 1:
-        options = ", ".join(sorted(r.relative_path for r in short))
-        return None, f"{name!r} is ambiguous, write one of: {options}"
-    return None, f"{name!r} is not in the group"
-
-
-@dataclass(frozen=True)
-class MergeRequest:
-    iid: int
-    url: str
-    state: str
-    closed_at_ms: int | None = None
+def _state(value: str | None) -> str:
+    # `locked` is an open MR that GitLab is merging this very moment: still open until it says merged.
+    return "opened" if value == "locked" else value or ""
 
 
 def _mr(d: dict) -> MergeRequest:
     closed = d.get("closed_at")
-    return MergeRequest(iid=d["iid"], url=d.get("web_url") or "", state=d.get("state") or "",
+    return MergeRequest(iid=d["iid"], url=d.get("web_url") or "", state=_state(d.get("state")),
                         closed_at_ms=int(datetime.fromisoformat(closed.replace("Z", "+00:00")).timestamp() * 1000)
                         if closed else None)
 
@@ -117,15 +109,7 @@ class GitLabWriter(GitLab):
         return _mr(items[0]) if items else None
 
     def create_mr(self, project_id: int, *, source_branch: str, target_branch: str, title: str, description: str,
-                  label: str, after_closed: bool = False) -> MergeRequest:
-        """Create the MR unless this branch already has one (a retry after a crash, or a person closed it).
-
-        `after_closed`: a person asked for more work after closing the branch's MR, so a closed one
-        is not the answer and a new MR is opened next to it.
-        """
-        existing = self.branch_mr(project_id, source_branch)
-        if existing and not (after_closed and existing.state == "closed"):
-            return existing
+                  label: str) -> MergeRequest:
         resp = self.c.request("POST", f"/api/v4/projects/{project_id}/merge_requests", json={
             "source_branch": source_branch, "target_branch": target_branch, "title": title,
             "description": description, "labels": label, "remove_source_branch": False,
@@ -133,40 +117,23 @@ class GitLabWriter(GitLab):
         return _mr(resp.json())
 
 
-@dataclass(frozen=True)
-class MRStatus:
-    """What the review loop needs to know about one MR right now."""
-    state: str                 # opened | merged | closed | locked
-    merge_status: str          # detailed_merge_status: mergeable, conflict, checking, ci_must_pass, ...
-    has_conflicts: bool
-    sha: str                   # head of the source branch as GitLab sees it
-    pipeline_id: int | None
-    pipeline_status: str | None  # success, failed, running, pending, canceled, manual, skipped, ...
-    pipeline_sha: str | None
-    pipeline_url: str | None
-    closed_by: str = ""        # who closed it, when it is closed
+# GitLab works mergeability out asynchronously: until it has, it cannot say whether there is a conflict.
+_MERGEABILITY_PENDING = {"checking", "unchecked", "preparing", "approvals_syncing"}
+_CI_RUNNING = {"created", "waiting_for_resource", "preparing", "pending", "running", "scheduled"}
 
 
-@dataclass(frozen=True)
-class Note:
-    id: int
-    discussion_id: str
-    author: str
-    body: str
-    system: bool
-    created_at: str
-    path: str | None           # file and line for a comment on the diff
-    line: int | None
-    url: str
-    commit: str | None = None  # the MR version a diff comment was written on (position.head_sha)
+def _ci_status(status: str | None) -> CIStatus | None:
+    if not status:
+        return None
+    if status in ("success", "failed"):
+        return status
+    return "running" if status in _CI_RUNNING else "other"
 
 
-@dataclass(frozen=True)
-class FailedJob:
-    id: int
-    name: str
-    stage: str
-    url: str
+def _conflict(detailed: str) -> bool | None:
+    if detailed == "conflict":
+        return True
+    return None if not detailed or detailed in _MERGEABILITY_PENDING else False
 
 
 class GitLabReview(GitLabWriter):
@@ -174,10 +141,10 @@ class GitLabReview(GitLabWriter):
         d = self.c.get_json(f"/api/v4/projects/{project_id}/merge_requests/{iid}")
         p = d.get("head_pipeline") or {}
         return MRStatus(
-            state=d.get("state") or "", merge_status=d.get("detailed_merge_status") or d.get("merge_status") or "",
-            has_conflicts=bool(d.get("has_conflicts")), sha=d.get("sha") or "",
-            pipeline_id=p.get("id"), pipeline_status=p.get("status"), pipeline_sha=p.get("sha"),
-            pipeline_url=p.get("web_url"), closed_by=(d.get("closed_by") or {}).get("username") or "")
+            state=_state(d.get("state")), sha=d.get("sha") or "",
+            conflict=_conflict(d.get("detailed_merge_status") or d.get("merge_status") or ""),
+            ci_id=p.get("id"), ci_status=_ci_status(p.get("status")), ci_sha=p.get("sha"), ci_url=p.get("web_url"),
+            closed_by=(d.get("closed_by") or {}).get("username") or "")
 
     def notes(self, project_id: int, iid: int, mr_url: str) -> list[Note]:
         """Every note of every discussion, so a late reply in an old thread is seen too."""
@@ -224,3 +191,170 @@ class GitLabReview(GitLabWriter):
 
     def close_mr(self, project_id: int, iid: int) -> None:
         self.c.request("PUT", f"/api/v4/projects/{project_id}/merge_requests/{iid}", json={"state_event": "close"})
+
+
+# -- the code host ----------------------------------------------------------------------------------
+
+
+class GitLabConfig(CodeHostConfig):
+    url: str
+    group: str = Field(min_length=1)  # the group that holds all the project's repositories
+    token_env: str = "GITLAB_TOKEN"
+    include_subgroups: bool = True
+
+    _check_url = field_validator("url")(_url)
+
+    @field_validator("group")
+    @classmethod
+    def _group(cls, v: str) -> str:
+        return v.strip("/")
+
+
+def mentions(bot: str) -> re.Pattern:
+    """`@bot` as GitLab writes a mention: not part of an e-mail address or of a longer username."""
+    return re.compile(rf"(?<![\w.@-])@{re.escape(bot)}(?![\w-])", re.IGNORECASE)
+
+
+class GitLabHost:
+    """integrations.CodeHost on GitLab: the repositories of one group, its MRs, discussions and pipelines."""
+
+    name = "gitlab"
+    label = "GitLab"
+    scope_kind = "group"
+    supports_uploads = True
+
+    def __init__(self, cfg: GitLabConfig, client: ServiceClient, token: str):
+        self.cfg = cfg
+        self.client = client
+        self.api = GitLabReview(client)
+        self.scope = cfg.group
+        self._token = token
+        self._mention = mentions(cfg.bot_user)
+
+    def identity(self) -> str:
+        return f"gitlab {self.cfg.url} group {self.cfg.group}"
+
+    def describe(self) -> str:
+        return f"GitLab at {self.cfg.url}, the repositories of group {self.cfg.group}"
+
+    def repos(self) -> list[Repo]:
+        return self.api.group_repos(self.cfg.group, self.cfg.include_subgroups)
+
+    def branch_mr(self, repo_id: Id, branch: str) -> MergeRequest | None:
+        return self.api.branch_mr(repo_id, branch)
+
+    def create_mr(self, repo_id: Id, *, source_branch: str, target_branch: str, title: str, description: str,
+                  label: str) -> MergeRequest:
+        return self.api.create_mr(repo_id, source_branch=source_branch, target_branch=target_branch, title=title,
+                                  description=description, label=label)
+
+    def mr_status(self, repo_id: Id, iid: Id) -> MRStatus:
+        return self.api.mr_status(repo_id, iid)
+
+    def notes(self, repo_id: Id, iid: Id, mr_url: str) -> list[Note]:
+        return self.api.notes(repo_id, iid, mr_url)
+
+    def mentions_bot(self, text: str) -> bool:
+        return bool(self._mention.search(text))
+
+    def failed_jobs(self, repo_id: Id, ci_id: Id) -> list[FailedJob]:
+        return self.api.failed_jobs(repo_id, ci_id)
+
+    def job_log_tail(self, repo_id: Id, job_id: Id, limit: int) -> str:
+        return self.api.job_trace_tail(repo_id, job_id, limit)
+
+    def reply(self, repo_id: Id, iid: Id, discussion_id: str, body: str) -> None:
+        self.api.reply(repo_id, iid, discussion_id, body)
+
+    def description(self, repo_id: Id, iid: Id) -> str:
+        return self.api.description(repo_id, iid)
+
+    def set_description(self, repo_id: Id, iid: Id, description: str) -> None:
+        self.api.set_description(repo_id, iid, description)
+
+    def note_mr(self, repo_id: Id, iid: Id, body: str) -> None:
+        self.api.note_mr(repo_id, iid, body)
+
+    def close_mr(self, repo_id: Id, iid: Id) -> None:
+        self.api.close_mr(repo_id, iid)
+
+    def upload(self, repo_id: Id, name: str, data: bytes, mime: str) -> str:
+        return self.api.upload(repo_id, name, data, mime)
+
+    def git_auth(self) -> GitAuth:
+        return GitAuth(self.cfg.url, self.cfg.bot_user, self._token)
+
+    def ping(self) -> None:
+        self.api.me()
+
+    def token_check(self, warn_days: int, today: date | None = None) -> Check | None:
+        try:
+            return _expiry_check(warn_days, self.api.token_self(), today or datetime.now(UTC).date())
+        except ServiceError as e:
+            return Check("gitlab.token_expiry", "warn", f"cannot read token info: {e}")
+
+    def check(self, warn_days: int, today: date | None = None) -> list[Check]:
+        return check_gitlab(self.cfg, self.api, warn_days, today)
+
+
+def gitlab_client(cfg: GitLabConfig, token: str, http: HttpConfig, transport=None) -> ServiceClient:
+    return ServiceClient("gitlab", cfg.url, {"PRIVATE-TOKEN": token}, http, transport=transport)
+
+
+def check_gitlab(g: GitLabConfig, gl: GitLab, warn_days: int, today: date | None = None) -> list[Check]:
+    """Every mistake in the section on its own line: the token and its rights, the bot, the group."""
+    out: list[Check] = []
+    today = today or datetime.now(UTC).date()
+    try:
+        me = gl.me()
+    except AuthError as e:
+        return [Check("gitlab.auth", "fail", str(e))]
+    except ServiceError as e:
+        return [Check("gitlab.reachable", "fail", str(e))]
+    if me.get("username") != g.bot_user:
+        out.append(Check("gitlab.bot_user", "fail",
+                         f"token belongs to {me.get('username')!r}, config says {g.bot_user!r}"))
+    else:
+        out.append(Check("gitlab.bot_user", "ok", g.bot_user))
+
+    try:
+        tok = gl.token_self()
+        scopes = tok.get("scopes") or []
+        if "api" not in scopes:
+            out.append(Check("gitlab.token_scopes", "fail", f"token needs scope 'api', has {scopes}"))
+        else:
+            out.append(Check("gitlab.token_scopes", "ok", ", ".join(scopes)))
+        out.append(_expiry_check(warn_days, tok, today))
+    except ServiceError as e:
+        out.append(Check("gitlab.token_expiry", "warn", f"cannot read token info: {e}"))
+
+    try:
+        repos = gl.group_repos(g.group, g.include_subgroups)
+    except ServiceError as e:
+        out.append(Check("gitlab.group", "fail", f"group {g.group!r}: {e}"))
+        return out
+    usable = [r for r in repos if r.relative_path not in g.exclude_repos and r.path not in g.exclude_repos]
+    out.append(Check("gitlab.group", "ok", f"{g.group}: {len(usable)} repositories ({len(repos) - len(usable)} excluded)"))
+
+    if not usable:
+        out.append(Check("gitlab.repositories", "fail", f"no repositories left in {g.group} after exclude_repos"))
+    for name in g.exclude_repos:
+        if not any(name in (r.relative_path, r.path) for r in repos):
+            out.append(Check(f"gitlab.exclude_repos.{name}", "warn", f"{name!r} is not in the group"))
+    return out
+
+
+def _expiry_check(warn_days: int, tok: dict, today: date) -> Check:
+    exp = tok.get("expires_at")
+    if not exp:
+        return Check("gitlab.token_expiry", "warn", "token has no expiry date; set one")
+    left = (date.fromisoformat(exp) - today).days
+    status: Status = "fail" if left < 0 else "warn" if left < warn_days else "ok"
+    return Check("gitlab.token_expiry", status, f"expires {exp} ({left} days)")
+
+
+def _build(cfg: GitLabConfig, token: str, http: HttpConfig, transport=None) -> GitLabHost:
+    return GitLabHost(cfg, gitlab_client(cfg, token, http, transport), token)
+
+
+CODE_HOST = CodeHostType(config=GitLabConfig, build=_build)

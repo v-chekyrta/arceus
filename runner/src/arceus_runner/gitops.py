@@ -1,9 +1,9 @@
 """Git operations the runner does itself: clone, fetch, publish a reviewed commit.
 
-The bot's credentials are in ~/.git-credentials for the GitLab host only (see
+The bot's credentials are in ~/.git-credentials for the code host only (see
 write_git_credentials), so plain `git fetch`/`pull`/`push` works for the runner and for
 the agent alike. Whether the agent may push from inside a run is the engine's policy
-(Bulava's server profile refuses it today); either way the runner checks that GitLab has
+(Bulava's server profile refuses it today); either way the runner checks that the code host has
 exactly the reviewed commit and pushes it itself when it is not there yet. The token is
 never in a URL, on a command line or in a repository's .git/config.
 """
@@ -299,7 +299,7 @@ class Git:
 
 
 def write_git_credentials(base_url: str, username: str, token: str, home: Path | None = None) -> bool:
-    """Keep the bot's GitLab credentials in ~/.git-credentials, for that host only.
+    """Keep the bot's code host credentials in ~/.git-credentials, for that host only.
 
     Other hosts' lines are left alone. Git is told to use the store for this host only, so
     nothing changes for any other remote of this user. Returns True if something changed.

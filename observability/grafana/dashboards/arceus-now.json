@@ -159,7 +159,7 @@
       "id": 3,
       "type": "stat",
       "title": "Takes new work",
-      "description": "No while any health check fails or YouTrack/GitLab is paused. Started tasks are still followed.",
+      "description": "No while any health check fails or the tracker or the code host is paused. Started tasks are still followed.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -235,8 +235,8 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "YouTrack",
-      "description": "",
+      "title": "Issue tracker",
+      "description": "The tracker config.yaml names (YouTrack, or another provider): answering, token accepted.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -250,7 +250,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "runner_service_up{service=\"youtrack\"}",
+          "expr": "runner_service_up{role=\"tracker\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -312,8 +312,8 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "GitLab",
-      "description": "",
+      "title": "Code host",
+      "description": "The code host config.yaml names (GitLab, or another provider): answering, token accepted.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -327,7 +327,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "runner_service_up{service=\"gitlab\"}",
+          "expr": "runner_service_up{role=\"code_host\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"

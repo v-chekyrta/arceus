@@ -146,7 +146,7 @@ def test_the_plain_fallback_of_an_answer_carries_the_same_clearance(w):
     w.tick()
     sends = [c["argv"] for c in w.calls("worker-send")]
     assert [a[a.index("--message-id") + 1] for a in sends] == [sends[0][sends[0].index("--message-id") + 1],
-                                                               sends[0][sends[0].index("--message-id") + 1] + "-plain"]
+                                                               sends[0][sends[0].index("--message-id") + 1] + ":plain"]
     assert w.screen.payloads().count("Postgres") == 1
 
 

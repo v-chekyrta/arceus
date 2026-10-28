@@ -11,6 +11,8 @@ from arceus_runner.config import ConfigError, load_config, load_secrets, parse_d
 
 from .conftest import EXAMPLE, example_raw
 
+LEGACY = Path(__file__).parent / "data" / "config.legacy.yaml"  # config.example.yaml before tracker:/code_host:
+
 
 def write(tmp_path: Path, raw: dict) -> Path:
     p = tmp_path / "config.yaml"
@@ -30,7 +32,8 @@ def test_example_config_is_valid():
     assert cfg.mode == "observe"
     assert cfg.schedule.poll_working == timedelta(minutes=2)
     assert cfg.limits.needs_input_fail_after == timedelta(days=5)
-    assert cfg.gitlab.exclude_repos == []
+    assert cfg.code_host.exclude_repos == []
+    assert (cfg.tracker.type, cfg.code_host.type) == ("youtrack", "gitlab")
 
 
 @pytest.mark.parametrize("raw,expected", [("30s", 30), ("2m", 120), ("6h", 21600), ("5d", 432000)])
@@ -48,8 +51,8 @@ def test_four_mistakes_give_four_errors(tmp_path, capsys):
     raw = example_raw()
     raw["polling"] = "2m"                                   # unknown key
     raw["schedule"]["timezone"] = "Mars/Base"               # bad zone
-    del raw["youtrack"]["states"]["in_progress"]             # missing state
-    raw["gitlab"]["git_author"]["email"] = "not-an-email"   # bad email
+    del raw["tracker"]["states"]["in_progress"]              # missing state
+    raw["code_host"]["git_author"]["email"] = "not-an-email"  # bad email
     path = write(tmp_path, raw)
 
     with pytest.raises(ConfigError) as e:
@@ -57,8 +60,8 @@ def test_four_mistakes_give_four_errors(tmp_path, capsys):
     assert sorted(e.value.problems) == sorted([
         "polling: unknown key (typo?)",
         "schedule.timezone: unknown time zone 'Mars/Base'",
-        "youtrack.states.in_progress: required",
-        "gitlab.git_author.email: String should match pattern '^[^@\\s]+@[^@\\s]+$'",
+        "tracker.states.in_progress: required",
+        "code_host.git_author.email: String should match pattern '^[^@\\s]+@[^@\\s]+$'",
     ])
 
     rc = main(["--config", str(path), "check", "--offline"])
@@ -70,13 +73,13 @@ def test_four_mistakes_give_four_errors(tmp_path, capsys):
 
 def test_cross_field_rules(tmp_path):
     raw = example_raw()
-    raw["youtrack"]["allowed_users"].append(raw["youtrack"]["bot_login"])
+    raw["tracker"]["allowed_users"].append(raw["tracker"]["bot_user"])
     with pytest.raises(ConfigError, match="must not contain the bot"):
         load_config(write(tmp_path, raw))
 
     raw = example_raw()
-    raw["gitlab"]["default_repo"] = "acme-theme"  # gone: the session starts in the workspace folder
-    with pytest.raises(ConfigError, match="gitlab.default_repo is no longer used: .*remove this line"):
+    raw["code_host"]["default_repo"] = "acme-theme"  # gone: the session starts in the workspace folder
+    with pytest.raises(ConfigError, match="code_host.default_repo is no longer used: .*remove this line"):
         load_config(write(tmp_path, raw))
 
     raw = example_raw()
@@ -90,7 +93,7 @@ def test_secrets_from_file_not_environment(tmp_path):
     raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN='g1'\nSLACK_BOT_TOKEN=s1\n"))}
     cfg = load_config(write(tmp_path, raw))
     s = load_secrets(cfg, environ={})
-    assert (s.youtrack, s.gitlab, s.slack) == ("a1", "g1", "s1")
+    assert (s.tracker, s.code_host, s.slack) == ("a1", "g1", "s1")
     assert "a1" not in repr(s)
 
 
@@ -101,7 +104,7 @@ def test_missing_secret_names_the_variable(tmp_path):
     with pytest.raises(ConfigError) as e:
         load_secrets(cfg, environ={})
     assert e.value.problems == [
-        f"gitlab.token_env: GITLAB_TOKEN is not set in {tmp_path / 'secrets.env'} or the environment",
+        f"code_host.token_env: GITLAB_TOKEN is not set in {tmp_path / 'secrets.env'} or the environment",
         f"slack.token_env: SLACK_BOT_TOKEN is not set in {tmp_path / 'secrets.env'} or the environment",
     ]
 
@@ -139,30 +142,30 @@ def test_offline_check_passes_on_example(tmp_path):
 
 def test_token_variable_names_need_no_config(tmp_path):
     raw = example_raw()
-    assert "token_env" not in raw["youtrack"] and "token_env" not in raw["gitlab"]
+    assert "token_env" not in raw["tracker"] and "token_env" not in raw["code_host"]
     raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN=g1\nSLACK_BOT_TOKEN=s1\n"))}
     cfg = load_config(write(tmp_path, raw))
-    assert (cfg.youtrack.token_env, cfg.gitlab.token_env, cfg.slack.token_env) == (
+    assert (cfg.tracker.token_env, cfg.code_host.token_env, cfg.slack.token_env) == (
         "YOUTRACK_TOKEN", "GITLAB_TOKEN", "SLACK_BOT_TOKEN")
-    assert load_secrets(cfg, environ={}).youtrack == "a1"
+    assert load_secrets(cfg, environ={}).tracker == "a1"
 
 
 def test_an_older_config_naming_token_env_still_loads(tmp_path):
     raw = example_raw()
-    raw["youtrack"]["token_env"] = "YT_BOT"
+    raw["tracker"]["token_env"] = "YT_BOT"
     raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YT_BOT=a1\nGITLAB_TOKEN=g1\nSLACK_BOT_TOKEN=s1\n"))}
-    assert load_secrets(load_config(write(tmp_path, raw)), environ={}).youtrack == "a1"
+    assert load_secrets(load_config(write(tmp_path, raw)), environ={}).tracker == "a1"
 
 
 def test_repository_mapping_keys_are_refused_with_what_to_do(tmp_path):
     raw = example_raw()
-    raw["youtrack"]["repo_field"] = "Repository"
-    raw["youtrack"]["repo_map"] = {"Platform": "acme-platform"}
+    raw["tracker"]["repo_field"] = "Repository"
+    raw["tracker"]["repo_map"] = {"Platform": "acme-platform"}
     raw["bulava"]["multi_repo_tasks"] = False
     with pytest.raises(ConfigError) as e:
         load_config(write(tmp_path, raw))
     text = "\n".join(e.value.problems)
-    assert "youtrack.repo_field is no longer used: the agent works across all repositories" in text
+    assert "tracker.repo_field is no longer used: the agent works across all repositories" in text
     assert "bulava.multi_repo_tasks is no longer used" in text
 
 
