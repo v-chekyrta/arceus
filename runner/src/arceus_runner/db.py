@@ -228,6 +228,17 @@ class Store:
         assert stored is not None
         return stored
 
+    def bind_integration(self, role: str, identity: str) -> str:
+        """The integration this database belongs to for `role`: `identity` on the first call, the stored one after."""
+        self.conn.execute("INSERT OR IGNORE INTO integrations (role, identity) VALUES (?, ?)", (role, identity))
+        return self.conn.execute("SELECT identity FROM integrations WHERE role = ?", (role,)).fetchone()[0]
+
+    def rebind_integration(self, role: str, identity: str) -> str | None:
+        """Bind `role` to `identity` whatever it was; returns what it was."""
+        row = self.conn.execute("SELECT identity FROM integrations WHERE role = ?", (role,)).fetchone()
+        self.conn.execute("INSERT OR REPLACE INTO integrations (role, identity) VALUES (?, ?)", (role, identity))
+        return row[0] if row else None
+
     def mark_announced(self, issue_key: str, tag_activity_id: str) -> None:
         """The event for this decision is in events.jsonl. Until then it is announced again on every poll."""
         self.conn.execute(
@@ -373,6 +384,44 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 12: the issue tracker and the code host this database's tasks belong to (loop.bind_integrations).
+    """
+    CREATE TABLE integrations (
+        role             TEXT PRIMARY KEY,
+        identity         TEXT NOT NULL,
+        bound_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    """
+)
+
+
+MIGRATIONS.append(
+    # 13: a code host's ids are opaque (integrations.Id): "00042" or "1e3" must come back as written, not as
+    # 42 or 1000. Columns with no declared type keep each value as given; GitLab's numbers stay numbers.
+    """
+    CREATE TABLE task_mrs_v13 (
+        task_id          TEXT NOT NULL,
+        repo             TEXT NOT NULL,
+        project_id       NOT NULL,
+        iid              NOT NULL,
+        url              TEXT NOT NULL,
+        state            TEXT NOT NULL DEFAULT 'opened',
+        published_sha    TEXT NOT NULL,
+        handled_pipeline,
+        handled_conflict TEXT,
+        PRIMARY KEY (task_id, repo)
+    );
+    INSERT INTO task_mrs_v13 (task_id, repo, project_id, iid, url, state, published_sha, handled_pipeline,
+                              handled_conflict)
+        SELECT task_id, repo, project_id, iid, url, state, published_sha, handled_pipeline, handled_conflict
+        FROM task_mrs;
+    DROP TABLE task_mrs;
+    ALTER TABLE task_mrs_v13 RENAME TO task_mrs;
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -460,10 +509,12 @@ class TaskStore(Store):
         return task
 
     def accepted_untaken(self) -> list[TriggerDecision]:
-        """Accepted triggers whose issue the runner has not taken yet, oldest tag first."""
+        """Accepted triggers whose issue the runner has not taken yet, oldest tag first. Only an issue's newest
+        decision counts: a later tag by someone not on the list overrides an earlier approval."""
         rows = self.conn.execute(
             "SELECT d.* FROM trigger_decisions d LEFT JOIN tasks t ON t.task_id = d.issue_key"
-            " WHERE d.accepted = 1 AND t.task_id IS NULL ORDER BY d.tagged_at_ms"
+            " WHERE d.accepted = 1 AND t.task_id IS NULL AND NOT EXISTS (SELECT 1 FROM trigger_decisions n"
+            " WHERE n.issue_key = d.issue_key AND n.tagged_at_ms > d.tagged_at_ms) ORDER BY d.tagged_at_ms"
         ).fetchall()
         return [TriggerDecision(r["issue_key"], r["tag_activity_id"], r["author"], True, bool(r["announced"]))
                 for r in rows]
@@ -638,12 +689,12 @@ class TaskStore(Store):
 class TaskMR:
     task_id: str
     repo: str
-    project_id: int
-    iid: int
+    project_id: int | str  # the code host's ids, opaque (integrations.Id): GitLab's are numbers
+    iid: int | str
     url: str
     state: str
     published_sha: str
-    handled_pipeline: int | None
+    handled_pipeline: int | str | None
     handled_conflict: str | None
 
 
@@ -681,7 +732,7 @@ class ReviewStore(TaskStore):
         rows = self.conn.execute("SELECT * FROM task_mrs WHERE task_id = ? ORDER BY repo", (task_id,)).fetchall()
         return [TaskMR(**dict(r)) for r in rows]
 
-    def upsert_mr(self, task_id: str, repo: str, project_id: int, iid: int, url: str, sha: str) -> None:
+    def upsert_mr(self, task_id: str, repo: str, project_id: int | str, iid: int | str, url: str, sha: str) -> None:
         self.conn.execute(
             "INSERT INTO task_mrs (task_id, repo, project_id, iid, url, published_sha) VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (task_id, repo) DO UPDATE SET iid = excluded.iid, url = excluded.url,"

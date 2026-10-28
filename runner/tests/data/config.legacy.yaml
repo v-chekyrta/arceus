@@ -1,0 +1,141 @@
+# Runner settings for one project. No secrets here: the bot tokens are in secrets.env
+# (YOUTRACK_TOKEN, GITLAB_TOKEN, SLACK_BOT_TOKEN). Unknown keys are errors.
+# Check it with: arceus-runner check
+
+project: acme-lms                      # name for logs, metrics and dashboards (a-z, 0-9, -)
+
+# observe: read YouTrack and GitLab, write what would happen to events.jsonl, change nothing.
+# live:    take tasks, run Bulava, push exactly the commit Codex reviewed and open MRs.
+mode: observe
+
+youtrack:
+  url: https://youtrack.example.com
+  project: ACME                        # short name (ID) of the YouTrack project
+  bot_login: agent-runner              # the runner ignores this user's comments
+  allowed_users:                       # who may start the agent with the tag (YouTrack logins)
+    - j.doe
+    - a.smith
+  tags:
+    queue: agent
+    needs_input: agent-needs-input
+    failed: agent-failed
+  state_field: State                   # name of the state field in the project's workflow
+  assignee_field: Assignee             # set to the bot when a task is taken; null to leave it alone
+  states:
+    queued: To Do
+    in_progress: In Progress
+    code_review: Code Review
+
+gitlab:
+  url: https://gitlab.example.com
+  group: clients/acme                  # the group that holds all the project's repositories.
+                                       # A task gets all of them; the agent changes whichever it needs,
+                                       # and MRs are opened only where it changed something
+  bot_username: acme-agent-bot
+  git_author: { name: "ACME Agent", email: "acme-agent-bot@example.com" }
+  include_subgroups: true
+  exclude_repos: []                    # repositories of the group the agent never gets, e.g. [acme-infra]
+  branch_prefix: agent/
+  mr_label: agent
+
+# Optional. Remove the section if there is no Slack bot yet.
+slack:
+  alerts_channel: "#acme-agent-alerts"
+
+schedule:
+  timezone: Europe/Kyiv
+  working_hours: { days: [mon, tue, wed, thu, fri], from: "09:00", to: "19:00" }
+  poll_working: 2m
+  poll_off_hours: 10m
+  poll_local: 2m                       # local health and, later, `task show` for active tasks
+  poll_progress: 30s                   # a running task's engine steps and agent activity (files only)
+  review_debounce: 5m
+  repo_sync: 24h
+
+http:
+  connect_timeout: 10s
+  read_timeout: 30s
+  slow_response: 10s
+  backoff: { start: 1m, max: 15m, jitter: 0.2 }
+
+limits:
+  max_review_rounds: 5          # review rounds that changed code
+  max_review_answers: 20        # review rounds answered without a code change
+  max_ci_fix_attempts: 3
+  needs_input_reminder: 24h
+  needs_input_fail_after: 5d
+  in_progress_alert_after: 6h
+  attempt_timeout: 8h                  # no verdict this long: the task fails as "agent hung"
+  agent_quiet_after: 20m               # the agent wrote nothing this long in its own step: agent_quiet
+  continue_window: 14d                 # a `/continue` comment this long after a failure resumes the task
+
+health:
+  disk_warn_percent: 25
+  disk_fail_percent: 10
+  ram_warn_gb: 2
+  token_expiry_warn_days: 14
+  # A command that exits 0 only while the project's dev stack is up; run in the workspace every
+  # poll_local. A failure stops new tasks. Leave it out until the stack exists on this VM, e.g.
+  #   devstack_check: "cd ~/arceus/omnis/<repo> && docker compose ps --status running --quiet | grep -q ."
+  #   devstack_check: "tutor dev status"
+
+bulava:
+  codex_unavailable: fail              # fail | wait, when Codex is out of quota or signed out
+  report_language: English             # the agent's fallback language (commits, its summary in the MR)
+  codex_unavailable_after_hours: 3
+  mcp_config: /opt/bulava-local/mcp.json   # the preinstalled headless browser, instead of npx
+  # Models and depth for the tasks dispatched from now on; a task keeps what it started with.
+  # auto: pass nothing (depth high, the CLI's default model for the server's account).
+  claude_model: auto                   # auto | opus | sonnet | haiku | fable | an exact id (claude-opus-5-5)
+  claude_effort: auto                  # auto | none (haiku) | low | medium | high | xhigh | max | ultracode
+  codex_model: auto                    # auto | a slug from `night-shift models codex`; review, consultations, report
+  codex_effort: auto                   # auto | low | medium | high | xhigh | max | ultra
+  start_handshake_wait: 30s            # 5s–2m: a new session's hooks confirm the run, or the start is rolled back
+  # Independent checks before Codex (engine/SERVER.md): after a green build, a code review and a
+  # security review in Claude sessions that never saw the ticket. Findings at min_severity or above go
+  # back to the agent `rounds` times per task; it fixes or declines each, and Codex decides, seeing
+  # them all. Once the rounds are spent the engine does not run the checks again for that task, so
+  # fixes after review comments and red CI go to Codex alone. The review gate reads these from
+  # bulava-engine.service: after a change run `sudo ./setup.sh` and restart bulava-engine between
+  # tasks; `arceus-runner doctor` says FAIL until the running engine has them.
+  claude_checks:
+    enabled: true
+    kinds: [code, security]
+    min_severity: high                 # critical | high | medium | low
+    rounds: 1                          # 1–5
+    timeout: 15m                       # per check, 1m–30m; they run side by side
+    required: true                     # a check that did not run stops the task for a person; false: Codex alone
+
+# The security screen: every ticket, comment and CI log is read by a classifier (Claude, no tools)
+# before the agent gets it. A suspicious text is held, and the task waits for a reviewer's
+# `/security-allow <code>` or `/security-reject <code>` on the ticket.
+security:
+  reviewers:                           # YouTrack logins who decide on held texts; required in live mode
+    - a.smith
+  model: auto                          # the classifier's model: auto | sonnet | opus | an exact id
+  timeout: 3m
+
+# What agents leave behind: containers, test volumes, dev servers, files in the repositories, old media.
+# A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than
+# limits.continue_window): by the label arceus.task=<KEY> the agent puts on it, by its place
+# (.arceus/<kind>/<KEY>, a task branch), or because it was made while that task held the workspace.
+# Anything else is only reported: `arceus-runner cleanup` shows the plan, `cleanup --last` the last pass.
+cleanup:
+  mode: report                         # report: log what would go | act: remove it. Start with report.
+  idle_after: 15m                      # a pass once the workspace is free and no work waits this long
+  min_interval: 6h                     # but not more often than this
+  force_every: 24h                     # at least this often; while a task works, only what cannot be its own
+  keep_media: 14d                      # .arceus/media/<KEY> after the task is over
+  keep_notes: 90d                      # .arceus/notes/<KEY>: reviewers ask about decisions weeks later
+  llm: off                             # advise: Claude (no tools) comments on what nobody owns; never removes
+  protect:                             # never touched, besides arceus-observability and arceus.keep=true
+    compose_projects: []               # e.g. the dev stack's compose project, if it lives in the workspace
+
+paths:
+  workspace: ~/arceus/workspace
+  bulava: /opt/bulava/engine           # the engine folder (bin/dispatch.sh is in it)
+  bulava_state: ~/.claude/supervisor   # SUPERVISOR_STATE_DIR: tasks/<key>/task.json and friends
+  bulava_env: ~/arceus/data/bulava.env # Claude token; passed to Bulava's processes only
+  secrets: ~/arceus/data/secrets.env # the runner reads it itself; tokens never enter its environment
+  db: ~/arceus/data/runner.db
+  events: ~/arceus/data/events.jsonl

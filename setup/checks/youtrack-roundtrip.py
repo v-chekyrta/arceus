@@ -2,7 +2,8 @@
 
     /opt/arceus-runner/venv/bin/python -I youtrack-roundtrip.py OMD-3
 
-It uses the runner's own client (YouTrackWriter) with the bot's token from ~/arceus/data: read the
+For a runner whose `tracker:` is YouTrack. It uses the runner's own client (YouTrackWriter) with the
+bot's token from ~/arceus/data: read the
 ticket and its history, set each workflow state the runner uses, assign the bot, add and remove the
 needs-input and failed tags, post a comment and read it back. Afterwards the ticket gets its
 original state, assignee and tags again and the comment is marked deleted. Exit 0 only if every step was
@@ -13,17 +14,19 @@ import sys
 from pathlib import Path
 from urllib.parse import quote
 
-from arceus_runner.checks import youtrack_client
 from arceus_runner.config import load_config, load_secrets
-from arceus_runner.youtrack import YouTrackWriter
+from arceus_runner.youtrack import YouTrackWriter, youtrack_client
 
 CONFIG = Path("~/arceus/data/config.yaml").expanduser()
 
 
 def main(key: str) -> int:
     cfg = load_config(CONFIG)
-    c = cfg.youtrack
-    yt = YouTrackWriter(youtrack_client(cfg, load_secrets(cfg)))
+    c = cfg.tracker
+    if c.type != "youtrack":
+        print(f"tracker.type is {c.type!r}: this check is for YouTrack")
+        return 2
+    yt = YouTrackWriter(youtrack_client(c, load_secrets(cfg).tracker, cfg.http))
     ok = True
 
     def step(name: str, passed: bool, detail: str = "") -> None:
@@ -46,9 +49,9 @@ def main(key: str) -> int:
             now = (yt.issue(key).fields.get(c.state_field) or [None])[0]
             step(f"set {c.state_field} = {state}", now == state, f"reads back {now!r}")
         if c.assignee_field:
-            yt.set_assignee(issue.db_id, c.assignee_field, c.bot_login)
+            yt.set_assignee(issue.db_id, c.assignee_field, c.bot_user)
             now = (yt.issue(key).fields.get(c.assignee_field) or [None])[0]
-            step(f"assign {c.bot_login}", now in (c.bot_login,) or bool(now), f"reads back {now!r}")
+            step(f"assign {c.bot_user}", now in (c.bot_user,) or bool(now), f"reads back {now!r}")
         for tag in (c.tags.needs_input, c.tags.failed):
             yt.add_tag(issue.db_id, tag)
             step(f"add tag {tag}", tag in yt.issue_tags(issue.db_id))
@@ -58,7 +61,7 @@ def main(key: str) -> int:
         text = "Arceus: checking that the runner can write to YouTrack. This comment will be deleted.\n\n[arceus:roundtrip]"
         comment_id, _ = yt.add_comment(issue.db_id, text)
         mine = [x for x in yt.comments(issue.db_id) if x.id == comment_id]
-        step("post comment", bool(mine) and mine[0].author == c.bot_login,
+        step("post comment", bool(mine) and mine[0].author == c.bot_user,
              f"by {mine[0].author}" if mine else "not found")
     finally:
         if comment_id:

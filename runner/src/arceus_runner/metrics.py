@@ -1,7 +1,7 @@
 """Prometheus metrics on localhost: what Grafana's "now" dashboard shows.
 
 Everything here is a gauge refreshed from the runner's own state on every tick, so a scrape
-never waits on YouTrack, GitLab or the engine. Task history and reasons live in events.jsonl and
+never waits on the tracker, the code host or the engine. Task history and reasons live in events.jsonl and
 reach Grafana through Loki; this file is only the current picture.
 """
 
@@ -30,8 +30,10 @@ class Metrics:
         self.queue = Gauge("runner_queue_length", "Accepted tickets waiting to be taken", registry=r)
         self.busy = Gauge("runner_agent_busy", "1 while a task holds the agent", registry=r)
         self.can_take = Gauge("runner_can_take", "1 when health allows new work", registry=r)
-        self.service_up = Gauge("runner_service_up", "1 when the service answers", ["service"], registry=r)
-        self.backoff = Gauge("runner_backoff_seconds", "Seconds left in a service's pause", ["service"], registry=r)
+        # role: tracker or code_host, so a dashboard reads them whichever provider config.yaml names.
+        self.service_up = Gauge("runner_service_up", "1 when the service answers", ["service", "role"], registry=r)
+        self.backoff = Gauge("runner_backoff_seconds", "Seconds left in a service's pause", ["service", "role"],
+                             registry=r)
         self.usage = Gauge("runner_usage_percent", "Subscription usage read by Bulava", ["provider", "window"],
                            registry=r)
         self.usage_resets = Gauge("runner_usage_resets_at_seconds", "When the usage window resets (epoch)",
@@ -92,9 +94,10 @@ class Metrics:
         self.busy.set(1 if runner.store.tasks("claimed", "dispatched", "publishing") else 0)
         self.can_take.set(1 if runner.can_take() else 0)
 
-        for client in (runner.yt_client, runner.gl_client):
-            self.service_up.labels(client.name).set(1 if runner.health.get(f"service.{client.name}") == "ok" else 0)
-            self.backoff.labels(client.name).set(round(client.seconds_left()))
+        for role, client in (("tracker", runner.tracker.client), ("code_host", runner.code_host.client)):
+            self.service_up.labels(client.name, role).set(
+                1 if runner.health.get(f"service.{client.name}") == "ok" else 0)
+            self.backoff.labels(client.name, role).set(round(client.seconds_left()))
 
         self.update_usage(cfg.paths.bulava_state)
         self.update_progress(runner)

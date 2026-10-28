@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from arceus_runner.config import Config, Secrets
+from arceus_runner.integrations import build_code_host, build_tracker
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "config.example.yaml"
 
@@ -23,7 +24,7 @@ def example_raw() -> dict:
 def cfg(tmp_path: Path) -> Config:
     raw = example_raw()
     raw.pop("slack")
-    raw["gitlab"]["exclude_repos"] = ["acme-infra"]
+    raw["code_host"]["exclude_repos"] = ["acme-infra"]
     raw["metrics"] = {"port": 0}
     raw["health"].pop("devstack_check", None)
     raw["paths"] = {
@@ -39,7 +40,16 @@ def cfg(tmp_path: Path) -> Config:
 
 @pytest.fixture
 def secrets() -> Secrets:
-    return Secrets(youtrack=YT_TOKEN, gitlab=GL_TOKEN, slack=None)
+    return Secrets(tracker=YT_TOKEN, code_host=GL_TOKEN, slack=None)
+
+
+def providers(cfg: Config, secrets: Secrets, fake_tracker, fake_host, clock=None):
+    """The configured tracker and code host, talking to in-memory fakes over HTTP."""
+    tracker = build_tracker(cfg, secrets, transport=httpx.MockTransport(fake_tracker))
+    host = build_code_host(cfg, secrets, transport=httpx.MockTransport(fake_host))
+    if clock is not None:
+        tracker.client.clock = host.client.clock = clock
+    return tracker, host
 
 
 class FakeClock:

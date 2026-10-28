@@ -2119,7 +2119,7 @@
       "id": 55,
       "type": "timeseries",
       "title": "Network errors and drops",
-      "description": "Packets per second. Errors should stay at zero: a steady line explains timeouts to GitLab, YouTrack or the model APIs. A low, flat drop rate is usually broadcast traffic nobody listens to; a jump during a task is not.",
+      "description": "Packets per second. Errors should stay at zero: a steady line explains timeouts to the code host, the tracker or the model APIs. A low, flat drop rate is usually broadcast traffic nobody listens to; a jump during a task is not.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

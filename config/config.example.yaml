@@ -1,42 +1,51 @@
 # Runner settings for one project. No secrets here: the bot tokens are in secrets.env
-# (YOUTRACK_TOKEN, GITLAB_TOKEN, SLACK_BOT_TOKEN). Unknown keys are errors.
+# (YOUTRACK_TOKEN, GITLAB_TOKEN, SLACK_BOT_TOKEN with the providers below). Unknown keys are errors.
 # Check it with: arceus-runner check
 
 project: acme-lms                      # name for logs, metrics and dashboards (a-z, 0-9, -)
 
-# observe: read YouTrack and GitLab, write what would happen to events.jsonl, change nothing.
+# observe: read the tracker and the code host, write what would happen to events.jsonl, change nothing.
 # live:    take tasks, run Bulava, push exactly the commit Codex reviewed and open MRs.
 mode: observe
 
-youtrack:
-  url: https://youtrack.example.com
-  project: ACME                        # short name (ID) of the YouTrack project
-  bot_login: agent-runner              # the runner ignores this user's comments
-  allowed_users:                       # who may start the agent with the tag (YouTrack logins)
+# Where tasks come from. `type` picks the implementation: youtrack ships with Arceus; another tracker
+# is a module of your own (see "Adding a tracker or a code host" in README.md). The keys up to
+# `states` mean the same for every tracker; the rest belong to the type.
+tracker:
+  type: youtrack
+  bot_user: agent-runner               # the bot's login: the runner ignores this user's comments
+  allowed_users:                       # who may start the agent with the queue tag (tracker logins)
     - j.doe
     - a.smith
   tags:
     queue: agent
     needs_input: agent-needs-input
     failed: agent-failed
-  state_field: State                   # name of the state field in the project's workflow
-  assignee_field: Assignee             # set to the bot when a task is taken; null to leave it alone
   states:
     queued: To Do
     in_progress: In Progress
     code_review: Code Review
+  # YouTrack
+  url: https://youtrack.example.com
+  project: ACME                        # short name (ID) of the YouTrack project
+  state_field: State                   # name of the state field in the project's workflow
+  assignee_field: Assignee             # set to the bot when a task is taken; null to leave it alone
 
-gitlab:
+# Where the repositories live: merge requests, their discussions and CI. `type` picks the
+# implementation: gitlab ships with Arceus. Git itself is the transport whatever the host.
+code_host:
+  type: gitlab
+  bot_user: acme-agent-bot             # the bot's username: its notes, and who a mention addresses
+  git_author: { name: "ACME Agent", email: "acme-agent-bot@example.com" }
+  exclude_repos: []                    # repositories of the group the agent never gets, e.g. [acme-infra]
+  branch_prefix: agent/
+  mr_label: agent
+  # GitLab
   url: https://gitlab.example.com
   group: clients/acme                  # the group that holds all the project's repositories.
                                        # A task gets all of them; the agent changes whichever it needs,
                                        # and MRs are opened only where it changed something
-  bot_username: acme-agent-bot
-  git_author: { name: "ACME Agent", email: "acme-agent-bot@example.com" }
   include_subgroups: true
-  exclude_repos: []                    # repositories of the group the agent never gets, e.g. [acme-infra]
-  branch_prefix: agent/
-  mr_label: agent
 
 # Optional. Remove the section if there is no Slack bot yet.
 slack:
@@ -110,7 +119,7 @@ bulava:
 # before the agent gets it. A suspicious text is held, and the task waits for a reviewer's
 # `/security-allow <code>` or `/security-reject <code>` on the ticket.
 security:
-  reviewers:                           # YouTrack logins who decide on held texts; required in live mode
+  reviewers:                           # tracker logins who decide on held texts; required in live mode
     - a.smith
   model: auto                          # the classifier's model: auto | sonnet | opus | an exact id
   timeout: 3m

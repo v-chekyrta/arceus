@@ -50,8 +50,8 @@ _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 # Keys an earlier layout used. They are refused by name, so the error says what to do with them.
 _GONE = {
-    "repo_field": "the agent works across all repositories of gitlab.group; remove this line",
-    "repo_map": "the agent works across all repositories of gitlab.group; remove this block",
+    "repo_field": "the agent works across all repositories of the code host's group; remove this line",
+    "repo_map": "the agent works across all repositories of the code host's group; remove this block",
     "multi_repo_tasks": "every task can change any repository of the group now; remove this line",
     "default_repo": "a session no longer starts in one repository: it starts in the workspace folder, "
                     "and the agent picks the repositories the ticket needs; remove this line",
@@ -78,51 +78,50 @@ def _env_name(v: str) -> str:
     return v
 
 
-class YouTrackTags(Strict):
+class TrackerTags(Strict):
+    """Tags (labels, in some trackers) that mark an issue for the runner."""
     queue: str = "agent"
     needs_input: str = "agent-needs-input"
     failed: str = "agent-failed"
 
     @model_validator(mode="after")
-    def _distinct(self) -> YouTrackTags:
+    def _distinct(self) -> TrackerTags:
         names = [self.queue, self.needs_input, self.failed]
         if len(set(names)) != len(names):
             raise ValueError(f"tags must be different, got {names}")
         return self
 
 
-class YouTrackStates(Strict):
+class TrackerStates(Strict):
+    """The tracker's names of the states a task moves through."""
     queued: str
     in_progress: str
     code_review: str
 
 
-class YouTrackConfig(Strict):
-    url: str
-    project: str = Field(min_length=1)
-    token_env: str = "YOUTRACK_TOKEN"  # name of the variable in secrets.env; there is rarely a reason to change it
-    bot_login: str = Field(min_length=1)
-    allowed_users: list[str] = Field(min_length=1)
-    tags: YouTrackTags = YouTrackTags()
-    state_field: str = "State"
-    assignee_field: str | None = "Assignee"  # set to the bot when a task is taken; null to leave it
-    states: YouTrackStates
+def _url(v: str) -> str:
+    if not v.startswith(("https://", "http://")):
+        raise ValueError("must start with https://")
+    return v.rstrip("/")
 
-    _gone = _refuse_gone("youtrack")
 
+class IssueTrackerConfig(Strict):
+    """The `tracker:` section: what the runner needs from any issue tracker. A provider (youtrack.py)
+    subclasses it with its own keys; `type` says which provider (integrations.py)."""
+    type: str
+    token_env: str  # name of the variable in secrets.env; each provider has its own default
+    bot_user: str = Field(min_length=1)  # the bot's login: its own comments are never read as people's
+    allowed_users: list[str] = Field(min_length=1)  # tracker logins who may start the agent with the queue tag
+    tags: TrackerTags = TrackerTags()
+    states: TrackerStates
+
+    _gone = _refuse_gone("tracker")
     _check_env = field_validator("token_env")(_env_name)
 
-    @field_validator("url")
-    @classmethod
-    def _url(cls, v: str) -> str:
-        if not v.startswith(("https://", "http://")):
-            raise ValueError("must start with https://")
-        return v.rstrip("/")
-
     @model_validator(mode="after")
-    def _users(self) -> YouTrackConfig:
-        if self.bot_login in self.allowed_users:
-            raise ValueError(f"allowed_users must not contain the bot itself ({self.bot_login})")
+    def _users(self) -> IssueTrackerConfig:
+        if self.bot_user in self.allowed_users:
+            raise ValueError(f"allowed_users must not contain the bot itself ({self.bot_user})")
         if len(set(self.allowed_users)) != len(self.allowed_users):
             raise ValueError("allowed_users has duplicates")
         return self
@@ -133,31 +132,19 @@ class GitAuthor(Strict):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+$")
 
 
-class GitLabConfig(Strict):
-    url: str
-    group: str = Field(min_length=1)
-    token_env: str = "GITLAB_TOKEN"  # name of the variable in secrets.env; there is rarely a reason to change it
-    bot_username: str = Field(min_length=1)
+class CodeHostConfig(Strict):
+    """The `code_host:` section: what the runner needs from any host of git repositories with merge
+    requests. A provider (gitlab.py) subclasses it with its own keys; `type` says which provider."""
+    type: str
+    token_env: str  # name of the variable in secrets.env; each provider has its own default
+    bot_user: str = Field(min_length=1)  # the bot's username: whose notes are its own, who a mention addresses
     git_author: GitAuthor
-    include_subgroups: bool = True
-    exclude_repos: list[str] = []
+    exclude_repos: list[str] = []  # repositories of the scope the agent never gets
     branch_prefix: str = "agent/"
     mr_label: str = "agent"
 
+    _gone = _refuse_gone("code_host")
     _check_env = field_validator("token_env")(_env_name)
-    _gone = _refuse_gone("gitlab")
-
-    @field_validator("url")
-    @classmethod
-    def _url(cls, v: str) -> str:
-        if not v.startswith(("https://", "http://")):
-            raise ValueError("must start with https://")
-        return v.rstrip("/")
-
-    @field_validator("group")
-    @classmethod
-    def _group(cls, v: str) -> str:
-        return v.strip("/")
 
     @field_validator("branch_prefix")
     @classmethod
@@ -358,7 +345,7 @@ class BulavaConfig(Strict):
 
 class SecurityConfig(Strict):
     """The security screen (screening.py): every text from people or CI is classified before the agent gets it."""
-    # YouTrack logins who release (`/security-allow <code>`) or reject a held text. Required in live mode.
+    # Tracker logins who release (`/security-allow <code>`) or reject a held text. Required in live mode.
     # Better a short list of people who answer for the client's data than everyone who may start the agent.
     reviewers: list[str] = []
     model: str = Field(default="auto", pattern=MODEL_NAME)  # the classifier's Claude model; auto: the CLI's default
@@ -387,7 +374,7 @@ class CleanupConfig(Strict):
     keep_media: Duration = timedelta(days=14)     # .arceus/media/<KEY> after the task is over
     keep_notes: Duration = timedelta(days=90)     # .arceus/notes/<KEY>: reviewers ask weeks later
     stash: bool = True       # uncommitted leftovers on a finished task's branch go to `git stash`
-    branches: bool = True    # local branches of finished tasks, when GitLab has their commits
+    branches: bool = True    # local branches of finished tasks, when the code host has their commits
     processes: bool = True   # dev servers whose agent session is gone
     # advise: Claude (no tools) comments on what the rules cannot place. YAML reads a bare `off` as false.
     llm: Annotated[Literal["off", "advise"], BeforeValidator(lambda v: "off" if v is False else v)] = "off"
@@ -412,13 +399,58 @@ class Paths(Strict):
     events: ExpandedPath = Path("~/arceus/data/events.jsonl").expanduser()
 
 
+def _provider_section(kind: str):
+    """The section's provider model, picked by its `type:` (integrations.py), validated as that model."""
+    def pick(cls, value, handler):
+        if not isinstance(value, dict):
+            return handler(value)
+        if "type" not in value:
+            raise ValueError(f"type: required: which {kind} this is, e.g. "
+                             f"{'youtrack' if kind == 'issue tracker' else 'gitlab'}")
+        from arceus_runner import integrations
+        find = integrations.tracker_type if kind == "issue tracker" else integrations.code_host_type
+        return find(value["type"]).config.model_validate(value)
+    return classmethod(pick)
+
+
+# The layout before `tracker:` and `code_host:`: a `youtrack:` and a `gitlab:` section. It still loads,
+# read as the same settings; the keys that were renamed on the way are named back in its errors.
+LEGACY_SECTIONS = {"youtrack": ("tracker", {"bot_login": "bot_user"}),
+                   "gitlab": ("code_host", {"bot_username": "bot_user"})}
+
+
+def is_legacy(raw: object) -> bool:
+    return isinstance(raw, dict) and any(k in raw for k in LEGACY_SECTIONS)
+
+
+def _from_legacy(raw: dict) -> dict:
+    out = dict(raw)
+    for old, (new, renamed) in LEGACY_SECTIONS.items():
+        if old not in out or new in out:
+            continue
+        section = out.pop(old)
+        if isinstance(section, dict):
+            section = {"type": old, **{renamed.get(k, k): v for k, v in section.items()}}
+        out[new] = section
+    return out
+
+
+def legacy_words(text: str) -> str:
+    """An error about the new layout, worded for a config.yaml in the old one."""
+    for old, (new, renamed) in LEGACY_SECTIONS.items():
+        for was, now in renamed.items():
+            text = re.sub(rf"\b{new}\.{now}\b", f"{new}.{was}", text)
+        text = re.sub(rf"(?<![\w.]){new}(?=[.:]|$)", old, text)
+    return text
+
+
 class Config(Strict):
     project: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
-    # observe: read YouTrack/GitLab, log what would happen, change nothing.
+    # observe: read the tracker and the code host, log what would happen, change nothing.
     # live: take tasks, run Bulava, push the reviewed commit and open MRs.
     mode: Literal["observe", "live"] = "observe"
-    youtrack: YouTrackConfig
-    gitlab: GitLabConfig
+    tracker: IssueTrackerConfig
+    code_host: CodeHostConfig
     slack: SlackConfig | None = None
     schedule: Schedule
     http: HttpConfig = HttpConfig()
@@ -430,14 +462,22 @@ class Config(Strict):
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
 
+    _tracker = field_validator("tracker", mode="wrap")(_provider_section("issue tracker"))
+    _code_host = field_validator("code_host", mode="wrap")(_provider_section("code host"))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy(cls, data):
+        return _from_legacy(data) if is_legacy(data) else data
+
     @model_validator(mode="after")
     def _security(self) -> Config:
         s = self.security
         if self.mode == "live" and not s.reviewers:
-            raise ValueError("security.reviewers: required in live mode: the YouTrack logins who decide on a text "
+            raise ValueError("security.reviewers: required in live mode: the tracker logins who decide on a text "
                              "the security screen held")
-        if self.youtrack.bot_login in s.reviewers:
-            raise ValueError(f"security.reviewers must not contain the bot itself ({self.youtrack.bot_login})")
+        if self.tracker.bot_user in s.reviewers:
+            raise ValueError(f"security.reviewers must not contain the bot itself ({self.tracker.bot_user})")
         if len(set(s.reviewers)) != len(s.reviewers):
             raise ValueError("security.reviewers has duplicates")
         return self
@@ -475,7 +515,8 @@ def load_config(path: Path) -> Config:
     try:
         return Config.model_validate(raw)
     except ValidationError as e:
-        raise ConfigError(_format(e)) from None
+        problems = _format(e)
+        raise ConfigError([legacy_words(p) for p in problems] if is_legacy(raw) else problems) from None
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -498,12 +539,12 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class Secrets:
-    youtrack: str
-    gitlab: str
+    tracker: str
+    code_host: str
     slack: str | None
 
     def values(self) -> list[str]:
-        return [v for v in (self.youtrack, self.gitlab, self.slack) if v]
+        return [v for v in (self.tracker, self.code_host, self.slack) if v]
 
     def __repr__(self) -> str:  # never print tokens by accident
         return "Secrets(<redacted>)"
@@ -529,7 +570,7 @@ def load_secrets(cfg: Config, environ: dict[str, str] | None = None) -> Secrets:
     def get(name: str) -> str | None:
         return file_values.get(name) or environ.get(name) or None
 
-    wanted = {"youtrack": cfg.youtrack.token_env, "gitlab": cfg.gitlab.token_env}
+    wanted = {"tracker": cfg.tracker.token_env, "code_host": cfg.code_host.token_env}
     if cfg.slack:
         wanted["slack"] = cfg.slack.token_env
     found = {k: get(v) for k, v in wanted.items()}
@@ -538,4 +579,4 @@ def load_secrets(cfg: Config, environ: dict[str, str] | None = None) -> Secrets:
             problems.append(f"{k}.token_env: {v} is not set in {path} or the environment")
     if problems:
         raise ConfigError(problems)
-    return Secrets(youtrack=found["youtrack"], gitlab=found["gitlab"], slack=found.get("slack"))
+    return Secrets(tracker=found["tracker"], code_host=found["code_host"], slack=found.get("slack"))

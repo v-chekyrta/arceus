@@ -1,7 +1,8 @@
 """HTTP access to one external service with its own pause rules.
 
-Each service (YouTrack, GitLab, Slack) has its own client and its own pause, so
-GitLab being down does not stop YouTrack polling and vice versa.
+Each service (the issue tracker, the code host, Slack) has its own client and its own pause,
+so the code host being down does not stop the tracker's polling and vice versa. Providers of
+integrations.py send their requests through it.
 """
 
 from __future__ import annotations

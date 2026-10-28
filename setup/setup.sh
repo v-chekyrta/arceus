@@ -519,7 +519,7 @@ UNIT
 unit_text() {
   cat <<UNIT
 [Unit]
-Description=Arceus runner: YouTrack/GitLab bridge for Bulava
+Description=Arceus runner: issue tracker and code host bridge for Bulava
 After=network-online.target bulava-engine.service
 Wants=network-online.target bulava-engine.service
 

@@ -13,14 +13,13 @@ import httpx
 import pytest
 
 from arceus_runner import loop
-from arceus_runner.checks import gitlab_client, youtrack_client
 from arceus_runner.config import Config
 from arceus_runner.db import ReviewStore as TaskStore
 from arceus_runner.engine import Engine
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git, GitAuth
 
-from .conftest import GL_TOKEN, FakeClock, example_raw, read_events
+from .conftest import GL_TOKEN, FakeClock, example_raw, providers, read_events
 from .fakes import FakeGitLab, FakeScreen, FakeYouTrack
 
 FAKE_ENGINE = Path(__file__).with_name("fake_engine.py")
@@ -74,7 +73,7 @@ class World:
         raw = example_raw()
         raw.pop("slack")
         raw["mode"] = "live"
-        raw["gitlab"]["exclude_repos"] = ["acme-infra"]
+        raw["code_host"]["exclude_repos"] = ["acme-infra"]
         raw["paths"] = {
             "workspace": str(tmp / "workspace"), "bulava": str(engine_dir), "bulava_state": str(tmp / "state"),
             "bulava_env": str(tmp / "bulava.env"), "secrets": str(tmp / "secrets.env"),
@@ -97,11 +96,9 @@ class World:
         self.runner = self._runner()
 
     def _runner(self) -> loop.Runner:
-        yc = youtrack_client(self.cfg, self.secrets, transport=httpx.MockTransport(self.yt))
-        gc = gitlab_client(self.cfg, self.secrets, transport=httpx.MockTransport(self.gl))
-        yc.clock = gc.clock = self.clock
-        g = Git(GitAuth(self.cfg.gitlab.url, "bot", GL_TOKEN), "ACME Agent", "bot@example.com")
-        return loop.Runner(self.cfg, self.store, self.events, yc, gc, now=lambda: self.now, mono=self.clock,
+        tracker, host = providers(self.cfg, self.secrets, self.yt, self.gl, self.clock)
+        g = Git(GitAuth(self.cfg.code_host.url, "bot", GL_TOKEN), "ACME Agent", "bot@example.com")
+        return loop.Runner(self.cfg, self.store, self.events, tracker, host, now=lambda: self.now, mono=self.clock,
                            engine=Engine(self.cfg, extra_env=self.engine_env), git=g, classify=self.screen)
 
     def tick(self) -> None:
@@ -197,7 +194,7 @@ def test_ticket_to_merge_request(w):
     assert d["env"]["SUPERVISOR_PROFILE"] == "server" and d["env"]["SUPERVISOR_REPORT_LANGUAGE"] == "English"
     assert d["env"]["SUPERVISOR_HANDSHAKE_WAIT"] == "30"   # a cold Claude takes longer than the engine's 5 s
     assert str(w.cfg.paths.secrets) in d["env"]["SUPERVISOR_SERVER_EXTRA_SECRET_PATHS"]
-    assert GL_TOKEN not in json.dumps(w.engine_state()) and w.secrets.youtrack not in json.dumps(w.engine_state())
+    assert GL_TOKEN not in json.dumps(w.engine_state()) and w.secrets.tracker not in json.dumps(w.engine_state())
     assert [c["argv"][0] for c in w.calls("night-shift") if c["argv"][0] != "doctor"][:2] == ["trust", "mcp-decide"]
     # The token is not in the clone's config either.
     assert GL_TOKEN not in (w.repo / ".git" / "config").read_text()
@@ -387,7 +384,7 @@ def test_failure_notice_survives_youtrack_outage(w):
 
 def test_untagged_or_moved_ticket_is_not_taken(w):
     db_id = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
-    w.runner.poll_youtrack()  # decision recorded while it is queued
+    w.runner.poll_tracker()  # decision recorded while it is queued
     w.yt.issue_fields[db_id] = {"State": {"name": "In Progress"}}  # someone took it by hand
     w.runner.delivery.maybe_start(True)
     assert w.calls("dispatch") == [] and w.store.task("ACME-1") is None
@@ -406,16 +403,16 @@ def test_live_mode_refused_when_engine_lacks_the_contract(w, tmp_path):
 def test_crash_right_after_failing_still_notifies(w, monkeypatch):
     take(w)
     w.settle("ACME-1", "failed", review="debt", state_reason="debt")
-    real = w.runner.delivery.yt.add_comment
+    real = w.runner.delivery.tracker.add_comment
 
     def die(*a, **k):
         raise RuntimeError("killed")  # not a service error: the process dies here
 
-    monkeypatch.setattr(w.runner.delivery.yt, "add_comment", die)
+    monkeypatch.setattr(w.runner.delivery.tracker, "add_comment", die)
     with pytest.raises(RuntimeError):
         w.tick()
     assert w.store.task("ACME-1").state == "failed"
-    monkeypatch.setattr(w.runner.delivery.yt, "add_comment", real)
+    monkeypatch.setattr(w.runner.delivery.tracker, "add_comment", real)
     w.restart()
     w.clock.advance(3600)
     w.tick()
@@ -707,7 +704,7 @@ def test_metrics_show_the_current_picture(w):
     assert 'runner_health{check="service.youtrack"} 0.0' in text
     assert 'runner_usage_percent{provider="claude",window="5h"} 4.0' in text
     assert 'runner_usage_resets_at_seconds{provider="claude",window="5h"} 1.792778399e+09' in text
-    assert 'runner_service_up{service="gitlab"} 1.0' in text
+    assert 'runner_service_up{role="code_host",service="gitlab"} 1.0' in text
 
 
 

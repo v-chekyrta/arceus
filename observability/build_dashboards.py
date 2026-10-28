@@ -226,9 +226,12 @@ def now_dashboard():
              desc="Tickets tagged by an allowed person and not taken yet."),
         stat("Takes new work", "runner_can_take", grid(8, 0, 4, 4),
              mappings=mapping([(1, "Yes", GOOD), (0, "No · see health", CRITICAL)]),
-             desc="No while any health check fails or YouTrack/GitLab is paused. Started tasks are still followed."),
-        stat("YouTrack", 'runner_service_up{service="youtrack"}', grid(12, 0, 4, 4), mappings=up),
-        stat("GitLab", 'runner_service_up{service="gitlab"}', grid(16, 0, 4, 4), mappings=up),
+             desc="No while any health check fails or the tracker or the code host is paused. Started tasks are "
+                  "still followed."),
+        stat("Issue tracker", 'runner_service_up{role="tracker"}', grid(12, 0, 4, 4), mappings=up,
+             desc="The tracker config.yaml names (YouTrack, or another provider): answering, token accepted."),
+        stat("Code host", 'runner_service_up{role="code_host"}', grid(16, 0, 4, 4), mappings=up,
+             desc="The code host config.yaml names (GitLab, or another provider): answering, token accepted."),
         stat("Mode", "runner_info", grid(20, 0, 4, 4), color="text", name="{{mode}}",
              desc="observe: reads and logs only. live: takes tasks and opens MRs."),
         stat("Step", "runner_task_step_since_seconds", grid(0, 4, 9, 4), color=SERIES[0], name="{{stage}} · {{state}}",
@@ -414,8 +417,8 @@ def resources_dashboard():
                     prom(f"sum(rate(node_network_receive_drop_total{{{nic}}}[5m]) + rate(node_network_transmit_drop_total{{{nic}}}[5m]))",
                          "Dropped", "B")],
                    grid(12, 50, 12, 8), unit="pps", single=False, minimum=0,
-                   desc="Packets per second. Errors should stay at zero: a steady line explains timeouts to GitLab, "
-                        "YouTrack or the model APIs. A low, flat drop rate is usually broadcast traffic nobody listens "
+                   desc="Packets per second. Errors should stay at zero: a steady line explains timeouts to the code host, "
+                        "the tracker or the model APIs. A low, flat drop rate is usually broadcast traffic nobody listens "
                         "to; a jump during a task is not."),
 
         row("Cleanup", 58),

@@ -114,7 +114,7 @@ def test_a_pending_continue_goes_before_a_new_ticket(w):
 def test_the_failed_tag_comes_off_even_if_youtrack_fails_then_and_does_not_come_back(w, monkeypatch):
     from arceus_runner.http import ServiceError
     take(w)
-    yt = w.runner.delivery.yt
+    yt = w.runner.delivery.tracker
     real, added = yt.add_tag, []
 
     def refuse(db_id, tag):

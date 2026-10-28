@@ -903,7 +903,7 @@ def test_a_close_that_gitlab_refused_is_retried_without_a_second_note(w, monkeyp
     git(w.repo, "revert", "--no-edit", "HEAD")
     commit(w.cfg.paths.workspace / "acme-theme", "s.css", "b{}\n")
     w.settle("ACME-1", "waiting_review")
-    gl = w.runner.gl
+    gl = w.runner.code_host
     real = gl.close_mr
 
     def broken(project_id, iid):

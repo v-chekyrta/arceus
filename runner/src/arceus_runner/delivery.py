@@ -1,10 +1,10 @@
-"""Live delivery: a queued YouTrack ticket becomes an MR with the commit Codex reviewed.
+"""Live delivery: a queued ticket becomes an MR with the commit Codex reviewed.
 
 Every step can be repeated. The runner's own state is in SQLite, Bulava's in
 `task show`; after a crash the next tick looks at both and finishes what is
 missing instead of doing anything twice:
 
-- a YouTrack comment goes through the action journal and carries a marker, so a
+- a ticket comment goes through the action journal and carries a marker, so a
   comment posted just before a crash is found instead of posted again;
 - a dispatch or a follow-up has a stable message id, Bulava answers a repeat
   with `duplicate`;
@@ -27,11 +27,19 @@ from arceus_runner.config import Config
 from arceus_runner.db import ACTIVE_STATES, TaskStore, Task, TriggerDecision
 from arceus_runner.engine import Engine, EngineError, Reply
 from arceus_runner.events import EventLog
-from arceus_runner.gitlab import GitLabWriter, MergeRequest, Repo
 from arceus_runner.gitops import HOME_BRANCH, Git, GitError
 from arceus_runner.http import BadRequest, NotFound, ServiceError
+from arceus_runner.integrations import (
+    CodeHost,
+    Issue,
+    IssueDetails,
+    IssueTracker,
+    MergeRequest,
+    Repo,
+    key_part,
+    usable_repos,
+)
 from arceus_runner.screening import Classify, Gate, trusted
-from arceus_runner.youtrack import IssueDetails, YouTrackWriter
 
 START_REFUSED = {
     76: "the repository folder is not a git repository",
@@ -55,7 +63,7 @@ RESUME = "The session was interrupted (a reboot or a crash). Continue the task f
 PREPARED_MARK = "arceus-prepared"
 CONTINUE = "/continue"  # a comment that starts with this, from someone allowed, resumes a failed task
 HOME_IGNORE = """\
-# Every folder here is a repository of the GitLab group, cloned by the Arceus runner.
+# Every folder here is a repository of the project's group on its code host, cloned by the Arceus runner.
 # This repository holds only the runner's notes for the agent and is never published.
 /*
 !/.gitignore
@@ -64,9 +72,10 @@ HOME_IGNORE = """\
 """
 
 
-def home_files(group: str, repos: list[Repo], home: Path) -> dict[str, str]:
-    """What the agent finds where its session starts: what the folder is, its path, and the repositories."""
-    lines = [f"# GitLab group `{group}`", "",
+def home_files(where: str, repos: list[Repo], home: Path) -> dict[str, str]:
+    """What the agent finds where its session starts: what the folder is, its path, and the repositories.
+    `where` names the scope: GitLab group `clients/acme`."""
+    lines = [f"# {where}", "",
              "This folder is not a project. Each folder in it is a separate git repository of the group,",
              "cloned by the Arceus runner and switched to the task's branch.", "",
              f"Its absolute path (the workspace): `{home}`", "",
@@ -121,10 +130,11 @@ def with_media_section(description: str, shots: list[str]) -> str:
         description.rstrip() + "\n\n" + section
 
 
-def ticket_media_text(items: list[media.MediaItem]) -> str:
-    """YouTrack shows a comment's own attachment in place when the text names it: images and a video player."""
+def ticket_media_text(tracker: IssueTracker, items: list[media.MediaItem]) -> str:
+    """The comment's own attachments, shown in place the way the tracker does it."""
     return "\n\n".join(["Screenshots and recordings of the change:",
-                         *(f"**{m.caption}**\n\n![{m.caption}]({m.upload_name})" for m in items)])
+                         *(f"**{m.caption}**\n\n{tracker.attachment_markdown(m.upload_name, m.caption)}"
+                           for m in items)])
 
 
 _CAUSE = re.compile(r"not found|no such file|not on path|\berror\b|\bfailed\b|denied|timed out", re.I)
@@ -143,17 +153,17 @@ def _log_hint(log: Path) -> str:
 
 
 class Delivery:
-    def __init__(self, cfg: Config, store: TaskStore, events: EventLog, yt: YouTrackWriter, gl: GitLabWriter,
+    def __init__(self, cfg: Config, store: TaskStore, events: EventLog, tracker: IssueTracker, host: CodeHost,
                  engine: Engine, git: Git, classify: Classify, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self.cfg = cfg
         self.store = store
         self.events = events
-        self.yt = yt
-        self.gl = gl
+        self.tracker = tracker
+        self.host = host
         self.engine = engine
         self.git = git
         self.now = now
-        self._skipped: set[str] = set()
+        self._skipped: set[tuple[str, str]] = set()  # (issue key, tag event) not takeable: not tried again
         self._engine_seen: dict[str, tuple] = {}  # task id → the engine's state last written as engine_state
         self._waiting: dict[str, tuple] = {}  # task id → why its follow-up waits, as last written as followup_waits
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
@@ -168,12 +178,12 @@ class Delivery:
         if act and act[0] == "done":
             return tuple(json.loads(act[1])) if act[1] else None
         if act:  # intent without done: it may have been posted before a crash
-            for c in self.yt.comments(task.issue_db_id):
-                if c.author == self.cfg.youtrack.bot_login and marker in c.text:
+            for c in self.tracker.comments(task.issue_db_id):
+                if c.author == self.cfg.tracker.bot_user and marker in c.text:
                     self.store.action_done(key, json.dumps([c.id, c.created]))
                     return c.id, c.created
         self.store.action_intent(key, task.task_id, "comment", json.dumps({"kind": kind, "text": text}))
-        cid, created = self.yt.add_comment(task.issue_db_id, f"{text}\n\n{marker}")
+        cid, created = self.tracker.add_comment(task.issue_db_id, f"{text}\n\n{marker}")
         self.store.action_done(key, json.dumps([cid, created]))
         return cid, created
 
@@ -182,11 +192,11 @@ class Delivery:
         if act and act[0] == "done":
             return
         self.store.action_intent(key, task.task_id, "tag", json.dumps({"tag": tag}))
-        self.yt.add_tag(task.issue_db_id, tag)
+        self.tracker.add_tag(task.issue_db_id, tag)
         self.store.action_done(key)
 
     def retry_pending(self) -> None:
-        """Finish YouTrack updates that a failure or a crash left half done."""
+        """Finish ticket updates that a failure or a crash left half done."""
         for key, task_id, kind, payload in self.store.pending_actions():
             task = self.store.task(task_id)
             if not task or not payload:
@@ -196,20 +206,20 @@ class Delivery:
                 if kind == "comment":
                     self.comment_once(task, data["kind"], data["text"])
                 elif kind == "tag":
-                    self.yt.add_tag(task.issue_db_id, data["tag"])
+                    self.tracker.add_tag(task.issue_db_id, data["tag"])
                     self.store.action_done(key)
                 elif kind == "untag":
-                    self.yt.remove_tag(task.issue_db_id, data["tag"])
+                    self.tracker.remove_tag(task.issue_db_id, data["tag"])
                     self.store.action_done(key)
                 elif kind == "state":
                     if task.state in data.get("while", [task.state]):  # never move a ticket back past a later step
-                        self.yt.set_state(task.issue_db_id, self.cfg.youtrack.state_field, data["state"])
+                        self.tracker.set_state(task.issue_db_id, data["state"])
                     self.store.action_done(key)
                 elif kind == "reply" and getattr(self, "review", None):
                     self.review.retry_reply(task, key, data)
             except ServiceError as e:
                 self.events.emit("notify_pending", task_id=task_id, action=key, reason=str(e))
-                return  # YouTrack is still unwell; the next tick tries again
+                return  # the tracker is still unwell; the next tick tries again
 
     # -- taking a task --------------------------------------------------------------------------
 
@@ -219,22 +229,30 @@ class Delivery:
         if self.store.has_pending_review() or self._continues_waiting():
             return  # fixes for open MRs and resumed tasks go first
         for decision in self.store.accepted_untaken():
-            if decision.issue_key in self._skipped:
+            if self.skipped(decision):
                 continue
             if self.start(decision):
                 return
 
+    def skipped(self, decision: TriggerDecision) -> bool:
+        return (decision.issue_key, decision.tag_activity_id) in self._skipped
+
     def start(self, decision: TriggerDecision) -> bool:
         """Take one queued ticket. False if it is not takeable now (and was skipped)."""
-        c = self.cfg.youtrack
-        details = self.yt.issue(decision.issue_key)
-        state = (details.fields.get(c.state_field) or [""])[0]
-        tags = self.yt.issue_tags(details.db_id)
-        if state != c.states.queued or c.tags.queue not in tags:
-            self._skipped.add(decision.issue_key)
-            self.events.emit("task_not_taken", task_id=decision.issue_key,
-                             reason=f"no longer queued (state {state!r}, tag present: {c.tags.queue in tags})")
-            return False
+        c = self.cfg.tracker
+        details = self.tracker.issue(decision.issue_key)
+        tags = self.tracker.tags(details.db_id)
+        if details.state != c.states.queued or c.tags.queue not in tags:
+            return self._not_taken(decision, f"no longer queued (state {details.state!r}, "
+                                             f"tag present: {c.tags.queue in tags})")
+        # The decision was made when the tag was seen. Whoever put it on since is who queued the ticket now:
+        # someone the tracker cannot name, or someone not on the list, does not inherit an earlier approval.
+        now = self.tracker.trigger(Issue(details.db_id, details.key, details.summary, 0, 0))
+        if now is None or now.id != decision.tag_activity_id:
+            return self._not_taken(decision, "the tag was set again since it was approved, "
+                                             f"{f'by {now.author}' if now and now.author else 'by someone unknown'}")
+        if now.author not in c.allowed_users:
+            return self._not_taken(decision, f"{now.author} is no longer in allowed_users")
 
         base = dict(task_id=details.key, issue_db_id=details.db_id, summary=details.summary[:300],
                     tag_author=decision.author, base_branch="", question_id=None, question_at_ms=None,
@@ -243,7 +261,7 @@ class Delivery:
         if not repos:
             task = self.store.create_task(**base, state="claimed", repo="", repo_path="", branch="",
                                           extra_repos="[]")
-            self.fail(task, f"the group {self.cfg.gitlab.group} has no repositories (after exclude_repos)")
+            self.fail(task, f"the {self.host.scope_kind} {self.host.scope} has no repositories (after exclude_repos)")
             return True
 
         # The ticket does not say where the work is, and no repository is "the main one": the session
@@ -254,12 +272,17 @@ class Delivery:
         base.update(base_branch=HOME_BRANCH)
         task = self.store.create_task(
             **base, state="claimed", repo="", repo_path=str(self.cfg.paths.workspace),
-            branch=f"{self.cfg.gitlab.branch_prefix}{details.key}-{slugify(details.summary)}",
+            branch=f"{self.cfg.code_host.branch_prefix}{details.key}-{slugify(details.summary)}",
             extra_repos=json.dumps(names))
         self.events.emit("task_claimed", task_id=task.task_id, author=task.tag_author, repos=names,
                          branch=task.branch)
         self._take(task, repos, details)
         return True
+
+    def _not_taken(self, decision: TriggerDecision, reason: str) -> bool:
+        self._skipped.add((decision.issue_key, decision.tag_activity_id))
+        self.events.emit("task_not_taken", task_id=decision.issue_key, reason=reason)
+        return False
 
     def _take(self, task: Task, repos: list[Repo], details: IssueDetails) -> None:
         # Screened as it is now, at the start, not when it was tagged: anyone may have edited it since.
@@ -273,13 +296,11 @@ class Delivery:
         if why:
             self.fail(task, why)
             return
-        self.claim_in_youtrack(task)
+        self.claim_on_ticket(task)
         self.dispatch(task, text, clearance)
 
     def _group(self) -> list[Repo]:
-        g = self.cfg.gitlab
-        return [r for r in self.gl.group_repos(g.group, g.include_subgroups)
-                if r.relative_path not in g.exclude_repos and r.path not in g.exclude_repos]
+        return usable_repos(self.cfg, self.host.repos())
 
     def _names(self, task: Task) -> list[str]:
         """The task's repositories, by path below the group (the starting one first for older tasks)."""
@@ -319,8 +340,9 @@ class Delivery:
     def _prepare_home(self, repos: list[Repo]) -> None:
         """The workspace folder as the git project Bulava runs in, on main with the current notes."""
         home = self.cfg.paths.workspace
-        if self.git.write_home(home, home_files(self.cfg.gitlab.group, repos, home.resolve()),
-                               f"Arceus: workspace of GitLab group {self.cfg.gitlab.group}"):
+        h = self.host
+        if self.git.write_home(home, home_files(f"{h.label} {h.scope_kind} `{h.scope}`", repos, home.resolve()),
+                               f"Arceus: workspace of {h.label} {h.scope_kind} {h.scope}"):
             self.events.emit("workspace_home_updated", path=str(home), repos=len(repos))
         if not (home / ".git" / PREPARED_MARK).exists():
             self.engine.prepare_repo(home)
@@ -367,7 +389,7 @@ class Delivery:
         self.events.emit("followup_waits", task_id=task.task_id, reason=reason, **fields)
 
     def _followup_ready(self, task: Task) -> bool:
-        """Before a follow-up: every repository of the task on the task branch, caught up with GitLab.
+        """Before a follow-up: every repository of the task on the task branch, caught up with the code host.
 
         The workspace is shared, so another task may have switched a repository to its own branch
         in between; and people may have pushed to the MR branch. Both are put right here; nothing
@@ -402,7 +424,7 @@ class Delivery:
                 self.git.start_branch(path, task.branch, "HEAD")
             if self.store.task_mrs(task.task_id) and self.git.is_clean(path):
                 moved = self.git.catch_up(path, task.branch)
-                if moved in ("forwarded", "diverged"):  # "same" and "ahead": nothing came from GitLab
+                if moved in ("forwarded", "diverged"):  # "same" and "ahead": nothing came from the code host
                     self.events.emit("branch_caught_up", task_id=task.task_id, repo=name, result=moved)
         self._write_extra_dirs(task)
         return True
@@ -420,22 +442,22 @@ class Delivery:
             (path / ".git" / PREPARED_MARK).write_text("trust, mcp-decide skip\n")
         self.git.fetch(path)
 
-    def claim_in_youtrack(self, task: Task) -> None:
-        c = self.cfg.youtrack
-        self.yt.set_state(task.issue_db_id, c.state_field, c.states.in_progress)
-        if c.assignee_field:
-            try:
-                self.yt.set_assignee(task.issue_db_id, c.assignee_field, c.bot_login)
-            except BadRequest as e:
-                self.events.emit("assignee_not_set", task_id=task.task_id, reason=str(e))
+    def claim_on_ticket(self, task: Task) -> None:
+        self.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.in_progress)
+        try:
+            self.tracker.assign_to_bot(task.issue_db_id)
+        except BadRequest as e:
+            self.events.emit("assignee_not_set", task_id=task.task_id, reason=str(e))
         n = len(self._names(task))
         self.comment_once(task, "claim", f"The agent has taken this ticket: branch `{task.branch}` in the "
-                                         f"{n} {'repository' if n == 1 else 'repositories'} of group "
-                                         f"`{self.cfg.gitlab.group}`. It decides which of them the ticket needs; "
-                                         "merge requests will appear wherever it changes something.")
+                                         f"{n} {'repository' if n == 1 else 'repositories'} of "
+                                         f"{self.host.scope_kind} `{self.host.scope}`. It decides which of them "
+                                         "the ticket needs; merge requests will appear wherever it changes something.")
 
     def dispatch(self, task: Task, text: str, clearance) -> None:
+        # Message ids keep the `yt-` prefix they had before trackers were pluggable: the engine dedups by them.
         reply = self.engine.dispatch(task_id=task.task_id, message_id=f"yt-{task.task_id}", author=task.tag_author,
+                                     source=self.tracker.engine_source,
                                      branch=task.branch,
                                      base=f"origin/{task.base_branch}" if task.repo else HOME_BRANCH,
                                      repo=Path(task.repo_path), text=text, clearance=clearance,
@@ -468,7 +490,7 @@ class Delivery:
             if show is None:  # crashed between taking it and the dispatch, or released by a security reviewer
                 if any(t.task_id != task.task_id for t in self.store.tasks("dispatched", "publishing")):
                     return  # another task works in the shared workspace: this one starts after it
-                self._take(task, self._group(), self.yt.issue(task.task_id))
+                self._take(task, self._group(), self.tracker.issue(task.task_id))
                 return
             # The engine has it: the dispatch went through before a crash. Start the clock now if the
             # runner never saw the acceptance, so a record stuck in `queued` still times out.
@@ -566,7 +588,7 @@ class Delivery:
         if not self._followup_ready(task):
             return True  # the nudge waits for the workspace: not a refusal
         reply = self.engine.send(task_id=task.task_id, message_id=f"stalled-{task.task_id}-{attempt}", source="other",
-                                 author=self.cfg.youtrack.bot_login, repo=Path(task.repo_path), text=STALLED_NUDGE,
+                                 author=self.cfg.tracker.bot_user, repo=Path(task.repo_path), text=STALLED_NUDGE,
                                  clearance=trusted(STALLED_NUDGE), extra_dirs=self._extra_dirs_file(task))
         if reply.rc == 6:
             self.events.emit("send_busy", task_id=task.task_id, reason=reply.why())
@@ -663,7 +685,7 @@ class Delivery:
         if not self._followup_ready(task):
             return  # sent on a later tick, once the workspace is free
         reply = self.engine.send(task_id=task.task_id, message_id=f"resume-{task.task_id}-{attempt}", source="other",
-                                 author=self.cfg.youtrack.bot_login, repo=Path(task.repo_path),
+                                 author=self.cfg.tracker.bot_user, repo=Path(task.repo_path),
                                  extra_dirs=self._extra_dirs_file(task), text=RESUME, clearance=trusted(RESUME))
         self._after_send(task, reply, "attempt_resumed")
 
@@ -703,11 +725,11 @@ class Delivery:
             body += (f"\n\nTo have Arceus pick this up again, reply with a comment that starts with "
                      f"`{CONTINUE}`, followed by anything it should know (what was fixed, what to do "
                      f"differently). Its branches and commits are kept.")
-        # Our own state first: it must not depend on YouTrack being up. The comment and the tag go
-        # through the journal, and retry_pending() finishes them if YouTrack fails right now.
-        # The state and both intents in one transaction: a crash or a YouTrack failure after it
+        # Our own state first: it must not depend on the tracker being up. The comment and the tag go
+        # through the journal, and retry_pending() finishes them if the tracker fails right now.
+        # The state and both intents in one transaction: a crash or a tracker failure after it
         # leaves the comment and the tag to retry_pending(), never lost.
-        tag = self.cfg.youtrack.tags.failed
+        tag = self.cfg.tracker.tags.failed
         tag_key = f"{task.task_id}:tag:{tag}:{kind}"
         with self.store.transaction():
             task = self.store.update_task(task.task_id, state="failed", reason=reason,
@@ -748,12 +770,12 @@ class Delivery:
         outcome = show.get("outcome") or {}
         attempt = len(show.get("attempts") or [])
         text = q.get("text") or outcome.get("summary") or "The agent needs a decision from a person."
-        lines = [f"@{task.tag_author}, the agent needs an answer to continue:", "", _short(text)]
+        lines = [f"{self.tracker.mention(task.tag_author)}, the agent needs an answer to continue:", "", _short(text)]
         for i, opt in enumerate(q.get("options") or [], 1):
             lines.append(f"{i}. {opt}")
         lines += ["", "Reply with a comment on this ticket: the option's number or your own words."]
         posted = self.comment_once(task, f"question:{q.get('id') or attempt}", "\n".join(lines))
-        self.yt.add_tag(task.issue_db_id, self.cfg.youtrack.tags.needs_input)
+        self.tracker.add_tag(task.issue_db_id, self.cfg.tracker.tags.needs_input)
         self.store.update_task(task.task_id, state="needs_input", question_id=q.get("id"),
                                question_at_ms=posted[1] if posted else None)
         self.events.emit("task_needs_input", task_id=task.task_id, question_id=q.get("id"),
@@ -761,14 +783,14 @@ class Delivery:
 
     def check_answers(self) -> None:
         """A comment from an allowed person after the question is the answer."""
-        c = self.cfg.youtrack
+        c = self.cfg.tracker
         for task in self.store.tasks("needs_input"):
             try:
                 after = task.question_at_ms or 0
                 # >=: a reply in the same millisecond as the question counts. The engine dedups by
                 # message id, so a comment seen twice is sent once.
-                answer = next((x for x in self.yt.comments(task.issue_db_id)
-                               if x.created >= after and x.author != c.bot_login and x.author in c.allowed_users
+                answer = next((x for x in self.tracker.comments(task.issue_db_id)
+                               if x.created >= after and x.author != c.bot_user and x.author in c.allowed_users
                                and x.text.strip()), None)
                 if not answer:
                     self._unanswered(task)
@@ -779,14 +801,19 @@ class Delivery:
                                             resume_state="needs_input")
                 if clearance is None or not self._followup_ready(task):
                     continue
-                reply = self.engine.send(task_id=task.task_id, message_id=f"yt-comment-{answer.id}",
-                                         source="youtrack", author=answer.author, repo=Path(task.repo_path),
+                # The engine dedups by message id: the comment's id escaped (unchanged for YouTrack's), and the
+                # plain retry after a `:`, which an escaped id never contains.
+                comment = key_part(answer.id, keep_dash=True)
+                reply = self.engine.send(task_id=task.task_id, message_id=f"yt-comment-{comment}",
+                                         source=self.tracker.engine_source, author=answer.author,
+                                         repo=Path(task.repo_path),
                                          text=answer.text, clearance=clearance, answers=task.question_id,
                                          extra_dirs=self._extra_dirs_file(task))
                 if reply.rc == 4 and task.question_id:
                     # The question is no longer open on the engine's side: send it as plain follow-up.
-                    reply = self.engine.send(task_id=task.task_id, message_id=f"yt-comment-{answer.id}-plain",
-                                             source="youtrack", author=answer.author, repo=Path(task.repo_path),
+                    reply = self.engine.send(task_id=task.task_id, message_id=f"yt-comment-{comment}:plain",
+                                             source=self.tracker.engine_source, author=answer.author,
+                                             repo=Path(task.repo_path),
                                              text=answer.text, clearance=clearance,
                                              extra_dirs=self._extra_dirs_file(task))
                 if self._after_send(task, reply, "answer_sent", untag=c.tags.needs_input, author=answer.author):
@@ -801,7 +828,7 @@ class Delivery:
 
     def check_continue(self) -> None:
         """A `/continue` comment from an allowed person after a failure: recorded, sent by send_continue()."""
-        c = self.cfg.youtrack
+        c = self.cfg.tracker
         window = self.cfg.limits.continue_window
         for task in self.store.tasks("failed"):
             if not task.failed_at_ms or not task.branch:
@@ -809,16 +836,16 @@ class Delivery:
             if self.now() - datetime.fromtimestamp(task.failed_at_ms / 1000, UTC) > window:
                 continue
             try:
-                comments = self.yt.comments(task.issue_db_id)
+                comments = self.tracker.comments(task.issue_db_id)
             except ServiceError as e:
                 self.events.emit("reconcile_failed", task_id=task.task_id, reason=str(e))
                 return
             for x in comments:
-                if x.created < task.failed_at_ms or x.author == c.bot_login or x.author not in c.allowed_users:
+                if x.created < task.failed_at_ms or x.author == c.bot_user or x.author not in c.allowed_users:
                     continue
                 if not x.text.strip().lower().startswith(CONTINUE):
                     continue
-                key = f"{task.task_id}:continue:{x.id}"
+                key = f"{task.task_id}:continue:{key_part(x.id, keep_dash=True)}"
                 if self.store.action(key):
                     continue  # this one was handled (or is waiting to be)
                 self.store.action_intent(key, task.task_id, "continue", json.dumps(
@@ -867,7 +894,7 @@ class Delivery:
         else:
             clearance = trusted(text)  # a bare `/continue`: only the runner's words
         reply = self.engine.send(task_id=task.task_id, message_id=f"yt-continue-{data['comment']}",
-                                 source="youtrack", author=data["author"], repo=Path(task.repo_path),
+                                 source=self.tracker.engine_source, author=data["author"], repo=Path(task.repo_path),
                                  text=text, clearance=clearance, extra_dirs=self._extra_dirs_file(task))
         if reply.accepted:  # dispatched, or a duplicate of what Bulava took before a crash
             self._resumed(task, key, data, state="dispatched", attempt=reply.data.get("attempt"))
@@ -878,12 +905,13 @@ class Delivery:
             self.reconcile()
         else:
             self.store.action_done(key, "refused")
-            self.comment_once(task, f"continue-refused:{data['comment']}",
-                              f"@{data['author']}, the execution engine did not accept the request to continue: {reply.why()}.")
+            self.comment_once(task, f"continue-refused:{key_part(data['comment'], keep_dash=True)}",
+                              f"{self.tracker.mention(data['author'])}, the execution engine did not accept the "
+                              f"request to continue: {reply.why()}.")
 
     def _resumed(self, task: Task, key: str, data: dict, state: str, attempt) -> None:
         """The task runs again: a person's request overrides the review and CI budgets it ran out of."""
-        c = self.cfg.youtrack
+        c = self.cfg.tracker
         tag = c.tags.failed
         with self.store.transaction():
             # An older pending "add agent-failed" must not put the tag back after it is taken off.
@@ -900,7 +928,7 @@ class Delivery:
                 self.store.drop_signals([sg.id for sg in self.store.signals(task.task_id, unbatched=True)
                                          if sg.kind == "ticket"], "continue")
             self.store.action_done(key, json.dumps({"attempt": attempt}))
-            cid = data["comment"]
+            cid = key_part(data["comment"], keep_dash=True)
             self.store.action_intent(f"{task.task_id}:untag:{tag}:{cid}", task.task_id, "untag",
                                      json.dumps({"tag": tag}))
             self.store.action_intent(f"{task.task_id}:state:continue:{cid}", task.task_id, "state", json.dumps(
@@ -933,20 +961,23 @@ class Delivery:
             return
         if waited > lim.needs_input_reminder:
             self.comment_once(task, f"reminder:{task.question_id or task.question_at_ms}",
-                              f"@{task.tag_author}, the agent is still waiting for an answer to the question above. "
+                              f"{self.tracker.mention(task.tag_author)}, the agent is still waiting for an answer to "
+                              "the question above. "
                               f"Without one the task will be closed as failed in "
                               f"{(lim.needs_input_fail_after - waited).days + 1} days.")
 
     def notice_rejected(self, issue_db_id: str, key: str, author: str, activity_id: str) -> None:
         """Tag set by someone not on the allowlist: said once on the ticket."""
-        action = f"{key}:rejected:{activity_id}"
+        action = f"{key}:rejected:{key_part(activity_id, keep_dash=True)}"
         if (self.store.action(action) or ("",))[0] == "done":
             return
-        marker = f"[arceus:rejected:{activity_id}]"
+        marker = f"[arceus:rejected:{key_part(activity_id, keep_dash=True)}]"
         self.store.action_intent(action, key, "rejected")
-        if not any(c.author == self.cfg.youtrack.bot_login and marker in c.text for c in self.yt.comments(issue_db_id)):
-            tag = self.cfg.youtrack.tags.queue
-            self.yt.add_comment(issue_db_id, f"The `{tag}` tag was set by {author}, but only people on the project's "
+        if not any(c.author == self.cfg.tracker.bot_user and marker in c.text
+                   for c in self.tracker.comments(issue_db_id)):
+            tag = self.cfg.tracker.tags.queue
+            who = author or "someone the tracker does not name"
+            self.tracker.add_comment(issue_db_id, f"The `{tag}` tag was set by {who}, but only people on the project's "
                                              f"list can start the agent. The ticket was not taken. To start it, the "
                                              f"tag has to be set by someone on the list.\n\n{marker}")
         self.store.action_done(action)
@@ -954,18 +985,19 @@ class Delivery:
     # -- publishing the reviewed commit ---------------------------------------------------------
 
     def _why_rejected(self, path: Path, branch: str, sha: str, remote: str | None, err: GitError) -> tuple[str, str]:
-        """The branch on GitLab is not the reviewed commit and cannot be moved there without force."""
+        """The branch on the code host is not the reviewed commit and cannot be moved there without force."""
+        host = self.host.label
         if remote:
             try:
                 self.git.fetch_branch(path, branch)
                 if self.git.is_ancestor(path, sha, remote):
                     # Someone (the agent, or a person) pushed more on top of what Codex reviewed.
-                    return ("the branch on GitLab has commits that were not reviewed",
-                            f"reviewed {sha[:12]}, on GitLab {remote[:12]}; the branch is left as it is, no MR opened")
+                    return (f"the branch on {host} has commits that were not reviewed",
+                            f"reviewed {sha[:12]}, on {host} {remote[:12]}; the branch is left as it is, no MR opened")
             except GitError:
                 pass
-            return ("the branch on GitLab has diverged from the reviewed commit",
-                    f"reviewed {sha[:12]}, on GitLab {remote[:12]}; no force push")
+            return (f"the branch on {host} has diverged from the reviewed commit",
+                    f"reviewed {sha[:12]}, on {host} {remote[:12]}; no force push")
         return "the push was rejected", str(err)
 
     def publish(self, task: Task, show: dict) -> None:
@@ -1031,11 +1063,11 @@ class Delivery:
             self.fail(task, "no changes", attempt=len(show.get("attempts") or []))
             return
 
-        group = {(workspace / r.relative_path).resolve(): r
-                 for r in self.gl.group_repos(self.cfg.gitlab.group, self.cfg.gitlab.include_subgroups)}
+        group = {(workspace / r.relative_path).resolve(): r for r in self.host.repos()}
         missing = [str(path) for path, _ in plan if path not in group]
         if missing:  # all of them are resolved before the first push
-            self.fail(task, "a repository is not in the GitLab group, nothing was pushed", "\n".join(missing))
+            self.fail(task, f"a repository is not in the {self.host.label} {self.host.scope_kind}, nothing was pushed",
+                      "\n".join(missing))
             return
         unreviewed = self._below_base(task, plan, group)
         if unreviewed:
@@ -1053,14 +1085,14 @@ class Delivery:
             # The agent took its changes back out: the MR is no longer part of this task.
             if mr.state == "opened":
                 pid = stored[repo].project_id
-                key = f"{task.task_id}:close-mr:{pid}:{mr.iid}"
+                key = f"{task.task_id}:close-mr:{key_part(pid)}:{key_part(mr.iid)}"
                 if not self.store.action(key):  # the note once, also when the close is retried after a crash
-                    self.gl.note_mr(pid, mr.iid, (
+                    self.host.note_mr(pid, mr.iid, (
                         f"Closed by the Arceus runner: the agent took its changes for {task.task_id} back out of "
                         f"this repository (reviewed commit `{sha[:12]}`), so there is nothing left to merge here. "
                         "The rest of the task goes on in its other merge requests."))
                     self.store.action_intent(key, task.task_id, "close-mr")
-                self.gl.close_mr(pid, mr.iid)
+                self.host.close_mr(pid, mr.iid)
                 self.store.action_done(key)
             self.store.drop_mr(task.task_id, repo)
             self.events.emit("mr_dropped", task_id=task.task_id, repo=repo, mr_iid=mr.iid, url=mr.url,
@@ -1104,19 +1136,16 @@ class Delivery:
             remote = self.git.remote_sha(path, branch)
             if remote != sha and not (remote and self.store.task_mrs(task.task_id)
                                       and self.git.is_ancestor(path, sha, remote)):
-                self.fail(task, "after the push the branch on GitLab is not the reviewed commit",
+                self.fail(task, f"after the push the branch on {self.host.label} is not the reviewed commit",
                           f"{repo.relative_path}: {remote} instead of {sha}")
                 return
             self.events.emit("pushed", task_id=task.task_id, repo=repo.relative_path, branch=branch, sha=sha)
             shots = self._mr_media(task, repo.id, repo.relative_path, media.for_repo(visuals, repo.relative_path))
             description = self._mr_description(task, show, path, r, shots)
             existed = {m.repo: m for m in self.store.task_mrs(task.task_id)}.get(repo.relative_path)
-            mr = self.gl.create_mr(
-                repo.id, source_branch=branch, target_branch=repo.default_branch or task.base_branch,
-                title=f"{task.task_id}: {task.summary}"[:250], description=description,
-                label=self.cfg.gitlab.mr_label, after_closed=bool(r.get("after_closed")))
+            mr = self._open_mr(repo, task, branch, description, after_closed=bool(r.get("after_closed")))
             if existed or mr.state != "opened" or self.store.task_mrs(task.task_id):
-                self.gl.set_description(repo.id, mr.iid, description)  # a later round: describe what is there now
+                self.host.set_description(repo.id, mr.iid, description)  # a later round: describe what is there now
             self.store.upsert_mr(task.task_id, repo.relative_path, repo.id, mr.iid, mr.url, sha)
             urls.append(mr.url)
             self.events.emit("mr_ready", task_id=task.task_id, repo=repo.relative_path, mr_iid=mr.iid, url=mr.url)
@@ -1133,11 +1162,23 @@ class Delivery:
                 "\n".join(f"- {mr.url}" for _, mr, _ in dropped)
         posted = self.comment_with_media(task, f"mr:{shas}", body, visuals)
         self.review.after_publish(task, {self._repo_name(p): r["reviewed_sha"] for p, r in plan})
-        c = self.cfg.youtrack
-        self.yt.set_state(task.issue_db_id, c.state_field, c.states.code_review)
+        self.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.code_review)
         self.store.update_task(task.task_id, state="code_review", reason=None,
                                published_at_ms=task.published_at_ms or (posted[1] if posted else None))
         self.events.emit("task_published", task_id=task.task_id, mrs=urls, round=follow_up)
+
+    def _open_mr(self, repo: Repo, task: Task, branch: str, description: str, after_closed: bool) -> MergeRequest:
+        """The branch's MR, created unless it already has one (a retry after a crash, or a person closed it).
+
+        `after_closed`: a person asked for more work after closing the branch's MR, so a closed one
+        is not the answer and a new MR is opened next to it.
+        """
+        existing = self.host.branch_mr(repo.id, branch)
+        if existing and not (after_closed and existing.state == "closed"):
+            return existing
+        return self.host.create_mr(repo.id, source_branch=branch, target_branch=repo.default_branch or task.base_branch,
+                                   title=f"{task.task_id}: {task.summary}"[:250], description=description,
+                                   label=self.cfg.code_host.mr_label)
 
     def _below_base(self, task: Task, plan: list[tuple[Path, dict]], group: dict) -> list[str]:
         """Repositories whose reviewed range does not start where the branch left the default branch.
@@ -1158,7 +1199,7 @@ class Delivery:
 
     def _closed_mrs(self, task: Task, plan: list[tuple[Path, dict]], group: dict) \
             -> tuple[list[tuple[Path, dict]], list[tuple[str, MergeRequest, str]], list[str]]:
-        """Split off the repositories whose branch has nothing left to merge, and those GitLab refuses.
+        """Split off the repositories whose branch has nothing left to merge, and those the code host refuses.
 
         A branch whose commits add up to nothing against the default branch (the agent reverted its
         work there, its way of taking a repository out of the task) is not pushed and gets no MR; its
@@ -1171,7 +1212,7 @@ class Delivery:
             repo = group[path]
             default = f"origin/{repo.default_branch or task.base_branch or 'main'}"
             changed = self.git.changes_since_fork(path, default, r["reviewed_sha"])
-            mr = self.gl.branch_mr(repo.id, r["branch"])
+            mr = self.host.branch_mr(repo.id, r["branch"])
             if changed and mr and mr.state == "closed" and self._asked_after(task, mr):
                 kept.append((path, {**r, "after_closed": True}))  # a new MR next to the closed one
             elif changed and mr and mr.state == "closed":
@@ -1194,18 +1235,20 @@ class Delivery:
     def _repo_name(self, path: Path) -> str:
         return str(path.resolve().relative_to(self.cfg.paths.workspace.resolve()))
 
-    def _mr_media(self, task: Task, project_id: int, repo: str, items: list[media.MediaItem]) -> list[str]:
+    def _mr_media(self, task: Task, project_id, repo: str, items: list[media.MediaItem]) -> list[str]:
         """Upload the agent's screenshots and recordings to the project once each; Markdown for the MR."""
         out = []
+        if not self.host.supports_uploads:
+            return out
         for m in items:
-            key = f"{task.task_id}:upload:{project_id}:{m.sha256}"
+            key = f"{task.task_id}:upload:{key_part(project_id)}:{m.sha256}"
             act = self.store.action(key)
             if act and act[0] == "done":
                 url = act[1]
             else:
                 self.store.action_intent(key, task.task_id, "upload", m.upload_name)
                 try:
-                    url = self.gl.upload(project_id, m.upload_name, m.data(), m.mime)
+                    url = self.host.upload(project_id, m.upload_name, m.data(), m.mime)
                 except (BadRequest, NotFound) as e:  # refused (size, type): the MR goes out without it
                     self.events.emit("media_skipped", task_id=task.task_id, repo=repo, detail=f"{m.path.name}: {e}")
                     continue
@@ -1216,9 +1259,10 @@ class Delivery:
     def comment_with_media(self, task: Task, kind: str, text: str,
                            visuals: list[media.MediaItem]) -> tuple[str, int] | None:
         """comment_once, with the screenshots and recordings not yet on the ticket attached to it."""
-        fresh = [m for m in visuals if (self.store.action(self._attach_key(task, m)) or ("",))[0] != "done"]
+        fresh = [m for m in visuals if (self.store.action(self._attach_key(task, m)) or ("",))[0] != "done"] \
+            if self.tracker.supports_attachments else []
         if fresh:
-            text += "\n\n" + ticket_media_text(fresh)
+            text += "\n\n" + ticket_media_text(self.tracker, fresh)
         posted = self.comment_once(task, kind, text)
         if posted and fresh:
             self._ticket_media(task, posted[0], fresh)
@@ -1235,10 +1279,10 @@ class Delivery:
             if mr.state not in ("", "opened"):
                 continue
             shots = self._mr_media(task, mr.project_id, mr.repo, media.for_repo(visuals, mr.repo))
-            current = self.gl.description(mr.project_id, mr.iid)
+            current = self.host.description(mr.project_id, mr.iid)
             updated = with_media_section(current, shots)
             if updated != current:
-                self.gl.set_description(mr.project_id, mr.iid, updated)
+                self.host.set_description(mr.project_id, mr.iid, updated)
         return visuals
 
     @staticmethod
@@ -1253,7 +1297,7 @@ class Delivery:
                 continue
             self.store.action_intent(key, task.task_id, "attach", m.upload_name)
             try:
-                self.yt.attach_to_comment(task.issue_db_id, comment_id, m.upload_name, m.data(), m.mime)
+                self.tracker.attach(task.issue_db_id, comment_id, m.upload_name, m.data(), m.mime)
             except (BadRequest, NotFound) as e:
                 self.events.emit("media_skipped", task_id=task.task_id, detail=f"{m.path.name} on the ticket: {e}")
                 continue
@@ -1264,7 +1308,7 @@ class Delivery:
         outcome = (show.get("outcome") or {}).get("summary") or ""
         commits = self.git.log_subjects(path, r["base_sha"], r["reviewed_sha"])
         others = [m.url for m in self.store.task_mrs(task.task_id) if m.repo != self._repo_name(path)]
-        parts = [f"Ticket: [{task.task_id}]({self.cfg.youtrack.url}/issue/{task.task_id}) — {task.summary}"]
+        parts = [f"Ticket: [{task.task_id}]({self.tracker.issue_url(task.task_id)}) — {task.summary}"]
         if outcome:
             parts += ["", "## What was done", unattributed(outcome).strip()]
         if commits:

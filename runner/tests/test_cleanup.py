@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 
 from arceus_runner import loop
-from arceus_runner.checks import gitlab_client, youtrack_client
 from arceus_runner.cleanup import (AdviceUnavailable, ClaudeAdvisor, Cleanup, DockerError, Item, Proc, Situation,
                                    kill_process, remove_tree, scan_processes)
 from arceus_runner.config import Config
@@ -22,7 +21,7 @@ from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git
 from arceus_runner.metrics import Metrics
 
-from .conftest import FakeClock, example_raw, read_events
+from .conftest import FakeClock, example_raw, providers, read_events
 from .fakes import FakeGitLab, FakeYouTrack
 
 T0 = datetime(2026, 10, 20, 7, 0, tzinfo=UTC)
@@ -455,7 +454,7 @@ def test_a_branch_gitlab_dropped_since_the_last_fetch_stays(world):
     world.cleanup.execute("r1", items, [], deadline=world.mono() + 600)
 
     branch = next(i for i in items if i.kind == "branch")
-    assert branch.result == "kept" and branch.detail["kept"] == "GitLab no longer has its commits"
+    assert branch.result == "kept" and branch.detail["kept"] == "the code host no longer has its commits"
     assert git(web, "rev-parse", "--verify", "agent/ACME-1-work")
 
 
@@ -1001,11 +1000,9 @@ def test_runner_tick_runs_cleanup_and_metrics_show_it(tmp_path, secrets, monkeyp
     monkeypatch.setattr("arceus_runner.health.shutil.which", lambda name: f"/usr/bin/{name}")
     w = World(tmp_path, mode="observe")
     clock = FakeClock()
-    yc = youtrack_client(w.cfg, secrets, transport=__import__("httpx").MockTransport(FakeYouTrack()))
-    gc = gitlab_client(w.cfg, secrets, transport=__import__("httpx").MockTransport(FakeGitLab()))
-    yc.clock = gc.clock = clock
+    tracker, host = providers(w.cfg, secrets, FakeYouTrack(), FakeGitLab(), clock)
     metrics = Metrics()
-    runner = loop.Runner(w.cfg, w.store, w.events, yc, gc, now=lambda: w.now, mono=clock, metrics=metrics,
+    runner = loop.Runner(w.cfg, w.store, w.events, tracker, host, now=lambda: w.now, mono=clock, metrics=metrics,
                          cleanup=w.cleanup)
     runner.tick()
     assert [e["event"] for e in w.events_named("cleanup_started", "cleanup_finished")] == \
@@ -1560,7 +1557,7 @@ def test_a_hold_open_at_the_upgrade_to_schema_11_ends_where_it_began(tmp_path):
     conn.close()
     store = ReviewStore(path)
     try:
-        assert store.version == 11
+        assert store.version == len(MIGRATIONS)
         assert store.workspace_holds() == [("ACME-1", iso(T0), iso(T0))]  # seen by no tick yet: nothing is its
         store.close_open_holds()
         assert store.conn.execute("SELECT ended_at FROM workspace_holds").fetchone()[0] == iso(T0)

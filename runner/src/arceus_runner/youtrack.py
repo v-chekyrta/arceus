@@ -1,4 +1,8 @@
-"""YouTrack REST client: only the calls the runner needs.
+"""YouTrack as Arceus's issue tracker: the provider that ships with it (integrations.IssueTracker).
+
+Three layers, top to bottom: the `tracker: {type: youtrack}` config section (YouTrackConfig), the
+adapter the runner's flow calls (YouTrackTracker), and the REST client with only the calls it needs
+(YouTrack, YouTrackWriter). A new tracker can follow the same shape.
 
 Collections are paged with $top/$skip (YouTrack returns 42 items by default
 without $top); the activity stream is paged with its cursor.
@@ -10,7 +14,12 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from urllib.parse import quote
 
-from arceus_runner.http import ServiceClient
+from pydantic import Field, field_validator
+
+from arceus_runner.checks import Check
+from arceus_runner.config import HttpConfig, IssueTrackerConfig, _url
+from arceus_runner.http import AuthError, ServiceClient, ServiceError
+from arceus_runner.integrations import Comment, Issue, IssueDetails, Trigger, TrackerType
 
 PAGE = 100
 UPLOAD_TIMEOUT = 120  # seconds: a recording is megabytes, more than the usual read timeout allows
@@ -21,15 +30,6 @@ class TagEvent:
     activity_id: str
     author: str
     timestamp: int  # ms since epoch, as YouTrack reports it
-
-
-@dataclass(frozen=True)
-class Issue:
-    db_id: str
-    key: str  # PRJ-123
-    summary: str
-    created: int
-    updated: int
 
 
 def query_value(v: str) -> str:
@@ -124,15 +124,7 @@ class YouTrack:
 
 
 @dataclass(frozen=True)
-class Comment:
-    id: str
-    text: str
-    author: str
-    created: int
-
-
-@dataclass(frozen=True)
-class IssueDetails:
+class YouTrackIssue:
     db_id: str
     key: str
     summary: str
@@ -161,7 +153,7 @@ class YouTrackWriter(YouTrack):
         super().__init__(client)
         self._tag_ids: dict[str, str] = {}
 
-    def issue(self, issue_id: str) -> IssueDetails:
+    def issue(self, issue_id: str) -> YouTrackIssue:
         data = self.c.get_json(
             f"/api/issues/{quote(issue_id)}",
             {"fields": "id,idReadable,summary,description,reporter(login),updater(login),"
@@ -170,8 +162,8 @@ class YouTrackWriter(YouTrack):
         fields = {f["name"]: _value_names(f.get("value")) for f in data.get("customFields") or [] if f.get("name")}
         writers = tuple(dict.fromkeys(u["login"] for u in (data.get("reporter"), data.get("updater"))
                                       if isinstance(u, dict) and u.get("login")))
-        return IssueDetails(data["id"], data["idReadable"], data.get("summary") or "", data.get("description") or "",
-                            fields, writers)
+        return YouTrackIssue(data["id"], data["idReadable"], data.get("summary") or "", data.get("description") or "",
+                             fields, writers)
 
     def comments(self, issue_id: str) -> list[Comment]:
         fields = "id,text,created,author(login),deleted"
@@ -220,3 +212,157 @@ class YouTrackWriter(YouTrack):
     def remove_tag(self, issue_id: str, name: str) -> None:
         if name in self.issue_tags(issue_id):
             self.c.request("DELETE", f"/api/issues/{quote(issue_id)}/tags/{quote(self.tag_id(name))}")
+
+
+# -- the issue tracker ------------------------------------------------------------------------------
+
+
+class YouTrackConfig(IssueTrackerConfig):
+    url: str
+    project: str = Field(min_length=1)  # short name (ID) of the YouTrack project
+    token_env: str = "YOUTRACK_TOKEN"
+    state_field: str = "State"  # the project's state field; `states` are its values
+    assignee_field: str | None = "Assignee"  # set to the bot when a task is taken; null to leave it
+
+    _check_url = field_validator("url")(_url)
+
+
+class YouTrackTracker:
+    """integrations.IssueTracker on YouTrack: the queue tag and state from a search, the tag's author from
+    the issue's activity stream, states in a custom field."""
+
+    name = "youtrack"
+    label = "YouTrack"
+    engine_source = "youtrack"
+    supports_attachments = True
+
+    def __init__(self, cfg: YouTrackConfig, client: ServiceClient):
+        self.cfg = cfg
+        self.client = client
+        self.api = YouTrackWriter(client)
+
+    def identity(self) -> str:
+        return f"youtrack {self.cfg.url} project {self.cfg.project}"
+
+    def describe(self) -> str:
+        return f"YouTrack at {self.cfg.url}, project {self.cfg.project}"
+
+    def queued(self) -> list[Issue]:
+        c = self.cfg
+        return self.api.queued_issues(c.project, c.tags.queue, c.state_field, c.states.queued)
+
+    def trigger(self, issue: Issue) -> Trigger | None:
+        event = self.api.tag_setter(issue.db_id, self.cfg.tags.queue)
+        return Trigger(event.activity_id, event.author, event.timestamp) if event else None
+
+    def issue(self, key: str) -> IssueDetails:
+        i = self.api.issue(key)
+        return IssueDetails(i.db_id, i.key, i.summary, i.description, (i.fields.get(self.cfg.state_field) or [""])[0],
+                            i.writers)
+
+    def tags(self, db_id: str) -> set[str]:
+        return self.api.issue_tags(db_id)
+
+    def add_tag(self, db_id: str, name: str) -> None:
+        self.api.add_tag(db_id, name)
+
+    def remove_tag(self, db_id: str, name: str) -> None:
+        self.api.remove_tag(db_id, name)
+
+    def set_state(self, db_id: str, state: str) -> None:
+        self.api.set_state(db_id, self.cfg.state_field, state)
+
+    def assign_to_bot(self, db_id: str) -> None:
+        if self.cfg.assignee_field:
+            self.api.set_assignee(db_id, self.cfg.assignee_field, self.cfg.bot_user)
+
+    def comments(self, db_id: str) -> list[Comment]:
+        return self.api.comments(db_id)
+
+    def add_comment(self, db_id: str, text: str) -> tuple[str, int]:
+        return self.api.add_comment(db_id, text)
+
+    def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
+        self.api.attach_to_comment(db_id, comment_id, name, data, mime)
+
+    def attachment_markdown(self, name: str, caption: str) -> str:
+        # YouTrack shows a comment's own attachment in place when the text names it: images and a video player.
+        return f"![{caption}]({name})"
+
+    def issue_url(self, key: str) -> str:
+        return f"{self.cfg.url}/issue/{key}"
+
+    def mention(self, user: str) -> str:
+        return f"@{user}"
+
+    def user_exists(self, login: str) -> bool:
+        return self.api.user_exists(login)
+
+    def check(self) -> list[Check]:
+        return check_youtrack(self.cfg, self.api)
+
+
+def youtrack_client(cfg: YouTrackConfig, token: str, http: HttpConfig, transport=None) -> ServiceClient:
+    return ServiceClient("youtrack", cfg.url, {"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                         http, transport=transport)
+
+
+def check_youtrack(c: YouTrackConfig, yt: YouTrack) -> list[Check]:
+    """Every mistake in the section on its own line: the token, the bot, the project, its states and tags."""
+    out: list[Check] = []
+    try:
+        me = yt.me()
+    except AuthError as e:
+        return [Check("youtrack.auth", "fail", str(e))]
+    except ServiceError as e:
+        return [Check("youtrack.reachable", "fail", str(e))]
+    if me.get("login") != c.bot_user:
+        out.append(Check("youtrack.bot_user", "fail",
+                         f"token belongs to {me.get('login')!r}, config says {c.bot_user!r}"))
+    else:
+        out.append(Check("youtrack.bot_user", "ok", c.bot_user))
+
+    project = yt.find_project(c.project)
+    if not project:
+        out.append(Check("youtrack.project", "fail", f"project {c.project!r} not found or not visible to the bot"))
+        return out
+    if project.get("archived"):
+        out.append(Check("youtrack.project", "fail", f"project {c.project!r} is archived"))
+        return out
+    out.append(Check("youtrack.project", "ok", f"{c.project} ({project.get('name')})"))
+
+    fields = {f["field"]["name"]: f for f in yt.project_fields(project["id"]) if f.get("field")}
+
+    def bundle_values(field: dict) -> list[str]:
+        return [v["name"] for v in ((field.get("bundle") or {}).get("values") or []) if not v.get("archived")]
+
+    state = fields.get(c.state_field)
+    if not state:
+        out.append(Check("youtrack.state_field", "fail",
+                         f"field {c.state_field!r} not in project; fields: {', '.join(sorted(fields))}"))
+    else:
+        values = bundle_values(state)
+        for key in ("queued", "in_progress", "code_review"):
+            want = getattr(c.states, key)
+            if want in values:
+                out.append(Check(f"youtrack.states.{key}", "ok", want))
+            else:
+                out.append(Check(f"youtrack.states.{key}", "fail",
+                                 f"{want!r} is not a {c.state_field} value; available: {', '.join(values)}"))
+
+    tags = yt.tag_names()
+    for key in ("queue", "needs_input", "failed"):
+        want = getattr(c.tags, key)
+        if want in tags:
+            out.append(Check(f"youtrack.tags.{key}", "ok", want))
+        else:
+            out.append(Check(f"youtrack.tags.{key}", "fail",
+                             f"tag {want!r} does not exist or is not shared with {c.bot_user}"))
+    return out
+
+
+def _build(cfg: YouTrackConfig, token: str, http: HttpConfig, transport=None) -> YouTrackTracker:
+    return YouTrackTracker(cfg, youtrack_client(cfg, token, http, transport))
+
+
+TRACKER = TrackerType(config=YouTrackConfig, build=_build)

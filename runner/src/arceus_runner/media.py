@@ -1,6 +1,6 @@
 """Visual proof of the agent's work: screenshots and recordings it leaves for the people who review it.
 
-The agent has no GitLab or YouTrack credentials, so it cannot upload anything itself. It saves the
+The agent has no credentials for the code host or the tracker, so it cannot upload anything itself. It saves the
 files into the task's media folder in the workspace, `.arceus/media/<ticket key>/`, next to a
 `media.json` that says what each file shows:
 

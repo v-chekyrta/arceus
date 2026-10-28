@@ -5,14 +5,14 @@
 The bot is a Developer in the project's group; in every repository the default
 branch is protected, nobody may push to it, only Maintainers merge, and force push is off. Read-only:
 it asks GitLab, changes nothing. Exit 0 only if every repository of the group is set up that way.
+For a runner whose `code_host:` is GitLab.
 """
 
 import sys
 from pathlib import Path
 
-from arceus_runner.checks import gitlab_client
 from arceus_runner.config import load_config, load_secrets
-from arceus_runner.gitlab import GitLab
+from arceus_runner.gitlab import GitLab, gitlab_client
 from arceus_runner.http import ServiceError
 
 CONFIG = Path("~/arceus/data/config.yaml").expanduser()
@@ -22,8 +22,11 @@ DEVELOPER, MAINTAINER = 30, 40
 
 def main() -> int:
     cfg = load_config(CONFIG)
-    g = cfg.gitlab
-    gl = GitLab(gitlab_client(cfg, load_secrets(cfg)))
+    g = cfg.code_host
+    if g.type != "gitlab":
+        print(f"code_host.type is {g.type!r}: this check is for GitLab")
+        return 2
+    gl = GitLab(gitlab_client(g, load_secrets(cfg).code_host, cfg.http))
     me = gl.me()
     ok = True
 

@@ -6,12 +6,11 @@ import httpx
 import pytest
 
 from arceus_runner import loop
-from arceus_runner.checks import gitlab_client, youtrack_client
 from arceus_runner.db import AlreadyRunning, InstanceLock, ReviewStore as Store
 from arceus_runner.events import EventLog
 from arceus_runner.http import AUTH_RETRY_SECONDS
 
-from .conftest import FakeClock, read_events
+from .conftest import FakeClock, providers, read_events
 from .fakes import FakeGitLab, FakeYouTrack
 from .test_cleanup import FakeDocker
 
@@ -47,10 +46,8 @@ class World:
         self.runner = self.make_runner()
 
     def make_runner(self) -> loop.Runner:
-        yc = youtrack_client(self.cfg, self.secrets, transport=httpx.MockTransport(self.yt))
-        gc = gitlab_client(self.cfg, self.secrets, transport=httpx.MockTransport(self.gl))
-        yc.clock = gc.clock = self.clock
-        return loop.Runner(self.cfg, self.store, self.events, yc, gc, now=lambda: WORKING, mono=self.clock)
+        tracker, host = providers(self.cfg, self.secrets, self.yt, self.gl, self.clock)
+        return loop.Runner(self.cfg, self.store, self.events, tracker, host, now=lambda: WORKING, mono=self.clock)
 
     def restart(self) -> None:
         self.store.close()
@@ -132,7 +129,7 @@ def test_one_broken_issue_does_not_stop_the_others(world):
     world.runner.tick()
     assert [e["task_id"] for e in world.events_named("issue_skipped")] == ["ACME-1"]
     assert [e["task_id"] for e in world.events_named("task_queued")] == ["ACME-2"]
-    assert world.runner.yt_client.available()
+    assert world.runner.tracker.client.available()
     assert world.runner.health["service.youtrack"] == "ok"
 
 
@@ -176,12 +173,12 @@ def test_slow_queue_answer_skips_one_poll_of_that_service_only(world):
             world.clock.advance(15)
         return fake(request)
 
-    world.runner.yt_client._client._transport = httpx.MockTransport(slow_yt)
+    world.runner.tracker.client._client._transport = httpx.MockTransport(slow_yt)
     world.yt.add_issue(1, ("a1", "j.doe", "+agent"))
     start = world.clock()
     world.runner.tick()
-    assert world.runner.next_due["youtrack"] - start >= 240 - 1  # 2 intervals: slow
-    assert world.runner.next_due["gitlab"] - start <= 120 + 16
+    assert world.runner.next_due["tracker"] - start >= 240 - 1  # 2 intervals: slow
+    assert world.runner.next_due["code_host"] - start <= 120 + 16
 
 
 def test_tokens_never_reach_the_event_log(world):
@@ -189,7 +186,7 @@ def test_tokens_never_reach_the_event_log(world):
     world.runner.tick()
     text = world.cfg.paths.events.read_text()
     assert "request_failed" in text and "<redacted>" in text
-    assert world.secrets.youtrack not in text and world.secrets.gitlab not in text
+    assert world.secrets.tracker not in text and world.secrets.code_host not in text
 
 
 def test_second_instance_is_refused(cfg):
@@ -205,9 +202,9 @@ def test_second_instance_is_refused(cfg):
 
 def test_run_once_releases_everything(cfg, secrets, monkeypatch):
     fake_yt, fake_gl = FakeYouTrack(), FakeGitLab()
-    real_yt, real_gl = loop.youtrack_client, loop.gitlab_client
-    monkeypatch.setattr(loop, "youtrack_client", lambda c, s: real_yt(c, s, transport=httpx.MockTransport(fake_yt)))
-    monkeypatch.setattr(loop, "gitlab_client", lambda c, s: real_gl(c, s, transport=httpx.MockTransport(fake_gl)))
+    real_yt, real_gl = loop.build_tracker, loop.build_code_host
+    monkeypatch.setattr(loop, "build_tracker", lambda c, s: real_yt(c, s, transport=httpx.MockTransport(fake_yt)))
+    monkeypatch.setattr(loop, "build_code_host", lambda c, s: real_gl(c, s, transport=httpx.MockTransport(fake_gl)))
     assert loop.run(cfg, secrets, once=True) == 0
     # The lock is free again and the log is closed with runner_stopped.
     lock = InstanceLock(cfg.paths.db.with_suffix(".lock"))
@@ -232,17 +229,17 @@ def test_failed_start_releases_the_lock(cfg, secrets, monkeypatch):
 def test_run_writes_git_credentials_for_the_gitlab_host_only(cfg, secrets, monkeypatch, own_home):
     (own_home / ".git-credentials").write_text("https://me:mine@github.com\nhttps://old:stale@gitlab.example.com\n")
     fake_yt, fake_gl = FakeYouTrack(), FakeGitLab()
-    real_yt, real_gl = loop.youtrack_client, loop.gitlab_client
-    monkeypatch.setattr(loop, "youtrack_client", lambda c, s: real_yt(c, s, transport=httpx.MockTransport(fake_yt)))
-    monkeypatch.setattr(loop, "gitlab_client", lambda c, s: real_gl(c, s, transport=httpx.MockTransport(fake_gl)))
+    real_yt, real_gl = loop.build_tracker, loop.build_code_host
+    monkeypatch.setattr(loop, "build_tracker", lambda c, s: real_yt(c, s, transport=httpx.MockTransport(fake_yt)))
+    monkeypatch.setattr(loop, "build_code_host", lambda c, s: real_gl(c, s, transport=httpx.MockTransport(fake_gl)))
     loop.run(cfg, secrets, once=True)
     store = own_home / ".git-credentials"
     assert store.read_text().splitlines() == [
-        "https://me:mine@github.com", f"https://acme-agent-bot:{secrets.gitlab}@gitlab.example.com"]
+        "https://me:mine@github.com", f"https://acme-agent-bot:{secrets.code_host}@gitlab.example.com"]
     assert oct(store.stat().st_mode & 0o777) == "0o600"
     import subprocess
     helper = subprocess.run(["git", "config", "--global", "--get", "credential.https://gitlab.example.com.helper"],
                             env={"HOME": str(own_home), "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"},
                             capture_output=True, text=True).stdout.strip()
     assert helper == "store"
-    assert secrets.gitlab not in cfg.paths.events.read_text()
+    assert secrets.code_host not in cfg.paths.events.read_text()

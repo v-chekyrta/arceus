@@ -1,20 +1,20 @@
 """The loop after the MR: watch, gather, send back, publish again.
 
-For every task in Code Review the runner reads each of its MRs on GitLab:
+For every task in Code Review the runner reads each of its MRs on the code host (integrations.CodeHost):
 
-- review notes by people that mention the bot (`@<bot_username>`), in every discussion, so a late
-  reply in an old thread is seen too; notes that do not address the bot are people talking to
+- review notes by people that mention the bot (`@<bot_user>`, as the host writes a mention), in every discussion, so a
+  late reply in an old thread is seen too; notes that do not address the bot are people talking to
   each other and wake nothing;
-- the head pipeline: a failure of the commit the runner published is a CI signal, with the
-  failed jobs and the end of their logs; a pipeline still running, cancelled or for an older
+- the newest CI run: a failure of the commit the runner published is a CI signal, with the
+  failed jobs and the end of their logs; a run still going, cancelled or for an older
   commit is not;
-- a conflict that GitLab has confirmed (`detailed_merge_status == conflict`; `checking` is not);
+- a conflict that the host has confirmed (MRStatus.conflict is True; still being worked out is not);
 - comments on the ticket by people on the allowlist;
 - the MR's state: all merged ends the task, one closed without merge stops it.
 
 Each signal is stored once (SQLite), so a repeated poll or a restart sends nothing twice. When
 `review_debounce` has passed since the newest signal, they go through the security screen
-(screening.py) and then to the agent as one follow-up of the same Bulava task (`worker-send --relation continue --source mr|ci|youtrack`). Each MR thread
+(screening.py) and then to the agent as one follow-up of the same Bulava task (`worker-send --relation continue --source mr|ci|<tracker>`). Each MR thread
 goes whole, earlier notes included, so a short "why?" keeps its context. The agent decides per
 thread whether it asks for a code change or only for an answer, and leaves one answer per thread
 in a file (replies.py). After Codex passes the fix, Delivery.publish pushes it to the same branch
@@ -35,9 +35,9 @@ from pathlib import Path
 from arceus_runner import replies
 from arceus_runner.db import ReviewStore, Signal, Task
 from arceus_runner.engine import EngineError
-from arceus_runner.gitlab import GitLabReview, MRStatus, Note
 from arceus_runner.gitops import GitError
 from arceus_runner.http import ServiceError
+from arceus_runner.integrations import CodeHost, MRStatus, Note, key_part
 
 KIND_TITLES = {
     "review": "Review comments on the MR",
@@ -55,20 +55,23 @@ _OUR_MARKER = re.compile(r"\s*<!-- arceus:[^>]*-->")
 
 
 def _closed_id(mr) -> str:
-    return f"closed-{mr.project_id}-{mr.iid}"
+    return f"closed-{key_part(mr.project_id)}-{key_part(mr.iid)}"
 
 
 def _ts(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def mentions(bot: str) -> re.Pattern:
-    """`@bot` as GitLab writes a mention: not part of an e-mail address or of a longer username."""
-    return re.compile(rf"(?<![\w.@-])@{re.escape(bot)}(?![\w-])", re.IGNORECASE)
+def _note_signal(mr, note_id) -> str:
+    return f"note-{key_part(mr.project_id)}-{key_part(note_id)}"
 
 
-def _note_id(signal: Signal) -> int:
-    return int(signal.id.rsplit("-", 1)[1])
+def _pipeline_signal(mr, ci_id) -> str:
+    return f"pipeline-{key_part(mr.project_id)}-{key_part(ci_id)}"
+
+
+def _conflict_signal(mr, sha: str) -> str:
+    return f"conflict-{key_part(mr.project_id)}-{key_part(sha)}"
 
 
 def _thread_labels(signals: list[Signal]) -> dict[tuple[str, str], str]:
@@ -97,7 +100,7 @@ class ReviewLoop:
         self.d = delivery
         self.cfg = delivery.cfg
         self.store: ReviewStore = delivery.store
-        self.gl: GitLabReview = delivery.gl
+        self.host: CodeHost = delivery.host
         self.events = delivery.events
 
     # -- watching -------------------------------------------------------------------------------
@@ -118,7 +121,7 @@ class ReviewLoop:
         now = self.d.now().isoformat()
         statuses: dict[str, MRStatus] = {}
         for mr in mrs:
-            st = self.gl.mr_status(mr.project_id, mr.iid)
+            st = self.host.mr_status(mr.project_id, mr.iid)
             statuses[mr.repo] = st
             if st.state != mr.state:
                 self.store.update_mr(task.task_id, mr.repo, state=st.state)
@@ -132,7 +135,7 @@ class ReviewLoop:
             self._conflict(task, mr, st, now)
 
         states = {s.state for s in statuses.values()}
-        if not states & {"opened", "locked"}:  # nothing left to review: people decided on every MR
+        if "opened" not in states:  # nothing left to review: people decided on every MR
             merged = [m for m in mrs if statuses[m.repo].state == "merged"]
             if merged:
                 self._finished(task, merged)
@@ -149,40 +152,39 @@ class ReviewLoop:
         return True
 
     def _notes(self, task: Task, mr, now: str) -> None:
-        bot = self.cfg.gitlab.bot_username
-        addressed = mentions(bot)
-        for n in self.gl.notes(mr.project_id, mr.iid, mr.url):
-            if n.system or n.author == bot or not addressed.search(n.body):
+        bot = self.cfg.code_host.bot_user
+        for n in self.host.notes(mr.project_id, mr.iid, mr.url):
+            if n.system or n.author == bot or not self.host.mentions_bot(n.body):
                 continue  # only a note that mentions the bot is a request to it
             where = f" ({n.path}:{n.line})" if n.path else ""
             text = f"{n.author} in {mr.repo}{where}: {n.body.strip()}\n{n.url}"
-            if self.store.add_signal(f"note-{mr.project_id}-{n.id}", task.task_id, "review", n.author, text, now,
+            if self.store.add_signal(_note_signal(mr, n.id), task.task_id, "review", n.author, text, now,
                                      repo=mr.repo, discussion_id=n.discussion_id):
                 self.events.emit("review_signal", task_id=task.task_id, kind="review", author=n.author,
                                  repo=mr.repo, url=n.url)
 
     def _pipeline(self, task: Task, mr, st: MRStatus, now: str) -> None:
-        if st.pipeline_sha != mr.published_sha or not st.pipeline_id:
-            return  # no pipeline yet, or one for an older commit
-        if st.pipeline_status == "success" and task.ci_attempts:
+        if st.ci_sha != mr.published_sha or st.ci_id is None:
+            return  # no CI run yet, or one for an older commit
+        if st.ci_status == "success" and task.ci_attempts:
             self.d.store.update_task(task.task_id, ci_attempts=0)
-        if st.pipeline_status != "failed" or st.pipeline_id == mr.handled_pipeline:
+        if st.ci_status != "failed" or str(st.ci_id) == str(mr.handled_pipeline):
             return
-        jobs = self.gl.failed_jobs(mr.project_id, st.pipeline_id)
-        parts = [f"Pipeline {st.pipeline_url or st.pipeline_id} in {mr.repo} failed on commit {mr.published_sha[:12]}."]
+        jobs = self.host.failed_jobs(mr.project_id, st.ci_id)
+        parts = [f"Pipeline {st.ci_url or st.ci_id} in {mr.repo} failed on commit {mr.published_sha[:12]}."]
         for job in jobs[:TRACE_JOBS]:
             try:
-                tail = self.d.git._scrub(self.gl.job_trace_tail(mr.project_id, job.id, TRACE_CHARS))
+                tail = self.d.git._scrub(self.host.job_log_tail(mr.project_id, job.id, TRACE_CHARS))
             except ServiceError as e:
                 tail = f"(could not read the log: {e})"
             parts.append(f"Job {job.name} (stage {job.stage}): {job.url}\n```\n{tail.strip()}\n```")
         if len(jobs) > TRACE_JOBS:
             parts.append(f"{len(jobs) - TRACE_JOBS} more failed jobs: " + ", ".join(j.name for j in jobs[TRACE_JOBS:]))
         with self.store.transaction():
-            self.store.add_signal(f"pipeline-{mr.project_id}-{st.pipeline_id}", task.task_id, "ci", "gitlab-ci",
+            self.store.add_signal(_pipeline_signal(mr, st.ci_id), task.task_id, "ci", f"{self.host.name}-ci",
                                   "\n\n".join(parts), now, repo=mr.repo)
-            self.store.update_mr(task.task_id, mr.repo, handled_pipeline=st.pipeline_id)
-        self.events.emit("review_signal", task_id=task.task_id, kind="ci", repo=mr.repo, pipeline=st.pipeline_id)
+            self.store.update_mr(task.task_id, mr.repo, handled_pipeline=st.ci_id)
+        self.events.emit("review_signal", task_id=task.task_id, kind="ci", repo=mr.repo, pipeline=st.ci_id)
 
     def _closed(self, task: Task, mr, st: MRStatus, now: str) -> bool:
         """A person closed one MR while others are open: the agent takes that repository's changes out.
@@ -205,20 +207,20 @@ class ReviewLoop:
                 f"no force push), so that the branch has no difference from origin/{target}. The runner then leaves "
                 f"that MR closed and drops it from the task. Keep the rest of the work correct without those "
                 f"changes; if the ticket or the MRs say where they belong instead, move them there.")
-        if self.store.add_signal(_closed_id(mr), task.task_id, "closed", "gitlab", text, now, repo=mr.repo):
+        if self.store.add_signal(_closed_id(mr), task.task_id, "closed", self.host.name, text, now, repo=mr.repo):
             self.events.emit("review_signal", task_id=task.task_id, kind="closed", repo=mr.repo, by=who)
         return True
 
     def _conflict(self, task: Task, mr, st: MRStatus, now: str) -> None:
-        # GitLab works mergeability out asynchronously: only its confirmed answer counts.
-        if st.merge_status != "conflict" or mr.handled_conflict == st.sha:
+        # Hosts work mergeability out asynchronously: only a confirmed conflict counts, never "not known yet".
+        if st.conflict is not True or mr.handled_conflict == st.sha:
             return
         target = self._target(mr)
         text = (f"The MR in {mr.repo} conflicts with {target}. Merge the latest {target} into the task branch "
                 f"(git fetch origin && git merge origin/{target}), resolve the conflicts and commit. No rebase.")
         with self.store.transaction():
-            self.store.add_signal(f"conflict-{mr.project_id}-{st.sha}", task.task_id, "conflict", "gitlab", text, now,
-                                  repo=mr.repo)
+            self.store.add_signal(_conflict_signal(mr, st.sha), task.task_id, "conflict", self.host.name,
+                                  text, now, repo=mr.repo)
             self.store.update_mr(task.task_id, mr.repo, handled_conflict=st.sha)
         self.events.emit("review_signal", task_id=task.task_id, kind="conflict", repo=mr.repo)
 
@@ -231,9 +233,9 @@ class ReviewLoop:
             mr = mrs.get(s.repo)
             if not mr:
                 return False
-            st = self.gl.mr_status(mr.project_id, mr.iid)
-            pid = int(s.id.rsplit("-", 1)[1])
-            if st.pipeline_id != pid or st.pipeline_status != "failed" or st.pipeline_sha != mr.published_sha:
+            st = self.host.mr_status(mr.project_id, mr.iid)
+            if st.ci_id is None or s.id != _pipeline_signal(mr, st.ci_id) or st.ci_status != "failed" \
+                    or st.ci_sha != mr.published_sha:
                 return False
         return True
 
@@ -244,18 +246,18 @@ class ReviewLoop:
         return "main"
 
     def _ticket_comments(self, task: Task, now: str) -> None:
-        c = self.cfg.youtrack
+        c = self.cfg.tracker
         since = task.published_at_ms or 0
-        for x in self.d.yt.comments(task.issue_db_id):
-            if x.created > since and x.author != c.bot_login and x.author in c.allowed_users and x.text.strip():
+        for x in self.d.tracker.comments(task.issue_db_id):
+            if x.created > since and x.author != c.bot_user and x.author in c.allowed_users and x.text.strip():
                 if self.store.add_signal(f"yt-{x.id}", task.task_id, "ticket", x.author,
                                          f"{x.author} on the ticket: {x.text.strip()}", now):
                     self.events.emit("review_signal", task_id=task.task_id, kind="ticket", author=x.author)
 
     def _ticket_moved_on(self, task: Task) -> bool:
         """Someone moved the ticket past Code Review by hand: the team took it from here."""
-        c = self.cfg.youtrack
-        state = (self.d.yt.issue(task.task_id).fields.get(c.state_field) or [""])[0]
+        c = self.cfg.tracker
+        state = self.d.tracker.issue(task.task_id).state
         if state in (c.states.code_review, c.states.in_progress):
             return False
         self.store.update_task(task.task_id, state="stopped", reason=f"the ticket was moved to \"{state}\" by hand")
@@ -317,11 +319,12 @@ class ReviewLoop:
             ids = [s.id for s in pending]
             batch_id = "review-" + hashlib.sha1("\n".join(sorted(ids)).encode()).hexdigest()[:16]
             humans = [s.author for s in pending if s.kind in ("review", "ticket")]
-            source = "ci" if ci_only else ("youtrack" if {s.kind for s in pending} == {"ticket"} else "mr")
+            source = "ci" if ci_only else (self.d.tracker.engine_source if {s.kind for s in pending} == {"ticket"}
+                                           else "mr")
             threads, writers = self._threads(task, pending)
             text = self._compose(task, pending, batch_id, threads)
             batch = self.store.make_batch(batch_id, task.task_id, source, humans[0] if humans else
-                                          self.cfg.youtrack.bot_login, text, ci_only, self.d.now().isoformat(), ids,
+                                          self.cfg.tracker.bot_user, text, ci_only, self.d.now().isoformat(), ids,
                                           authors=list(dict.fromkeys([*humans, *writers])))
             self.events.emit("review_batch", task_id=task.task_id, batch=batch.id, signals=len(ids), source=source)
         self._send(task, batch)
@@ -340,7 +343,7 @@ class ReviewLoop:
                                    author=batch.author, repo=Path(task.repo_path), text=batch.text,
                                    clearance=clearance, extra_dirs=self.d._extra_dirs_file(task))
         if reply.accepted:
-            c = self.cfg.youtrack
+            c = self.cfg.tracker
             has_ci = any(s.kind == "ci" for s in self.store.signals(task.task_id, batch.id))
             state_key = f"{task.task_id}:state:{batch.id}"
             with self.store.transaction():
@@ -348,11 +351,11 @@ class ReviewLoop:
                 # A review round is counted when it ends: in published code (count_round) or in an answer.
                 self.store.update_task(task.task_id, state="dispatched", attempt_started=self.d.now().isoformat(),
                                        ci_attempts=task.ci_attempts + (1 if has_ci else 0))
-                # The ticket shows In Progress again; journaled, so a YouTrack failure is retried.
+                # The ticket shows In Progress again; journaled, so a tracker failure is retried.
                 self.store.action_intent(state_key, task.task_id, "state", json.dumps(
                     {"state": c.states.in_progress, "while": ["dispatched"]}))
             try:
-                self.d.yt.set_state(task.issue_db_id, c.state_field, c.states.in_progress)
+                self.d.tracker.set_state(task.issue_db_id, c.states.in_progress)
                 self.store.action_done(state_key)
             except ServiceError as e:
                 self.events.emit("notify_pending", task_id=task.task_id, action=state_key, reason=str(e))
@@ -369,28 +372,30 @@ class ReviewLoop:
         labels = _thread_labels(signals)
         if not labels:
             return [], []
-        new = {_note_id(s) for s in signals if s.kind == "review"}
         mrs = {m.repo: m for m in self.store.task_mrs(task.task_id)}
+        new = {s.id for s in signals if s.kind == "review"}
         notes: dict[tuple[str, str], list[Note]] = {}
         for repo in sorted({repo for repo, _ in labels}):
             mr = mrs.get(repo)
             if mr:
-                for n in self.gl.notes(mr.project_id, mr.iid, mr.url):
+                for n in self.host.notes(mr.project_id, mr.iid, mr.url):
                     if not n.system:
                         notes.setdefault((repo, n.discussion_id), []).append(n)
         out, writers = [], []
         for key, label in labels.items():
             thread = notes.get(key)
             if thread:
-                writers += [n.author for n in thread if n.author != self.cfg.gitlab.bot_username]
-                out.append(self._render_thread(label, key[0], thread, new))
-            else:  # the thread is gone from GitLab since: what was asked is still in the signals
+                writers += [n.author for n in thread if n.author != self.cfg.code_host.bot_user]
+                fresh = {str(n.id) for n in thread if _note_signal(mrs[key[0]], n.id) in new}
+                out.append(self._render_thread(label, key[0], thread, fresh))
+            else:  # the thread is gone from the code host since: what was asked is still in the signals
                 asked = [s.body for s in signals if (s.repo, s.discussion_id) == key]
                 out.append(f"### {label} · {key[0]}\n" + "\n".join(f"- NEW: {b}" for b in asked))
         return out, writers
 
-    def _render_thread(self, label: str, repo: str, thread: list[Note], new: set[int]) -> str:
-        bot = self.cfg.gitlab.bot_username
+    def _render_thread(self, label: str, repo: str, thread: list[Note], new: set[str]) -> str:
+        """`new`: the ids of the notes that ask something of the agent in this round."""
+        bot = self.cfg.code_host.bot_user
         first = thread[0]
         where = f" · {first.path}:{first.line}" if first.path else ""
         version = f" (on commit {first.commit[:12]})" if first.commit else ""
@@ -400,7 +405,7 @@ class ReviewLoop:
             body = _OUR_MARKER.sub("", n.body).strip()
             if len(body) > NOTE_CHARS:
                 body = body[:NOTE_CHARS].rstrip() + " …"
-            mark = "NEW, to you: " if n.id in new else ""
+            mark = "NEW, to you: " if str(n.id) in new else ""
             lines.append(f"- {mark}{who}: " + body.replace("\n", "\n  "))
         return "\n".join([f"### {label} · {repo}{where}{version}", first.url, *_fit(lines)])
 
@@ -433,7 +438,7 @@ class ReviewLoop:
                 '{"replies": [{"thread": "T1", "changed": true, "text": "…"}]}. `changed` is true when your '
                 "answer to that thread is a code change. `text` is your reply in that thread, to the person "
                 "who asked, in English: what you changed, or the answer to their question. The runner posts "
-                "each answer in its thread; you cannot post in GitLab yourself.",
+                f"each answer in its thread; you cannot post in {self.host.label} yourself.",
             ]
         lines += ["- Make code changes with new commits on the same branch, without rebase or force push, and "
                   "commit everything. If nothing in this round needs a code change, change nothing and say why "
@@ -514,8 +519,7 @@ class ReviewLoop:
                 task = self._count(task, batch.id, "answer")
         visuals = self.d.refresh_media(task)
         self.d.comment_with_media(task, f"nochange:{batch.id if batch else 'none'}", text[:3000], visuals)
-        c = self.cfg.youtrack
-        self.d.yt.set_state(task.issue_db_id, c.state_field, c.states.code_review)
+        self.d.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.code_review)
         self.store.update_task(task.task_id, state="code_review", reason=None)
         self.events.emit("review_answered", task_id=task.task_id, changed=False)
 
@@ -536,18 +540,19 @@ class ReviewLoop:
             self.store.action_done(key)
             return
         marker = f"<!-- arceus:{payload['signal']} -->"
-        if not any(marker in n.body and n.author == self.cfg.gitlab.bot_username
-                   for n in self.gl.notes(mr.project_id, mr.iid, mr.url) if n.discussion_id == payload["discussion"]):
-            self.gl.reply(mr.project_id, mr.iid, payload["discussion"], f"{payload['body']}\n\n{marker}")
+        if not any(marker in n.body and n.author == self.cfg.code_host.bot_user
+                   for n in self.host.notes(mr.project_id, mr.iid, mr.url) if n.discussion_id == payload["discussion"]):
+            self.host.reply(mr.project_id, mr.iid, payload["discussion"], f"{payload['body']}\n\n{marker}")
         self.store.action_done(key)
         self.store.mark_replied(payload["signal"])
 
     def note_moved(self, task: Task, repo: str, remote: str, sha: str) -> None:
         """People pushed to the MR branch while the agent worked: hand it to the agent to merge in."""
         now = self.d.now().isoformat()
-        text = (f"Branch {task.branch} of {repo} on GitLab has commits that you do not have "
-                f"(GitLab {remote[:12]}, yours {sha[:12]}). Merge them in: git pull --no-rebase origin {task.branch}, "
+        host = self.host.label
+        text = (f"Branch {task.branch} of {repo} on {host} has commits that you do not have "
+                f"({host} {remote[:12]}, yours {sha[:12]}). Merge them in: git pull --no-rebase origin {task.branch}, "
                 f"resolve any conflicts and commit. Do not rewrite other people's commits.")
-        self.store.add_signal(f"moved-{repo}-{remote}", task.task_id, "moved", "gitlab", text, now, repo=repo)
+        self.store.add_signal(f"moved-{repo}-{remote}", task.task_id, "moved", self.host.name, text, now, repo=repo)
         self.store.update_task(task.task_id, state="code_review")
         self.events.emit("review_signal", task_id=task.task_id, kind="moved", repo=repo)
