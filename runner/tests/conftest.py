@@ -81,3 +81,10 @@ def read_events(path: Path) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@pytest.fixture(autouse=True)
+def no_engine_tmux_server(monkeypatch):
+    """The engine's tmux server of the machine running the tests (a dev Mac, the sandbox's keeper) is not
+    the engine these tests talk to. The live scenarios, which do use it, put the real reading back."""
+    monkeypatch.setattr("arceus_runner.health.engine_tmux_env", lambda socket="bulava": None)

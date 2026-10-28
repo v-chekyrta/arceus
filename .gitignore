@@ -7,6 +7,9 @@ __pycache__/
 .pytest_cache/
 .playwright-mcp/
 
+# The Docker sandbox of the server is a local tool, never committed (its README is inside)
+/sandbox/
+
 # Internal notes, not part of the public repository
 Agentic development workflow.md
 bulava-agreement.md

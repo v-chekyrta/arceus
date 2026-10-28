@@ -12,9 +12,16 @@ CHROME_DEVTOOLS_MCP_VERSION=1.10.1   # the version Bulava's automation-mcp.json 
 
 # Bulava engine (engine/SERVER.md): the public repository, installed to /opt/bulava.
 #   BULAVA_SOURCE  a git URL, or a directory here. Empty BULAVA_SOURCE skips the engine phases.
-#   BULAVA_REF     a branch the server follows, a tag, or a full commit to stay on.
-#                  With a branch, run `sudo ./setup.sh` between tasks to take its newest commit (the
-#                  engine and its install.sh); it refuses to swap the engine while a task is running.
-# `factory` is the branch where Bulava puts server fixes first (they reach main later).
+#   BULAVA_REF     a full commit to stay on (the default), a tag, or a branch the server follows.
+#                  setup refuses to swap the engine while a task is running: run it between tasks.
+# A full commit, because Bulava rewrites its branches: `factory` and `main` were squashed into one
+# commit, and the SHAs the server ran before stopped existing upstream. Every commit setup installs
+# is kept in /var/lib/arceus/bulava.git, so the server can be rebuilt on it whatever happens upstream.
+# To update: put the new commit here (`git ls-remote <source> refs/heads/main`), check its
+# engine/SERVER.md, and run `sudo ./setup.sh` between tasks. `factory` is where Bulava puts server
+# fixes first; BULAVA_REF=factory follows it, taking its newest commit on every run.
+# b721e5f (2026-10-26): the independent Claude checks before Codex (bulava.claude_checks in config.yaml).
+# 93746a0 (2026-10-27, main, 1.16.3): b721e5f plus fixes: Codex reviews Cyrillic tasks, the write-gate's
+# false refusals, `codex` on the task says where Codex did not take part.
 BULAVA_SOURCE=https://github.com/Stepanokdev/bulava
-BULAVA_REF=factory
+BULAVA_REF=93746a05a5336702c785e64f0928dc40747d73e4

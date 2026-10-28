@@ -61,6 +61,46 @@ def bulava(probe: Probe) -> Check:
     return Check("bulava.installed", "warn", f"{ver}; missing for live mode: {', '.join(probe.missing(1))}")
 
 
+def engine_tmux_env(socket: str = "bulava") -> dict[str, str] | None:
+    """The global environment of the engine's tmux server (bulava-engine.service), which every worker
+    session and so every review gate inherits. None when no server runs."""
+    try:
+        r = subprocess.run(["tmux", "-L", socket, "show-environment", "-g"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line and not line.startswith("-"))
+
+
+def claude_checks(cfg: Config, probe: Probe, live_env=None) -> Check:
+    """The engine's code and security checks before Codex, as config.yaml sets them. No new tasks when
+    the engine would not do what config.yaml says: checks turned on and an engine without them, or a
+    review gate that would run with other settings (bulava-engine.service not updated or not restarted)."""
+    c = cfg.bulava.claude_checks
+    if not probe.installed:
+        return Check("config.claude_checks", "warn", "the engine is not installed")
+    shown = ("off" if not c.enabled else
+             f"{' + '.join(dict.fromkeys(c.kinds))}, back to the agent from {c.min_severity}, "
+             f"{c.rounds} round(s) per task, {int(c.timeout.total_seconds() // 60)} min each"
+             + (", required" if c.required else ", not required"))
+    if c.enabled and probe.missing_for_checks():
+        return Check("config.claude_checks", "fail", f"{shown}; the engine in {cfg.paths.bulava} has no "
+                                                     "independent checks: update it (setup.sh)")
+    live = (live_env or engine_tmux_env)()
+    if live is not None and not probe.advertised.get("settings.claude_checks"):
+        want, gate = c.env(), c.gate_env(live)
+        differ = [f"{k}={gate[k]} (config.yaml: {want[k]})" for k in want if gate[k] != want[k]]
+        if differ:
+            return Check("config.claude_checks", "fail",
+                         f"the review gate would run with {', '.join(differ)}: bulava-engine.service is not "
+                         "up to date with config.yaml; run sudo ./setup.sh, then restart bulava-engine between tasks")
+    if not c.enabled:
+        return Check("config.claude_checks", "warn", "off in config.yaml: Codex alone reviews the work")
+    return Check("config.claude_checks", "ok", shown)
+
+
 def engine_doctor(engine: Engine) -> list[Check]:
     """The engine's own health, with the environment the runner gives it: Claude and Codex
     signed in as this user, hooks installed, usage readings, the browser."""
@@ -94,4 +134,4 @@ def devstack(cfg: Config) -> list[Check]:
 
 
 def local_checks(cfg: Config, probe: Probe) -> list[Check]:
-    return [disk(cfg), ram(cfg), bulava(probe), *tools(), *devstack(cfg)]
+    return [disk(cfg), ram(cfg), bulava(probe), claude_checks(cfg, probe), *tools(), *devstack(cfg)]

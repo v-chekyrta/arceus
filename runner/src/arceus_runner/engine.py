@@ -19,8 +19,10 @@ from arceus_runner.gitops import _workspace_umask
 from arceus_runner.screening import Clearance, NotScreened
 
 TIMEOUT = 900
-# Chosen in config.yaml (bulava.*_model, *_effort); bulava.env is for the token and cannot override them.
+# Chosen in config.yaml (bulava.*_model, *_effort, claude_checks); bulava.env is for the token and
+# cannot override them.
 MODEL_VARS = ("SUPERVISOR_CLAUDE_MODEL", "SUPERVISOR_CLAUDE_EFFORT", "SUPERVISOR_CODEX_MODEL", "SUPERVISOR_CODEX_EFFORT")
+CHECKS_PREFIX = "SUPERVISOR_CLAUDE_CHECKS"
 
 
 class EngineError(Exception):
@@ -83,6 +85,7 @@ class Engine:
             "SUPERVISOR_REPORT_LANGUAGE": b.report_language,
             "SUPERVISOR_CODEX_UNAVAILABLE": b.codex_unavailable,
             "SUPERVISOR_CODEX_UNAVAILABLE_AFTER_HOURS": str(b.codex_unavailable_after_hours),
+            "SUPERVISOR_HANDSHAKE_WAIT": str(int(b.start_handshake_wait.total_seconds())),
             "SUPERVISOR_SERVER_EXTRA_SECRET_PATHS": " ".join(str(p) for p in self.secret_paths()),
         }
         if b.mcp_config:
@@ -93,6 +96,10 @@ class Engine:
         env["NIGHT_SHIFT_SETTINGS"] = "off"
         env.update(self.token_env())
         env.update(b.model_env())
+        # The engine's checks before Codex. doctor reports them from here; the review gate on a server
+        # reads them from the worker's environment, which comes from bulava-engine.service, so only the
+        # engine's defaults reach it until the engine carries these (health.claude_checks).
+        env.update(b.claude_checks.env())
         env.update(self.extra_env)
         return env
 
@@ -104,7 +111,7 @@ class Engine:
         if not path.exists():
             return {}
         return {k: v for k, v in read_env_file(path).items()
-                if v.strip() and "replace-me" not in v and k not in MODEL_VARS}
+                if v.strip() and "replace-me" not in v and k not in MODEL_VARS and not k.startswith(CHECKS_PREFIX)}
 
     def refresh_usage(self) -> None:
         """Take fresh subscription readings with the engine's own scripts (Bulava takes them only during

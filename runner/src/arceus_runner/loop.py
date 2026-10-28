@@ -55,6 +55,8 @@ def require_mode_ready(cfg: Config, probe: bulava_mod.Probe) -> None:
     missing = probe.missing_for_live()
     if cfg.bulava.model_env():
         missing += probe.missing_for_models()
+    if cfg.bulava.claude_checks.enabled:
+        missing += probe.missing_for_checks()
     if not probe.installed or probe.problems or missing:
         why = "; ".join([*probe.problems, *(f"no {m}" for m in missing)]) or "engine not installed"
         raise LiveModeUnavailable(f"mode: live needs the Bulava server contract at {probe.root}: {why}. "

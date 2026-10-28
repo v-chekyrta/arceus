@@ -46,6 +46,8 @@ FAIL_REASONS = {
     "scope_violation": "the agent went outside the task's scope",
     "stalled": "the agent's session stopped at its prompt without finishing, again after being asked to finish",
 }
+# The review gate's words when a required independent check did not run (review-gate.sh, claude checks).
+CHECK_FAILED = "independent check failed"
 STALLED_NUDGE = ("Your previous session stopped at its prompt without finishing the turn, and Bulava parked it. "
                  "Pick the task up from where the work stands: finish it, commit in every repository you "
                  "changed, and declare the outcome.")
@@ -444,7 +446,7 @@ class Delivery:
             # `auto` means the CLI chose, and only its own transcripts say what that was.
             self.events.emit("task_dispatched", task_id=task.task_id, tier=reply.tier,
                              attempt=reply.data.get("attempt"), dispatch_id=reply.data.get("dispatch_id"),
-                             **self.cfg.bulava.model_profile())
+                             **self.cfg.bulava.model_profile(), **self.cfg.bulava.claude_checks.profile())
         elif reply.rc == 6:
             self.events.emit("dispatch_busy", task_id=task.task_id, reason=reply.why())
         else:
@@ -521,6 +523,13 @@ class Delivery:
                     verdict = "but Bulava's verifier did not confirm it with the project's build and tests"
                 self.fail(task, f"Codex accepted the change, {verdict}, so it was not published",
                           self._debt_details(task, receipt, outcome, failed + unproven), attempt=len(attempts))
+                return
+            review_why = receipt.get("review_why") or ""
+            if why == "needs-user" and CHECK_FAILED in review_why:
+                # bulava.claude_checks.required: the engine stopped before Codex, so it is not Codex's decision.
+                self.fail(task, "an independent Claude check (code or security review) did not run, and "
+                                "config.yaml requires it, so Codex did not review the work",
+                          review_why, attempt=len(attempts))
                 return
             reason = FAIL_REASONS.get(why) or FAIL_REASONS.get(outcome.get("reason") or "") or why
             self.fail(task, reason, outcome.get("summary") or "", attempt=len(attempts))

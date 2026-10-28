@@ -223,3 +223,106 @@ def test_a_chosen_model_needs_an_engine_that_takes_it(tmp_path, monkeypatch):
     new = bulava.probe(_engine(tmp_path / "new", ': "${SUPERVISOR_CLAUDE_MODEL:=}"\n',
                                '#!/bin/sh\ncase "${NIGHT_SHIFT_SETTINGS:-}" in off) ;; esac\n'))
     assert new.missing_for_models() == [] and models_check(cfg, new).status == "ok"
+
+
+def test_independent_checks_are_on_and_every_value_is_passed_to_the_engine():
+    c = load_config(EXAMPLE).bulava.claude_checks
+    assert c.env() == {"SUPERVISOR_CLAUDE_CHECKS": "1", "SUPERVISOR_CLAUDE_CHECKS_LIST": "code security",
+                       "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY": "high", "SUPERVISOR_CLAUDE_CHECKS_ROUNDS": "1",
+                       "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": "900", "SUPERVISOR_CLAUDE_CHECKS_REQUIRED": "1"}
+
+
+def test_independent_checks_turned_off_say_so_to_the_engine(tmp_path):
+    raw = example_raw()
+    raw["bulava"]["claude_checks"] = {"enabled": False, "rounds": 3}
+    c = load_config(write(tmp_path, raw)).bulava.claude_checks
+    assert c.env() == {"SUPERVISOR_CLAUDE_CHECKS": "0"} and c.profile() == {"claude_checks": "off"}
+
+
+def test_independent_checks_as_chosen(tmp_path):
+    raw = example_raw()
+    raw["bulava"]["claude_checks"] = {"kinds": ["security", "security"], "min_severity": "medium",
+                                      "rounds": 2, "timeout": "20m", "required": True}
+    env = load_config(write(tmp_path, raw)).bulava.claude_checks.env()
+    assert (env["SUPERVISOR_CLAUDE_CHECKS_LIST"], env["SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY"],
+            env["SUPERVISOR_CLAUDE_CHECKS_ROUNDS"], env["SUPERVISOR_CLAUDE_CHECKS_TIMEOUT"],
+            env["SUPERVISOR_CLAUDE_CHECKS_REQUIRED"]) == ("security", "medium", "2", "1200", "1")
+
+
+@pytest.mark.parametrize("key,value", [
+    ("kinds", []), ("kinds", ["style"]), ("min_severity", "info"), ("rounds", 0), ("rounds", 6),
+    ("timeout", "45m"), ("timeout", "30s"), ("required", "maybe"),
+])
+def test_independent_checks_the_engine_would_not_take_are_refused(tmp_path, key, value):
+    raw = example_raw()
+    raw["bulava"]["claude_checks"] = {key: value}
+    with pytest.raises(ConfigError) as e:
+        load_config(write(tmp_path, raw))
+    assert all(p.startswith(f"bulava.claude_checks.{key}") for p in e.value.problems), e.value.problems
+
+
+def test_independent_checks_need_an_engine_that_runs_them(tmp_path, monkeypatch):
+    from arceus_runner import bulava
+    from arceus_runner.health import claude_checks
+    from arceus_runner.loop import LiveModeUnavailable, require_mode_ready
+    monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
+    old = _engine(tmp_path, "", "#!/bin/sh\n")
+    (old / "hooks").mkdir()
+    (old / "hooks" / "review-gate.sh").write_text("#!/bin/bash\n# claude_checks_enabled only in a comment\n")
+    old_probe = bulava.probe(old)
+    cfg = load_config(EXAMPLE)
+    c = claude_checks(cfg, old_probe)
+    assert c.status == "fail" and "update it (setup.sh)" in c.detail
+    with pytest.raises(LiveModeUnavailable, match="independent Claude checks"):
+        require_mode_ready(cfg.model_copy(update={"mode": "live"}), old_probe)
+
+    raw = example_raw()
+    raw["bulava"]["claude_checks"] = {"enabled": False}
+    off = load_config(write(tmp_path, raw))
+    assert claude_checks(off, old_probe).status == "warn"  # no engine server to compare with yet
+
+    new = _engine(tmp_path / "new", "", "#!/bin/sh\n")
+    (new / "hooks").mkdir()
+    (new / "hooks" / "review-gate.sh").write_text(
+        '#!/bin/bash\nif [ -n "${IDIR_SCOPE:-}" ] && claude_checks_enabled; then\n  :\nfi\n')
+    new_probe = bulava.probe(new)
+    assert new_probe.missing_for_checks() == []
+    c = claude_checks(cfg, new_probe)
+    assert c.status == "ok"
+    assert c.detail == "code + security, back to the agent from high, 1 round(s) per task, 15 min each, required"
+
+
+def test_the_review_gate_must_run_with_what_config_yaml_says(tmp_path, monkeypatch):
+    """A worker's review gate reads the environment of the engine's tmux server (bulava-engine.service),
+    so that is what config.yaml is compared with: an engine server started from an older unit, or never
+    restarted, would run the checks on other terms, and no new task is taken until it is put right."""
+    from arceus_runner import bulava
+    from arceus_runner.health import claude_checks
+    monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
+    root = _engine(tmp_path / "engine", "", "#!/bin/sh\n")
+    (root / "hooks").mkdir()
+    (root / "hooks" / "review-gate.sh").write_text('#!/bin/bash\nif [ -n "${IDIR_SCOPE:-}" ] && claude_checks_enabled; then\n  :\nfi\n')
+    probe = bulava.probe(root)
+    cfg = load_config(EXAMPLE)
+    unit = {"SUPERVISOR_PROFILE": "server", **cfg.bulava.claude_checks.env()}
+    assert claude_checks(cfg, probe, live_env=lambda: None).status == "ok"         # no server: the dispatch starts it
+    assert claude_checks(cfg, probe, live_env=lambda: unit).status == "ok"
+    old_unit = {"SUPERVISOR_PROFILE": "server"}                                    # the engine's own defaults
+    c = claude_checks(cfg, probe, live_env=lambda: old_unit)
+    assert c.status == "fail" and "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=0 (config.yaml: 1)" in c.detail and "restart bulava-engine" in c.detail
+    raw = example_raw()
+    raw["bulava"]["claude_checks"] = {"enabled": False}
+    off = load_config(write(tmp_path, raw))
+    c = claude_checks(off, probe, live_env=lambda: old_unit)                       # the gate would still run them
+    assert c.status == "fail" and "SUPERVISOR_CLAUDE_CHECKS=1 (config.yaml: 0)" in c.detail
+    assert claude_checks(off, probe, live_env=lambda: {"SUPERVISOR_CLAUDE_CHECKS": "0"}).status == "warn"
+    (root / "bin" / "supervisor-lib.sh").write_text('_RUN_ENV_VARS="SUPERVISOR_CODEX_EFFORT SUPERVISOR_CLAUDE_CHECKS"\n')
+    carries = bulava.probe(root)                                                    # an engine that takes them per task
+    assert claude_checks(cfg, carries, live_env=lambda: old_unit).status == "ok"
+
+
+def test_engine_env_prints_what_setup_writes_into_the_engine_unit(capsys):
+    assert main(["--config", str(EXAMPLE), "engine-env"]) == EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    assert "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1" in lines and "SUPERVISOR_CLAUDE_CHECKS_LIST=code security" in lines
+    assert len(lines) == 6
