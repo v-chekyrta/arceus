@@ -49,6 +49,14 @@ CAPABILITIES: tuple[Capability, ...] = (
                "SUPERVISOR_{CLAUDE,CODEX}_{MODEL,EFFORT}"),
     Capability("settings.file_off", 3, ("bin/night-shift.sh",), r"NIGHT_SHIFT_SETTINGS",
                "NIGHT_SHIFT_SETTINGS=off"),
+    # Needed when config.yaml turns the independent checks on (bulava.claude_checks.enabled, the default).
+    Capability("gate.claude_checks", 3, ("hooks/review-gate.sh",), r"^\s*if .*claude_checks_enabled\b",
+               "the independent Claude checks before Codex (SUPERVISOR_CLAUDE_CHECKS)"),
+    # On a server a worker inherits the environment of the engine's tmux server (bulava-engine.service),
+    # not the dispatch's. An engine that carries these on the worker's launch line, as it does for the
+    # names in _RUN_ENV_VARS, takes them from the dispatch; until then the unit is the way in.
+    Capability("settings.claude_checks", 3, ("bin/supervisor-lib.sh",), r'_RUN_ENV_VARS="[^"]*SUPERVISOR_CLAUDE_CHECKS',
+               "SUPERVISOR_CLAUDE_CHECKS_* carried to the worker's review gate"),
 )
 
 
@@ -74,6 +82,10 @@ class Probe:
         """What a model or depth chosen in config.yaml needs, so the choice is applied and nothing outranks it."""
         need = ("settings.models", "settings.file_off")
         return [c.meaning for c in CAPABILITIES if c.name in need and not self.advertised.get(c.name)]
+
+    def missing_for_checks(self) -> list[str]:
+        """What bulava.claude_checks.enabled needs: a review gate that runs the checks."""
+        return [c.meaning for c in CAPABILITIES if c.name == "gate.claude_checks" and not self.advertised.get(c.name)]
 
     def missing(self, wave: int) -> list[str]:
         return [c.meaning for c in CAPABILITIES if c.wave <= wave and not self.advertised.get(c.name)]

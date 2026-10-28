@@ -6,7 +6,8 @@ Arceus runs AI coding agents on a server instead of a developer's laptop. A pers
 
 ```
 YouTrack ──tag "agent"──▶ runner ──dispatch / worker-send──▶ Bulava ──▶ Claude Code (writes, commits)
-   ▲                        │  ▲                                  └──▶ Codex (reviews)
+   ▲                        │  ▲                                  ├──▶ Claude code + security checks (advise)
+   │                        │  │                                  └──▶ Codex (reviews)
    │ comments, state        │  └── task show: state, verdict, reviewed commits
    └────────────────────────┤
                             └──push reviewed commit, open MR──▶ GitLab ──▶ CI, people merge
@@ -15,7 +16,7 @@ runner metrics, VM ──▶ Prometheus ┴──▶ Grafana
 ```
 
 - **Runner** (`runner/`, Python, a systemd service). The deterministic bridge. It polls YouTrack for tickets tagged `agent` by someone on the project's allowlist, prepares the repositories, starts the task in Bulava, follows it with `night-shift task show`, and when Codex has passed the work it makes sure GitLab holds exactly the reviewed commit, opens and describes the merge request and moves the ticket to Code Review. It then watches the MR: review comments that mention the bot, red CI and conflicts go back to the agent, which either fixes the code or answers the question in its thread, and each reviewed fix is published to the same MR. Questions the agent cannot answer go to the ticket as comments; the answer goes back to the agent. Between tasks it clears what the agents left behind (stopped containers, test volumes, orphaned dev servers, uncommitted files, old screenshots), but only what it can tie to a task that is over; the rest it reports. All of its state is in SQLite, and every external step can be repeated after a crash without doing anything twice.
-- **Bulava** ([Stepanokdev/bulava](https://github.com/Stepanokdev/bulava), branch `factory`, `engine/SERVER.md` is the contract). The engine that runs the agent: a Claude Code session in tmux, Codex as reviewer, the task record that outlives sessions, usage limits, the server profile that keeps the agent away from credentials.
+- **Bulava** ([Stepanokdev/bulava](https://github.com/Stepanokdev/bulava), a pinned commit of branch `factory`, `engine/SERVER.md` is the contract). The engine that runs the agent: a Claude Code session in tmux, after a green build a code review and a security review by Claude sessions that never saw the ticket (`bulava.claude_checks`, see [setup/README.md](setup/README.md#independent-checks-before-codex)), Codex as reviewer, the task record that outlives sessions, usage limits, the server profile that keeps the agent away from credentials.
 - **Setup** (`setup/`). One idempotent script that prepares the VM: packages, Docker, Chrome, pinned `claude`/`codex`/`chrome-devtools-mcp`, the Bulava engine, the runner, the systemd units and the observability stack. `--check` reports what is not done without changing anything.
 - **Observability** (`observability/`). Grafana with Prometheus and Loki on the VM, reached through an SSH tunnel: what the agent is doing now, what happened to every ticket, and the VM's resources.
 
@@ -45,10 +46,15 @@ Not there yet:
 | [`setup/`](setup) | `setup.sh`, `setup.conf.example` and checks; **[setup/README.md](setup/README.md) is the operator's guide** |
 | [`config/`](config) | example `config.yaml`, `secrets.env` and `bulava.env` |
 | [`observability/`](observability) | Docker Compose stack and the generator of the Grafana dashboards |
+| `sandbox/` | local only, git-ignored: the server in a Docker container on a Mac, installed by `setup.sh`, for the tests that need no model and the review cycles with the real Claude and Codex; how to use it is in `sandbox/README.md` beside it |
 
 Running the tests locally:
 
 ```bash
-cd runner && uv venv && uv pip install -e '.[test]' && .venv/bin/pytest -q
+cd runner && uv venv && uv pip install -e '.[test]' && .venv/bin/pytest -q -n auto   # in parallel, under a minute
 ARCEUS_REAL_ENGINE=/opt/bulava/engine .venv/bin/pytest -q   # on a machine with Bulava installed
 ```
+
+`./verify.sh` from the root runs all of it at once: the runner's tests, the setup and sandbox script tests, and, when the sandbox container is up, the runner's tests on Linux, the runner against the real engine and the invariants of the latest live report of each scenario. No model is called. A checkout without `sandbox/` skips that part and prints that it did.
+
+Where a local `sandbox/` exists, the same runs in a container before anything reaches the VM; `sandbox/README.md` there says how.

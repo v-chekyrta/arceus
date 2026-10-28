@@ -36,7 +36,8 @@ Setup never overwrites `data/config.yaml`, `secrets.env` or `bulava.env`: the ex
 |---|---|---|
 | `/opt/agent-tools` | root, read-only | `claude`, `codex` and `chrome-devtools-mcp` at pinned versions, linked from `/usr/local/bin` |
 | `/opt/arceus-runner` | root, read-only | the runner's code and virtualenv |
-| `/opt/bulava/engine` | root, read-only | the Bulava engine at `BULAVA_REF`: a branch the server follows (for example `factory`), a tag or a commit. A new commit on the branch is installed by the next `sudo ./setup.sh`, never while a task runs. The engine's `install.sh` runs as the user and writes to their `~/.claude` (worker hooks, status line) and `~/.local/bin` |
+| `/opt/bulava/engine` | root, read-only | the Bulava engine at `BULAVA_REF`: a full commit (the default), a tag or a branch the server follows (for example `factory`). A new commit is installed by the next `sudo ./setup.sh`, never while a task runs. The engine's `install.sh` runs as the user and writes to their `~/.claude` (worker hooks, status line) and `~/.local/bin` |
+| `/var/lib/arceus/bulava.git` | root | a mirror of the Bulava repository that keeps every commit setup installed (`refs/arceus/<commit>`), so a pinned commit stays installable after Bulava rewrites its branches |
 | `/opt/bulava-local/mcp.json` | root | the headless browser for Bulava (`SUPERVISOR_AUTOMATION_MCP_CONFIG`), without `npx` |
 | `/opt/arceus-observability` | root | the Docker Compose stack for Grafana, Prometheus, Loki, Alloy and node_exporter |
 | `/etc/systemd/system/bulava-engine.service` | root | the tmux server the workers run in (`tmux -L bulava`). Installed, not enabled |
@@ -128,6 +129,34 @@ sudo systemctl enable --now bulava-engine runner
 ```
 
 When observing shows what you expect, set `mode: live` and run `sudo systemctl restart runner`. If the installed engine lacks a contract the runner needs, `live` does not start and lists what is missing (`arceus-runner probe-bulava`).
+
+## Independent checks before Codex
+
+After the build and tests pass and before Codex reviews, Bulava runs two Claude sessions side by side, a code review and a security review (engine/SERVER.md, "Independent checks before Codex"). They never see the ticket or the agent's conversation, only the diff of every repository with work in it, and they cannot change anything. Findings at `min_severity` or above go back to the agent, which fixes each one or says why not. Codex then decides with all the findings and the agent's answers in front of it. The checks only advise: an empty list is not a pass, and a reviewer who always finds something cannot keep the task going, because the number of returns per task is fixed. A red build skips them.
+
+```yaml
+bulava:
+  claude_checks:
+    enabled: true
+    kinds: [code, security]
+    min_severity: high     # critical | high | medium | low
+    rounds: 1              # returns to the agent per task, 1–5; a follow-up does not reset it
+    timeout: 15m           # per check, 1m–30m
+    required: true         # a check that did not run stops the task for a person; false: Codex alone
+```
+
+A worker's review gate reads these from the environment of the engine's tmux server, which `bulava-engine.service` starts; whatever the runner passes on a dispatch does not reach it (the engine carries none of `SUPERVISOR_CLAUDE_CHECKS_*` on the worker's launch line, `tests/test_real_engine.py` pins that). So `setup.sh` writes them into that unit (`arceus-runner engine-env` prints them from `config.yaml`) and restarts `bulava-engine` when they changed and no task is running; with a task running it says so, and you restart it between tasks. `check` and `doctor` compare `config.yaml` with the running tmux server and show `FAIL` on `config.claude_checks` while they differ, so no new task starts on other terms than `config.yaml` says. They also show `FAIL` when the installed engine has no checks at all. The runner drops these names from `bulava.env`.
+
+A `config.yaml` written from an earlier example has `required: false` in it, and that stays until you change it.
+
+What to know:
+
+- **Spent rounds stop the checks for the task.** Once the findings have gone back `rounds` times, the engine does not run the checks again for that task. Fixes after MR comments and red CI then go to Codex alone, and Codex is shown the last reading.
+- **A check that did not run** (time, a Claude limit, no answer, the network, a write) is shown as `gate.check failed` in the engine steps (Grafana, `engine_step`). With `required: true` the task then fails before Codex, nothing is published, and the ticket says "an independent Claude check (code or security review) did not run"; `/continue` runs it again. With `required: false` the work goes on to Codex alone, and only the engine steps show it.
+- **Time and quota.** Two more Claude sessions per review on the same subscription, up to `timeout` each, inside the review gate's hour, together with the build and Codex. A diff over 400 000 characters is cut, and the checks read the rest from the files.
+- **A start that waits for its session.** The engine rolls a start back when the new session's hooks do not confirm the run in time (`SUPERVISOR_HANDSHAKE_WAIT`, 5 s in the engine), and the ticket then fails. A cold Claude on a busy machine is slower than that, so the runner passes `bulava.start_handshake_wait` (30 s by default, 5 s–2 m).
+- **The agent's model and depth.** Both checks run on `bulava.claude_model` and `bulava.claude_effort`, the ones the task started with; there is no setting of their own. With `auto` no `--model` is passed (the Claude CLI's default for the server's account) and the engine's `high` is the depth. A change in `config.yaml` reaches new tasks only.
+- **Not the slash commands.** The checks run Bulava's own prompts, not `/code-review` and `/security-review`. The engine builds the diff itself, because the commands choose their own base and do not see the other repositories.
 
 ## How a task goes in `live`
 

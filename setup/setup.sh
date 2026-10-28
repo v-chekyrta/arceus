@@ -104,7 +104,8 @@ preflight() {
   # The services are machine-wide. Setup never moves them from one user to another behind his back.
   local unit owner
   for unit in "$UNIT" "$ENGINE_UNIT"; do
-    owner="$(sed -n 's/^User=//p' "$unit" 2>/dev/null | head -1)"
+    [ -f "$unit" ] || continue   # a machine setup has not run on yet
+    owner="$(sed -n 's/^User=//p' "$unit" | head -1)"
     if [ -n "$owner" ] && [ "$owner" != "$RUN_USER" ] && id "$owner" >/dev/null 2>&1; then
       die "$(basename "$unit") runs as '$owner'. Stop and remove it there first (sudo systemctl disable --now $(basename "$unit" .service); sudo rm $unit), then run setup as '$RUN_USER'."
     fi
@@ -268,6 +269,9 @@ apply_dirs() {
 }
 
 bulava_wanted() { [ -n "$BULAVA_SOURCE" ]; }
+# shellcheck source=bulava-source.sh
+. "$SELF_DIR/bulava-source.sh"
+BULAVA_MIRROR="$FACTS_DIR/bulava.git"   # every engine commit installed here stays installable
 # The engine is a commit of the public repository (engine/SERVER.md), root-owned and read-only for
 # the run user. It runs from $BULAVA_DIR/engine. BULAVA_REF is a full commit, a tag, or a branch the
 # server follows: a branch is read on every run, and a new commit on it is what makes this phase act.
@@ -314,9 +318,10 @@ apply_bulava() {
     [ -n "$BULAVA_REF" ] || die "BULAVA_REF must name a commit, a tag or a branch when BULAVA_SOURCE is a git URL"
     commit="$(bulava_target)"
     [ -n "$commit" ] || die "$BULAVA_SOURCE has no branch or tag $BULAVA_REF"
-    git clone --quiet "$BULAVA_SOURCE" "$stage/repo"
-    git -C "$stage/repo" -c advice.detachedHead=false checkout --quiet "$commit"
-    commit="$(git -C "$stage/repo" rev-parse HEAD)"
+    install -d -m 755 "$FACTS_DIR"
+    bulava_mirror_fetch "$BULAVA_MIRROR" "$BULAVA_SOURCE" "$commit" \
+      || die "neither $BULAVA_SOURCE nor the mirror $BULAVA_MIRROR has commit $commit"
+    bulava_mirror_checkout "$BULAVA_MIRROR" "$commit" "$stage/repo" || die "cannot check out $commit from $BULAVA_MIRROR"
   fi
   [ -x "$stage/repo/engine/bin/dispatch.sh" ] || die "$BULAVA_SOURCE does not look like Bulava (no engine/bin/dispatch.sh)"
   # Only the engine is needed on a server; the app, the phone app and the site stay out.
@@ -468,6 +473,21 @@ engine_env_lines() {
     "Environment=SUPERVISOR_AUTOMATION_MCP_CONFIG=$MCP_CONFIG" \
     "Environment=\"SUPERVISOR_SERVER_EXTRA_SECRET_PATHS=$DATA_DIR/secrets.env $DATA_DIR/bulava.env $DATA_DIR/runner.db $DATA_DIR/runner.lock\"" \
     "Environment=PATH=$RUN_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  engine_check_lines
+}
+
+# The independent checks before Codex (bulava.claude_checks in config.yaml). A worker's review gate
+# reads the environment of this unit's tmux server, not the runner's dispatch, so this is the one
+# place the settings reach it; `arceus-runner doctor` compares them with the running server.
+ENGINE_CHECK_SETTINGS=""
+engine_check_lines() {
+  local cfg="$DATA_DIR/config.yaml" line
+  [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] && [ -f "$cfg" ] || return 0
+  if [ -z "$ENGINE_CHECK_SETTINGS" ]; then
+    ENGINE_CHECK_SETTINGS="$("$RUNNER_OPT/venv/bin/arceus-runner" --config "$cfg" engine-env)" \
+      || die "$cfg is not valid, so the engine's check settings cannot be written: run arceus-runner check --offline"
+  fi
+  while IFS= read -r line; do [ -n "$line" ] && printf 'Environment="%s"\n' "$line"; done <<< "$ENGINE_CHECK_SETTINGS"
 }
 
 engine_unit_text() {
@@ -530,11 +550,22 @@ check_systemd() {
   same_file "$UNIT" "$(unit_text)" 644 root:root && same_file "$ENGINE_UNIT" "$(engine_unit_text)" 644 root:root
 }
 apply_systemd() {
+  local engine_changed=0 busy
   put_file "$UNIT" 644 root:root "$(unit_text)" || true
-  put_file "$ENGINE_UNIT" 644 root:root "$(engine_unit_text)" || true
+  put_file "$ENGINE_UNIT" 644 root:root "$(engine_unit_text)" && engine_changed=1
   systemctl daemon-reload
   # Installed, not started: the operator fills in config.yaml and bulava.env, runs
   # `arceus-runner check`, then `systemctl enable --now bulava-engine runner`.
+  # A running engine keeps its old environment until it restarts, and a restart ends the workers'
+  # sessions: only between tasks, as the engine itself is swapped.
+  if [ "$engine_changed" = 1 ] && systemctl is-active --quiet bulava-engine 2>/dev/null; then
+    busy="$(running_bulava_tasks | tr '\n' ' ')"
+    if [ -z "${busy// /}" ]; then
+      systemctl restart bulava-engine && say "  bulava-engine restarted with the new settings"
+    else
+      say "  bulava-engine has a task running ($busy): restart it between tasks (sudo systemctl restart bulava-engine)"
+    fi
+  fi
 }
 
 # Grafana, Prometheus, Loki, Alloy and node_exporter in Docker, all on 127.0.0.1.

@@ -90,6 +90,21 @@ bulava:
   claude_effort: auto                  # auto | none (haiku) | low | medium | high | xhigh | max | ultracode
   codex_model: auto                    # auto | a slug from `night-shift models codex`; review, consultations, report
   codex_effort: auto                   # auto | low | medium | high | xhigh | max | ultra
+  start_handshake_wait: 30s            # 5s–2m: a new session's hooks confirm the run, or the start is rolled back
+  # Independent checks before Codex (engine/SERVER.md): after a green build, a code review and a
+  # security review in Claude sessions that never saw the ticket. Findings at min_severity or above go
+  # back to the agent `rounds` times per task; it fixes or declines each, and Codex decides, seeing
+  # them all. Once the rounds are spent the engine does not run the checks again for that task, so
+  # fixes after review comments and red CI go to Codex alone. The review gate reads these from
+  # bulava-engine.service: after a change run `sudo ./setup.sh` and restart bulava-engine between
+  # tasks; `arceus-runner doctor` says FAIL until the running engine has them.
+  claude_checks:
+    enabled: true
+    kinds: [code, security]
+    min_severity: high                 # critical | high | medium | low
+    rounds: 1                          # 1–5
+    timeout: 15m                       # per check, 1m–30m; they run side by side
+    required: true                     # a check that did not run stops the task for a person; false: Codex alone
 
 # The security screen: every ticket, comment and CI log is read by a classifier (Claude, no tools)
 # before the agent gets it. A suspicious text is held, and the task waits for a reviewer's

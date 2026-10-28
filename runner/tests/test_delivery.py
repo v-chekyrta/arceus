@@ -38,7 +38,8 @@ def no_real_tools(monkeypatch):
 
 
 class World:
-    def __init__(self, tmp: Path, secrets, engine_dir: Path | None = None, engine_env: dict | None = None):
+    def __init__(self, tmp: Path, secrets, engine_dir: Path | None = None, engine_env: dict | None = None,
+                 claude_checks: dict | None = None):
         self.tmp = tmp
         self.engine_env = engine_env or {}
         if engine_dir is None:
@@ -50,6 +51,10 @@ class World:
                 f = engine_dir / "bin" / script
                 f.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_ENGINE}" {cmd} "$@"\n')
                 f.chmod(0o755)
+            # A review gate that runs the independent checks, as the probe looks for it.
+            (engine_dir / "hooks").mkdir()
+            (engine_dir / "hooks" / "review-gate.sh").write_text(
+                '#!/bin/bash\nif [ -n "${IDIR_SCOPE:-}" ] && claude_checks_enabled; then :; fi\n')
         (tmp / "bulava.env").write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test\n")
         (tmp / "bulava.env").chmod(0o600)
 
@@ -75,6 +80,7 @@ class World:
             "db": str(tmp / "runner.db"), "events": str(tmp / "events.jsonl"),
         }
         raw["bulava"]["mcp_config"] = None
+        raw["bulava"]["claude_checks"].update(claude_checks or {})
         raw["health"].pop("devstack_check", None)
         self.cfg = Config.model_validate(raw)
         self.secrets = secrets
@@ -188,6 +194,7 @@ def test_ticket_to_merge_request(w):
     # Bulava gets the Claude token and the engine settings, never the runner's own tokens.
     assert d["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
     assert d["env"]["SUPERVISOR_PROFILE"] == "server" and d["env"]["SUPERVISOR_REPORT_LANGUAGE"] == "English"
+    assert d["env"]["SUPERVISOR_HANDSHAKE_WAIT"] == "30"   # a cold Claude takes longer than the engine's 5 s
     assert str(w.cfg.paths.secrets) in d["env"]["SUPERVISOR_SERVER_EXTRA_SECRET_PATHS"]
     assert GL_TOKEN not in json.dumps(w.engine_state()) and w.secrets.youtrack not in json.dumps(w.engine_state())
     assert [c["argv"][0] for c in w.calls("night-shift") if c["argv"][0] != "doctor"][:2] == ["trust", "mcp-decide"]
@@ -1110,3 +1117,36 @@ def test_a_follow_up_called_directly_still_waits_for_the_workspace(w):
     other = occupy(w)
     assert w.runner.delivery._followup_ready(w.store.task("ACME-1")) is False
     assert set(branches(w).values()) == {other}
+
+
+def test_the_engine_gets_the_independent_checks_from_config_and_never_from_bulava_env(w):
+    (w.tmp / "bulava.env").write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test\nSUPERVISOR_CLAUDE_CHECKS=0\n"
+                                      "SUPERVISOR_CLAUDE_CHECKS_ROUNDS=5\n")
+    take(w)
+    [d] = w.calls("dispatch")
+    assert (d["env"]["SUPERVISOR_CLAUDE_CHECKS"], d["env"]["SUPERVISOR_CLAUDE_CHECKS_LIST"],
+            d["env"]["SUPERVISOR_CLAUDE_CHECKS_ROUNDS"]) == ("1", "code security", "1")
+    [e] = w.events_named("task_dispatched")
+    assert (e["claude_checks"], e["claude_checks_rounds"], e["claude_checks_required"]) == ("code security", 1, True)
+
+
+def test_a_required_check_that_did_not_run_is_not_called_codex_s_decision(w):
+    take(w)
+    w.agent_commits()
+    w.settle("ACME-1", "failed", review="failed", state_reason="needs-user")
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(
+        review_why="independent check failed (security) and SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1"))
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed"
+    assert task.reason.startswith("an independent Claude check (code or security review) did not run")
+    assert w.remote_branch("agent/ACME-1-fix-login-page") is None and w.gl.mrs == []
+    assert any("independent check failed (security)" in t for t in w.bot_comments())
+
+
+def test_a_person_asked_by_codex_is_still_codex_s_decision(w):
+    take(w)
+    w.agent_commits()
+    w.settle("ACME-1", "failed", review="failed", state_reason="needs-user")
+    w.tick()
+    assert w.store.task("ACME-1").reason == "Codex handed the decision to a person"
