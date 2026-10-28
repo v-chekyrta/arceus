@@ -13,6 +13,7 @@ from arceus_runner.http import AUTH_RETRY_SECONDS
 
 from .conftest import FakeClock, read_events
 from .fakes import FakeGitLab, FakeYouTrack
+from .test_cleanup import FakeDocker
 
 # A Tuesday at 10:00 in Kyiv: working hours, so the poll interval is 2 minutes.
 WORKING = datetime(2026, 10, 20, 7, 0, tzinfo=UTC)
@@ -31,6 +32,8 @@ def own_home(tmp_path, monkeypatch):
 def no_real_tools(monkeypatch):
     # Health must not depend on what is installed on the machine running the tests.
     monkeypatch.setattr("arceus_runner.health.shutil.which", lambda name: f"/usr/bin/{name}")
+    # That makes Docker look installed too: run() must not then send its cleanup pass to the host's Docker.
+    monkeypatch.setattr(loop, "Docker", FakeDocker)
 
 
 class World:

@@ -166,12 +166,6 @@ def test_repository_mapping_keys_are_refused_with_what_to_do(tmp_path):
     assert "bulava.multi_repo_tasks is no longer used" in text
 
 
-def test_models_default_to_auto_and_pass_nothing():
-    b = load_config(EXAMPLE).bulava
-    assert (b.claude_model, b.claude_effort, b.codex_model, b.codex_effort) == ("auto",) * 4
-    assert b.model_env() == {}
-
-
 def test_chosen_models_become_the_engine_variables(tmp_path):
     raw = example_raw()
     raw["bulava"].update(claude_model="opus", claude_effort="none", codex_model="gpt-6.1-sol", codex_effort="ultra")
@@ -223,13 +217,6 @@ def test_a_chosen_model_needs_an_engine_that_takes_it(tmp_path, monkeypatch):
     new = bulava.probe(_engine(tmp_path / "new", ': "${SUPERVISOR_CLAUDE_MODEL:=}"\n',
                                '#!/bin/sh\ncase "${NIGHT_SHIFT_SETTINGS:-}" in off) ;; esac\n'))
     assert new.missing_for_models() == [] and models_check(cfg, new).status == "ok"
-
-
-def test_independent_checks_are_on_and_every_value_is_passed_to_the_engine():
-    c = load_config(EXAMPLE).bulava.claude_checks
-    assert c.env() == {"SUPERVISOR_CLAUDE_CHECKS": "1", "SUPERVISOR_CLAUDE_CHECKS_LIST": "code security",
-                       "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY": "high", "SUPERVISOR_CLAUDE_CHECKS_ROUNDS": "1",
-                       "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": "900", "SUPERVISOR_CLAUDE_CHECKS_REQUIRED": "1"}
 
 
 def test_independent_checks_turned_off_say_so_to_the_engine(tmp_path):
@@ -323,6 +310,7 @@ def test_the_review_gate_must_run_with_what_config_yaml_says(tmp_path, monkeypat
 
 def test_engine_env_prints_what_setup_writes_into_the_engine_unit(capsys):
     assert main(["--config", str(EXAMPLE), "engine-env"]) == EXIT_OK
-    lines = capsys.readouterr().out.splitlines()
-    assert "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1" in lines and "SUPERVISOR_CLAUDE_CHECKS_LIST=code security" in lines
-    assert len(lines) == 6
+    assert sorted(capsys.readouterr().out.splitlines()) == [
+        "SUPERVISOR_CLAUDE_CHECKS=1", "SUPERVISOR_CLAUDE_CHECKS_LIST=code security",
+        "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY=high", "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1",
+        "SUPERVISOR_CLAUDE_CHECKS_ROUNDS=1", "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT=900"]

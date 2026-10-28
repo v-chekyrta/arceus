@@ -101,7 +101,8 @@ def test_ticket_to_mr_through_the_real_engine(w):
     show = w.runner.delivery.engine.show("ACME-1")
     assert show["state"] == "running" and show["branch"] == task.branch
     assert git(w.repo, "symbolic-ref", "--short", "HEAD") == task.branch  # the engine made the branch
-    assert "UNTRUSTED_TRACKER_TEXT source=youtrack author=j.doe" in show["objective"] or show["objective"]
+    # The ticket reaches the agent framed as what a person wrote, not as the engine's own instruction.
+    assert "<<UNTRUSTED_TRACKER_TEXT source=youtrack author=j.doe>>\nACME-1: Add health endpoint" in show["objective"]
 
     sha = w.agent_commits("health.txt")
     settle(w, "ACME-1", "passed", {"schema": 1, "result": "succeeded_changes", "summary": "done", "task_id": "ACME-1"})

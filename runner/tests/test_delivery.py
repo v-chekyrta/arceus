@@ -218,6 +218,7 @@ def test_ticket_to_merge_request(w):
     mr = w.gl.mrs[0]
     assert (mr["source_branch"], mr["target_branch"], mr["title"], mr["labels"]) == (
         "agent/ACME-1-fix-login-page", "main", "ACME-1: Fix login page", "agent")
+    assert "Screenshots" not in mr["description"] and w.gl.uploads == [] and w.yt.attachments == {}  # no media
     assert w.yt.issue_fields["2-1"]["State"] == {"name": "Code Review"}
     assert any(mr["web_url"] in t for t in w.bot_comments())
     assert w.store.task("ACME-1").state == "code_review"
@@ -467,7 +468,7 @@ def test_push_taken_by_the_server_before_an_error_still_gets_its_mr(w, monkeypat
 
 def test_sibling_missing_from_the_group_means_no_push_at_all(w):
     take(w)
-    sha = w.agent_commits()
+    w.agent_commits()  # the primary repository has a real change, and still nothing may go out
     other = w.cfg.paths.workspace / "acme-extra"
     subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
     git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
@@ -483,7 +484,6 @@ def test_sibling_missing_from_the_group_means_no_push_at_all(w):
     # A repository the task was never given is refused before anything is pushed, even the real change.
     assert "nothing was pushed" in w.store.task("ACME-1").reason
     assert any("acme-extra: not one of this task's repositories" in c for c in w.bot_comments())
-    assert sha  # the primary repository had a real change, and still nothing went out
 
 
 def test_mr_closed_by_a_person_after_a_crash_is_not_recreated(w):
@@ -827,38 +827,46 @@ def test_everything_the_runner_writes_to_people_is_in_english(w):
 def test_clones_are_readable_by_the_dev_stacks_containers(w):
     """The runner's private umask must not leak into the workspace (nginx in a container reads it)."""
     import os
+    seed = w.tmp / "seed" / "acme-theme"
+    (seed / "theme.css").write_text("a{}\n")
+    git(seed, "add", "theme.css")
+    git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "theme")
+    git(seed, "push", "-q", str(w.origins["acme-theme"]), "main")
     old = os.umask(0o077)
     try:
+        take(w)  # clones every repository of the group under the runner's own umask
         theme = w.cfg.paths.workspace / "acme-theme"
-        take(w)
-        tracked = [p for p in theme.rglob("*") if p.is_file() and ".git" not in p.parts]
-        (w.repo / "conf.txt").write_text("x")
-        (w.repo / "conf.txt").chmod(0o600)
-        git(w.repo, "add", "conf.txt")
-        assert w.runner.delivery.git.fix_modes(w.repo) >= 1
-        assert oct((w.repo / "conf.txt").stat().st_mode & 0o777) == "0o644"
-        assert all(p.stat().st_mode & 0o044 == 0o044 for p in tracked)
+        assert oct((theme / "theme.css").stat().st_mode & 0o777) == "0o644"
         assert (theme.stat().st_mode & 0o055) == 0o055
     finally:
         os.umask(old)
 
+
+def test_a_tracked_file_left_private_gets_the_mode_git_records(w):
+    take(w)
+    (w.repo / "conf.txt").write_text("x")
+    (w.repo / "conf.txt").chmod(0o600)
+    git(w.repo, "add", "conf.txt")
+    assert w.runner.delivery.git.fix_modes(w.repo) == 1
+    assert oct((w.repo / "conf.txt").stat().st_mode & 0o777) == "0o644"
 
 
 def test_debt_after_a_codex_pass_says_so_instead_of_blaming_codex(w):
     take(w)
     w.agent_commits()
     w.settle("ACME-1", "failed", review="debt", state_reason="debt",
-             outcome={"result": "succeeded_changes", "summary": "Error pages added"})
+             outcome={"result": "succeeded_changes", "summary": "Codex: Error pages added"})
     w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(
         review_why="STATE: COMPLETE\nVERDICT: PASS\n\nChecked.",
-        findings=[{"kind": "note", "text": "/oauth/ is not proxied by the MFE nginx"}]))
+        findings=[{"kind": "note", "text": "**Claude Code:** /oauth/ is not proxied by the MFE nginx"}]))
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "failed"
     assert task.reason.startswith("The change passed review, but the automated checks did not confirm it")
     [note] = [t for t in w.bot_comments() if "The change passed review" in t]
-    assert "acme-platform" in note and "/oauth/ is not proxied" in note and "Error pages added" in note
-    assert "inconclusive" not in note
+    assert "acme-platform" in note and "- /oauth/ is not proxied" in note
+    assert "Summary of the work: Error pages added" in note
+    assert "inconclusive" not in note and not re.search(r"Codex|Claude|Bulava", note)  # labels taken off
     assert w.gl.mrs == []
 
 
@@ -991,15 +999,6 @@ def test_a_refused_upload_does_not_hold_the_mr_back(w):
     assert any("a.png" in e["detail"] for e in w.events_named("media_skipped"))
 
 
-def test_no_media_folder_changes_nothing(w):
-    take(w)
-    w.agent_commits()
-    w.settle("ACME-1", "waiting_review")
-    w.tick()
-    [mr] = w.gl.mrs
-    assert "Screenshots" not in mr["description"] and w.gl.uploads == [] and w.yt.attachments == {}
-
-
 def test_a_crash_after_the_uploads_does_not_upload_again(w):
     take(w)
     w.agent_commits()
@@ -1096,7 +1095,6 @@ def test_a_follow_up_never_switches_a_repository_with_uncommitted_work(w):
         w.tick()
     assert w.calls("worker-send") == [] and set(branches(w).values()) == {other}
     assert (w.repo / "wip.txt").read_text() == "ACME-2's work, not committed yet\n"
-    assert w.runner.delivery._followup_ready(w.store.task("ACME-1")) is False
     [wait] = [e for e in w.events_named("followup_waits") if e["task_id"] == "ACME-1"]
     assert (wait["reason"], wait["repos"]) == ("uncommitted_changes", ["acme-platform"])
 
@@ -1113,13 +1111,6 @@ def test_uncommitted_work_on_the_tasks_own_branch_does_not_hold_its_follow_up(w)
     w.tick()
     assert len(w.calls("worker-send")) == 1 and not w.events_named("followup_waits")
     assert (w.repo / "wip.txt").exists()
-
-
-def test_a_follow_up_called_directly_still_waits_for_the_workspace(w):
-    _ask(w)
-    other = occupy(w)
-    assert w.runner.delivery._followup_ready(w.store.task("ACME-1")) is False
-    assert set(branches(w).values()) == {other}
 
 
 def test_the_engine_gets_the_independent_checks_from_config_and_never_from_bulava_env(w):
@@ -1165,20 +1156,6 @@ def test_a_model_or_engine_label_at_a_line_start_goes_and_the_same_word_in_the_t
     assert unattributed("- Codex: a\n- **Claude Code:** b\n1. [Bulava]: c\nClaude: d") == "- a\n- b\n1. c\nd"
     assert unattributed("Ran `codex exec`: fine\nuse the Codex API: it works") == \
         "Ran `codex exec`: fine\nuse the Codex API: it works"
-
-
-def test_a_labelled_summary_and_review_notes_are_published_without_the_label(w):
-    take(w)
-    w.agent_commits()
-    w.settle("ACME-1", "failed", review="debt", state_reason="debt",
-             outcome={"result": "succeeded_changes", "summary": "Codex: tests are missing"})
-    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(
-        review_why="STATE: COMPLETE\nVERDICT: PASS\n\nChecked.",
-        findings=[{"kind": "note", "text": "**Claude Code:** the fixture is stale"}]))
-    w.tick()
-    [note] = [t for t in w.bot_comments() if "The change passed review" in t]
-    assert "Summary of the work: tests are missing" in note and "- the fixture is stale" in note
-    assert not re.search(r"Codex|Claude|Bulava", note)
 
 
 def test_a_failure_recorded_by_an_earlier_version_is_posted_once_with_its_own_key(w):
