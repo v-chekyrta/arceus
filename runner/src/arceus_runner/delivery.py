@@ -28,6 +28,7 @@ from arceus_runner.db import ACTIVE_STATES, TaskStore, Task, TriggerDecision
 from arceus_runner.engine import Engine, EngineError, Reply
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import HOME_BRANCH, Git, GitError
+from arceus_runner.progress import task_key
 from arceus_runner.http import BadRequest, NotFound, ServiceError
 from arceus_runner.integrations import (
     CodeHost,
@@ -39,7 +40,7 @@ from arceus_runner.integrations import (
     key_part,
     usable_repos,
 )
-from arceus_runner.screening import Classify, Gate, trusted
+from arceus_runner.screening import Classify, Gate, is_decision, trusted
 
 START_REFUSED = {
     76: "the repository folder is not a git repository",
@@ -166,7 +167,9 @@ class Delivery:
         self._skipped: set[tuple[str, str]] = set()  # (issue key, tag event) not takeable: not tried again
         self._engine_seen: dict[str, tuple] = {}  # task id → the engine's state last written as engine_state
         self._waiting: dict[str, tuple] = {}  # task id → why its follow-up waits, as last written as followup_waits
+        self.published: set[str] = set()  # tasks published since the loop last read their MRs (loop.tick)
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
+        self.reviewer = None  # code_review.ReviewAgent, set by the loop: its runs hold the workspace too
 
     # -- comments: once per (task, kind), even across a crash -----------------------------------
 
@@ -226,8 +229,8 @@ class Delivery:
     def maybe_start(self, can_take: bool) -> None:
         if not can_take or self.workspace_taken():
             return
-        if self.store.has_pending_review() or self._continues_waiting():
-            return  # fixes for open MRs and resumed tasks go first
+        if self.store.has_pending_review() or self._continues_waiting() or (self.reviewer and self.reviewer.waiting()):
+            return  # fixes for open MRs, resumed tasks and requested code reviews go first
         for decision in self.store.accepted_untaken():
             if self.skipped(decision):
                 continue
@@ -368,8 +371,12 @@ class Delivery:
         """The task working in the shared workspace now, other than `task`; None when it is free.
 
         Every repository of the group and the home are one checkout, so whatever switches a branch
-        there waits for it. A task's own resume or nudge does not wait for itself.
+        there waits for it. A task's own resume or nudge does not wait for itself; it does wait for a
+        code review of its own ticket (code_review.py), which has the workspace switched to the MRs.
         """
+        reviewed = self.reviewer.holding() if self.reviewer else None
+        if reviewed is not None:
+            return reviewed
         return next((t for t in self.store.tasks(*ACTIVE_STATES) if task is None or t.task_id != task.task_id), None)
 
     def _workspace_waits(self, task: Task) -> bool:
@@ -488,8 +495,9 @@ class Delivery:
         show = self.engine.show(task.task_id)
         if task.state == "claimed":
             if show is None:  # crashed between taking it and the dispatch, or released by a security reviewer
-                if any(t.task_id != task.task_id for t in self.store.tasks("dispatched", "publishing")):
-                    return  # another task works in the shared workspace: this one starts after it
+                if any(t.task_id != task.task_id for t in self.store.tasks("dispatched", "publishing")) \
+                        or (self.reviewer and self.reviewer.holding()):
+                    return  # another task or a code review works in the shared workspace: this one starts after it
                 self._take(task, self._group(), self.tracker.issue(task.task_id))
                 return
             # The engine has it: the dispatch went through before a crash. Start the clock now if the
@@ -534,6 +542,13 @@ class Delivery:
                 # banks it as debt; nothing is pushed either way, so it is an answer, not a failure.
                 self.review.answered_without_changes(task, outcome.get("summary") or "")
                 return
+            if why == "debt" and self._passed_before(task, receipt, outcome):
+                # The work was committed and passed review in an earlier attempt that ended without a declared
+                # outcome; this one only said so. Bulava banks the empty diff as debt, but every commit in it
+                # is one a passing review saw, so it is published as that review left it.
+                self.events.emit("published_earlier_pass", task_id=task.task_id, attempt=len(attempts))
+                self.publish(task, show | {"receipt": receipt | {"review": "passed"}})
+                return
             if why == "debt" and "VERDICT: PASS" in (receipt.get("review_why") or ""):
                 # Codex passed it; Bulava's own verifier did not prove it with a build/test run.
                 failed, unproven = self._verifier_gaps(receipt)
@@ -561,6 +576,42 @@ class Delivery:
             self.fail(task, reason, outcome.get("summary") or "", attempt=len(attempts))
         else:
             self.events.emit("unknown_engine_state", task_id=task.task_id, state=state)
+
+    def _passed_without_outcome(self, task: Task, show: dict) -> bool:
+        """`waiting_review` with a passed last attempt but no receipt: every repository `task show` lists is at
+        its base or at the commit the engine recorded as passed (`repo_reviewed`), and one of them moved."""
+        attempts = show.get("attempts") or []
+        if show.get("state_reason") != "passed" or not attempts or attempts[-1].get("review") != "passed":
+            return False
+        repos = show.get("repos") or []
+        changed = [r for r in repos if (r.get("reviewed_sha") or "") != (r.get("base_sha") or "")]
+        passed = self._repo_reviewed(task)
+        return bool(changed) and all(r.get("clean") and passed.get(r.get("path")) == r.get("reviewed_sha")
+                                     for r in changed)
+
+    def _repo_reviewed(self, task: Task) -> dict:
+        """The engine's record of what the last passing review saw in each repository (tasks.sh, on a pass only)."""
+        try:
+            data = json.loads((self.cfg.paths.bulava_state / "tasks" / task_key(task.task_id) / "task.json")
+                              .read_text())
+        except (OSError, ValueError):
+            return {}
+        return data.get("repo_reviewed") or {}
+
+    def _passed_before(self, task: Task, receipt: dict, outcome: dict) -> bool:
+        """An attempt that only declared the outcome an earlier one left out: no MR yet, an empty-diff no-change
+        or research claim, and every repository at the commit the last passing review saw (the engine records
+        it as `repo_reviewed`, on a pass only), with at least one of them past its base."""
+        if self.store.task_mrs(task.task_id) or outcome.get("result") not in ("succeeded_no_change",
+                                                                              "succeeded_research"):
+            return False
+        if "with an empty diff" not in (receipt.get("review_why") or ""):
+            return False
+        passed = self._repo_reviewed(task)
+        repos = receipt.get("repos") or []
+        changed = [r for r in repos if (r.get("reviewed_sha") or "") != (r.get("base_sha") or "")]
+        return bool(changed) and all(r.get("clean") and passed.get(r.get("path")) == r.get("reviewed_sha")
+                                     for r in changed)
 
     def _note_engine_state(self, task: Task, show: dict) -> None:
         """An `engine_state` line when what `task show` says changes; nothing on a tick where it does not.
@@ -789,9 +840,12 @@ class Delivery:
                 after = task.question_at_ms or 0
                 # >=: a reply in the same millisecond as the question counts. The engine dedups by
                 # message id, so a comment seen twice is sent once.
+                # A request for a code review is the reviewer's (code_review.py), never an answer to the agent.
                 answer = next((x for x in self.tracker.comments(task.issue_db_id)
                                if x.created >= after and x.author != c.bot_user and x.author in c.allowed_users
-                               and x.text.strip()), None)
+                               and x.text.strip() and not is_decision(x.text)
+                               and not (self.reviewer and self.reviewer.claims(task.task_id, x))),
+                              None)
                 if not answer:
                     self._unanswered(task)
                     continue
@@ -926,7 +980,7 @@ class Delivery:
                                    published_at_ms=data.get("created") or int(self.now().timestamp() * 1000))
             if hasattr(self.store, "signals"):
                 self.store.drop_signals([sg.id for sg in self.store.signals(task.task_id, unbatched=True)
-                                         if sg.kind == "ticket"], "continue")
+                                         if sg.kind in ("ticket", "code_review")], "continue")
             self.store.action_done(key, json.dumps({"attempt": attempt}))
             cid = key_part(data["comment"], keep_dash=True)
             self.store.action_intent(f"{task.task_id}:untag:{tag}:{cid}", task.task_id, "untag",
@@ -1002,6 +1056,13 @@ class Delivery:
 
     def publish(self, task: Task, show: dict) -> None:
         receipt = show.get("receipt") or {}
+        if not receipt.get("review") and self._passed_without_outcome(task, show):
+            # The attempt passed review but ended without a declared outcome, so Bulava wrote no receipt (staging,
+            # TTTLIN-29 and TTTLIN-37). What the review accepted is in `task show` and in `repo_reviewed`.
+            self.events.emit("published_without_outcome", task_id=task.task_id,
+                             attempt=len(show.get("attempts") or []))
+            receipt = {"review": "passed", "repos": show["repos"], "no_outcome": True}
+            show = show | {"receipt": receipt}
         if receipt.get("review") != "passed":
             self.fail(task, f"the review verdict is \"{receipt.get('review')}\", nothing to publish",
                       attempt=len(show.get("attempts") or []))
@@ -1144,8 +1205,11 @@ class Delivery:
             description = self._mr_description(task, show, path, r, shots)
             existed = {m.repo: m for m in self.store.task_mrs(task.task_id)}.get(repo.relative_path)
             mr = self._open_mr(repo, task, branch, description, after_closed=bool(r.get("after_closed")))
-            if existed or mr.state != "opened" or self.store.task_mrs(task.task_id):
-                self.host.set_description(repo.id, mr.iid, description)  # a later round: describe what is there now
+            if (existed or mr.state != "opened" or self.store.task_mrs(task.task_id)) \
+                    and not (receipt.get("no_outcome") and existed):
+                # A later round: describe what is there now. A round that declared no outcome has nothing to say
+                # about the work, so the MR keeps its description rather than losing "What was done".
+                self.host.set_description(repo.id, mr.iid, description)
             self.store.upsert_mr(task.task_id, repo.relative_path, repo.id, mr.iid, mr.url, sha)
             urls.append(mr.url)
             self.events.emit("mr_ready", task_id=task.task_id, repo=repo.relative_path, mr_iid=mr.iid, url=mr.url)
@@ -1166,6 +1230,7 @@ class Delivery:
         self.store.update_task(task.task_id, state="code_review", reason=None,
                                published_at_ms=task.published_at_ms or (posted[1] if posted else None))
         self.events.emit("task_published", task_id=task.task_id, mrs=urls, round=follow_up)
+        self.published.add(task.task_id)
 
     def _open_mr(self, repo: Repo, task: Task, branch: str, description: str, after_closed: bool) -> MergeRequest:
         """The branch's MR, created unless it already has one (a retry after a crash, or a person closed it).

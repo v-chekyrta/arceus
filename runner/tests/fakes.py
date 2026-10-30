@@ -46,6 +46,9 @@ class FakeYouTrack:
                                       "customFields": [{"name": k, "value": v} for k, v in fields.items()]})
             if method == "POST" and not rest:
                 for f in json.loads(request.content)["customFields"]:
+                    if f["name"] == "State" and f["value"]["name"] not in self.states:  # as YouTrack answers it
+                        return json_response({"error": "bad request", "error_description": "Unknown state"}, 400)
+                for f in json.loads(request.content)["customFields"]:
                     self.issue_fields.setdefault(db_id, {})[f["name"]] = f["value"]
                 return json_response({"id": db_id})
             if rest == ["comments"] and method == "GET":
@@ -157,6 +160,8 @@ class FakeGitLab:
         self.uploads: list[tuple[int, str, bytes]] = []  # (project id, file name, content)
         self.refuse_uploads = False
         self._note = 1000
+        self.tokens: dict[str, str] = {}  # token → username, for a second account (the approver); else the bot
+        self.refuse_approval: int | None = None  # the status an approval gets, as for an account without rights
 
     def mr(self, iid: int) -> dict:
         return next(m for m in self.mrs if m["iid"] == iid)
@@ -208,8 +213,25 @@ class FakeGitLab:
                     mr.update(state="closed", closed_by={"username": self.username})
                 mr.update(body)
                 return json_response(mr)
+            if tail == ["approvals"]:
+                return json_response({"approved_by": [{"user": {"username": u}} for u in mr.get("approved_by", [])]})
+            if tail == ["approve"] and request.method == "POST":
+                who = self.tokens.get(request.headers.get("private-token"), self.username)
+                if self.refuse_approval or who == self.username:  # GitLab's default: an author may not approve
+                    return json_response({"message": "401 Unauthorized"}, self.refuse_approval or 401)
+                if mr.get("sha") and json.loads(request.content).get("sha") != mr["sha"]:
+                    return json_response({"message": "SHA does not match HEAD of source branch"}, 409)
+                mr.setdefault("approved_by", []).append(who)
+                return json_response({"approved": True}, 201)
+            if tail == ["unapprove"] and request.method == "POST":
+                who = self.tokens.get(request.headers.get("private-token"), self.username)
+                if who not in mr.get("approved_by", []):
+                    return json_response({"message": "404 Not Found"}, 404)
+                mr["approved_by"].remove(who)
+                return json_response({}, 201)
             if tail == ["notes"] and request.method == "POST":
-                self.note(iid, self.username, json.loads(request.content)["body"])
+                who = self.tokens.get(request.headers.get("private-token"), self.username)
+                self.note(iid, who, json.loads(request.content)["body"])
                 return json_response({"id": self._note}, 201)
             if tail == ["discussions"]:
                 page = int(request.url.params.get("page", 1))

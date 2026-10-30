@@ -246,6 +246,52 @@ def test_two_mrs_need_both_merged(w):
     assert w.store.task("ACME-1").state == "done" and any("are merged" in t for t in w.bot_comments())
 
 
+def merged_world(tmp_path, secrets, merged="unset", board=("Testing",)) -> World:
+    states = {"queued": "To Do", "in_progress": "In Progress", "code_review": "Code Review"}
+    w = World(tmp_path, secrets, settings={"tracker": {"states": states | ({} if merged == "unset" else
+                                                                         {"merged": merged})}})
+    w.yt.states += list(board)
+    published(w)
+    w.gl.mrs[0]["state"] = "merged"
+    return w
+
+
+def test_a_merged_task_moves_its_ticket_to_testing_by_default(tmp_path, secrets):
+    w = merged_world(tmp_path, secrets)
+    later(w)
+    assert w.store.task("ACME-1").state == "done"
+    assert w.yt.issue_fields["2-1"]["State"] == {"name": "Testing"}
+    assert [e["state"] for e in w.events_named("ticket_moved")] == ["Testing"]
+
+
+def test_a_board_with_its_own_name_for_testing_is_set_in_the_config(tmp_path, secrets):
+    w = merged_world(tmp_path, secrets, merged="QA", board=("QA",))
+    later(w)
+    assert w.yt.issue_fields["2-1"]["State"] == {"name": "QA"}
+
+
+def test_a_board_without_that_state_still_ends_the_task(tmp_path, secrets):
+    w = merged_world(tmp_path, secrets, board=())
+    later(w)
+    assert w.store.task("ACME-1").state == "done" and any("are merged" in t for t in w.bot_comments())
+    assert w.yt.issue_fields["2-1"]["State"] == {"name": "Code Review"}
+    assert [e["state"] for e in w.events_named("ticket_move_failed")] == ["Testing"]
+
+
+def test_null_leaves_a_merged_ticket_in_code_review(tmp_path, secrets):
+    w = merged_world(tmp_path, secrets, merged=None)
+    later(w)
+    assert w.store.task("ACME-1").state == "done"
+    assert w.yt.issue_fields["2-1"]["State"] == {"name": "Code Review"} and not w.events_named("ticket_moved")
+
+
+def test_a_ticket_a_person_moved_on_stays_where_they_put_it(tmp_path, secrets):
+    w = merged_world(tmp_path, secrets)
+    w.yt.issue_fields["2-1"]["State"] = {"name": "Done"}
+    later(w)
+    assert w.yt.issue_fields["2-1"]["State"] == {"name": "Done"} and not w.events_named("ticket_moved")
+
+
 def test_a_follow_up_without_changes_answers_and_stays_in_review(w):
     published(w)
     d = w.gl.note(1, "reviewer", "@acme-agent-bot Why not use the cache here?")
@@ -319,6 +365,24 @@ def test_fixes_for_open_mrs_go_before_new_tasks(w):
     assert [c["argv"][1] for c in w.calls("dispatch")] == ["ACME-1"]     # ACME-2 waits
     later(w)
     assert len(sends(w)) == 1 and [c["argv"][1] for c in w.calls("dispatch")] == ["ACME-1"]
+
+
+def test_a_note_written_during_the_repair_goes_before_a_ticket_queued_meanwhile(w):
+    # Staging, TTTLIN-45: the round was published and a new ticket taken in the same tick, before the MR
+    # poll of that tick had a chance to see the note people left while the agent worked.
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Rename it")
+    w.tick()
+    later(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot And fix the throttle race")      # while the agent works
+    w.yt.add_issue(2, ("b1", "j.doe", "+agent"))
+    w.tick()
+    fix_and_settle(w)
+    w.tick()                                                                  # publishes the round
+    assert w.store.task("ACME-1").state == "code_review"
+    assert [c["argv"][1] for c in w.calls("dispatch")] == ["ACME-1"]          # ACME-2 still waits
+    later(w)
+    assert len(sends(w)) == 2 and "throttle race" in sends(w)[1]["argv"][-1]
 
 
 # -- the windows found on review (each one a sequence that used to lose or duplicate work) -------
@@ -429,6 +493,39 @@ def test_red_ci_that_turns_green_while_waiting_is_not_sent(w):
     later(w)
     assert len(sends(w)) == 1 and w.events_named("review_batch_dropped")
     assert w.store.task("ACME-1").state == "code_review"
+
+
+def test_a_conflict_resolved_before_its_round_goes_is_not_sent(w):
+    published(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict")
+    w.tick()                                                   # the conflict is recorded
+    w.gl.mrs[0].update(detailed_merge_status="mergeable")      # a /continue merged main in meanwhile
+    later(w)
+    later(w)
+    assert sends(w) == [] and w.store.task("ACME-1").state == "code_review"
+
+
+def test_a_conflict_batch_that_waited_is_dropped_once_it_merges_cleanly(w):
+    published(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict")
+    w.tick()
+    w.set_engine(lambda s: s["next_rc"].update({"worker-send": 6}))
+    later(w)                                                   # batch made, engine busy
+    w.gl.mrs[0].update(detailed_merge_status="mergeable")
+    later(w)
+    later(w)
+    assert len(sends(w)) == 1 and w.events_named("review_batch_dropped")[0]["reason"] == "nothing left to repair"
+    assert w.store.task("ACME-1").state == "code_review"
+
+
+def test_a_conflict_the_host_cannot_judge_yet_is_still_sent(w):
+    published(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict")
+    w.tick()
+    w.gl.mrs[0].update(detailed_merge_status="checking")
+    later(w)
+    [send] = sends(w)
+    assert "conflicts with main" in send["argv"][-1]
 
 
 def test_the_ticket_goes_back_to_in_progress_even_if_youtrack_fails_then(w):

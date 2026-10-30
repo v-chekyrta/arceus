@@ -342,10 +342,17 @@ def check_youtrack(c: YouTrackConfig, yt: YouTrack) -> list[Check]:
                          f"field {c.state_field!r} not in project; fields: {', '.join(sorted(fields))}"))
     else:
         values = bundle_values(state)
-        for key in ("queued", "in_progress", "code_review"):
+        for key in ("queued", "in_progress", "code_review", "merged"):
             want = getattr(c.states, key)
+            if want is None:
+                continue
             if want in values:
                 out.append(Check(f"youtrack.states.{key}", "ok", want))
+            elif key == "merged" and "merged" not in c.states.model_fields_set:
+                out.append(Check(f"youtrack.states.{key}", "warn",
+                                 f"the default {want!r} is not a {c.state_field} value, so merged tickets stay where "
+                                 f"they are; set tracker.states.merged to this board's column or null. Available: "
+                                 f"{', '.join(values)}"))
             else:
                 out.append(Check(f"youtrack.states.{key}", "fail",
                                  f"{want!r} is not a {c.state_field} value; available: {', '.join(values)}"))

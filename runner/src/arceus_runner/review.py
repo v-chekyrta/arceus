@@ -36,10 +36,12 @@ from arceus_runner import replies
 from arceus_runner.db import ReviewStore, Signal, Task
 from arceus_runner.engine import EngineError
 from arceus_runner.gitops import GitError
-from arceus_runner.http import ServiceError
+from arceus_runner.http import BadRequest, NotFound, ServiceError
 from arceus_runner.integrations import CodeHost, MRStatus, Note, key_part
+from arceus_runner.screening import is_decision
 
 KIND_TITLES = {
+    "code_review": "What the code review found that has to change",
     "review": "Review comments on the MR",
     "ci": "Failed CI",
     "conflict": "Conflicts with the target branch",
@@ -105,8 +107,10 @@ class ReviewLoop:
 
     # -- watching -------------------------------------------------------------------------------
 
-    def poll(self) -> None:
+    def poll(self, only: set[str] | None = None) -> None:
         for task in self.store.tasks("code_review"):
+            if only is not None and task.task_id not in only:
+                continue
             try:
                 if self._watch(task):
                     self._maybe_send(self.store.task(task.task_id))
@@ -130,6 +134,8 @@ class ReviewLoop:
                     self.store.withdraw_signal(_closed_id(mr))
             if st.state != "opened":
                 continue
+            if self.d.reviewer:
+                self.d.reviewer.approval_outlived(task, mr.project_id, mr.iid, st.sha)
             self._notes(task, mr, now)
             self._pipeline(task, mr, st, now)
             self._conflict(task, mr, st, now)
@@ -153,9 +159,14 @@ class ReviewLoop:
 
     def _notes(self, task: Task, mr, now: str) -> None:
         bot = self.cfg.code_host.bot_user
+        reviewer = self.d.reviewer
         for n in self.host.notes(mr.project_id, mr.iid, mr.url):
             if n.system or n.author == bot or not self.host.mentions_bot(n.body):
                 continue  # only a note that mentions the bot is a request to it
+            if n.author == getattr(self.host, "approver", "") and "<!-- arceus:" in n.body:
+                continue  # the code review's own note, signed by the approver; the person behind it may still ask
+            if reviewer and reviewer.is_mr_command(n.body):
+                continue  # the code review command: started from the ticket, and never a change request
             where = f" ({n.path}:{n.line})" if n.path else ""
             text = f"{n.author} in {mr.repo}{where}: {n.body.strip()}\n{n.url}"
             if self.store.add_signal(_note_signal(mr, n.id), task.task_id, "review", n.author, text, now,
@@ -224,6 +235,23 @@ class ReviewLoop:
             self.store.update_mr(task.task_id, mr.repo, handled_conflict=st.sha)
         self.events.emit("review_signal", task_id=task.task_id, kind="conflict", repo=mr.repo)
 
+    def _stale(self, task: Task, signals: list[Signal]) -> bool:
+        """Every signal is a CI run or a conflict that is over: the pipeline passed or was replaced, or the host
+        now says the MR merges cleanly (a `/continue` or another round merged the target in meanwhile). A
+        conflict the host cannot judge yet still counts."""
+        if not signals or any(s.kind not in ("ci", "conflict") for s in signals):
+            return False
+        mrs = {m.repo: m for m in self.store.task_mrs(task.task_id)}
+        for s in signals:
+            if s.kind == "ci":
+                if self._ci_still_failing(task, [s]):
+                    return False
+                continue
+            mr = mrs.get(s.repo)
+            if mr and self.host.mr_status(mr.project_id, mr.iid).conflict is not False:
+                return False
+        return True
+
     def _ci_still_failing(self, task: Task, signals: list[Signal]) -> bool:
         """A CI signal is worth sending only while that very pipeline is still the MR's, and red."""
         mrs = {m.repo: m for m in self.store.task_mrs(task.task_id)}
@@ -248,8 +276,13 @@ class ReviewLoop:
     def _ticket_comments(self, task: Task, now: str) -> None:
         c = self.cfg.tracker
         since = task.published_at_ms or 0
+        reviewer = self.d.reviewer
         for x in self.d.tracker.comments(task.issue_db_id):
             if x.created > since and x.author != c.bot_user and x.author in c.allowed_users and x.text.strip():
+                if reviewer and reviewer.claims(task.task_id, x):
+                    continue  # a request to the reviewer (code_review.py), not to the agent that wrote the code
+                if is_decision(x.text):
+                    continue  # a security reviewer's decision on a held text: the runner's, not a review comment
                 if self.store.add_signal(f"yt-{x.id}", task.task_id, "ticket", x.author,
                                          f"{x.author} on the ticket: {x.text.strip()}", now):
                     self.events.emit("review_signal", task_id=task.task_id, kind="ticket", author=x.author)
@@ -265,6 +298,17 @@ class ReviewLoop:
         return True
 
     def _finished(self, task: Task, mrs) -> None:
+        c = self.cfg.tracker
+        if c.states.merged and self.d.tracker.issue(task.task_id).state in (c.states.code_review,
+                                                                             c.states.in_progress):
+            # Only from where the runner put it: a ticket a person already moved on stays where they put it.
+            # A passing failure raises and the next poll tries again, since the task is not done yet; a board
+            # without that state does not keep the task open.
+            try:
+                self.d.tracker.set_state(task.issue_db_id, c.states.merged)
+                self.events.emit("ticket_moved", task_id=task.task_id, state=c.states.merged, reason="merged")
+            except (BadRequest, NotFound) as e:
+                self.events.emit("ticket_move_failed", task_id=task.task_id, state=c.states.merged, error=str(e)[:300])
         links = "\n".join(f"- {m.url}" for m in mrs)
         self.d.comment_once(task, "merged", f"All merge requests of this task are merged; the runner has stopped following it:\n{links}")
         self.store.update_task(task.task_id, state="done", reason="merge requests merged")
@@ -273,13 +317,15 @@ class ReviewLoop:
     # -- sending back ---------------------------------------------------------------------------
 
     def _maybe_send(self, task: Task) -> None:
+        if self.store.open_batch(task.task_id) is None and not self.store.signals(task.task_id, unbatched=True):
+            return  # nothing to send, so nothing waits for the workspace either
         if self.d._workspace_waits(task):
             return  # the workspace is shared: nothing is switched while another task works in it
         batch = self.store.open_batch(task.task_id)
-        if batch is not None and batch.ci_only and not self._ci_still_failing(task, self.store.signals(task.task_id,
-                                                                                                         batch.id)):
-            self.store.batch_sent(batch.id, "stale")  # the pipeline passed or was replaced while we waited
-            self.events.emit("review_batch_dropped", task_id=task.task_id, batch=batch.id, reason="CI no longer red")
+        if batch is not None and self._stale(task, self.store.signals(task.task_id, batch.id)):
+            self.store.batch_sent(batch.id, "stale")  # the pipeline passed or the conflict went while we waited
+            self.events.emit("review_batch_dropped", task_id=task.task_id, batch=batch.id,
+                             reason="CI no longer red" if batch.ci_only else "nothing left to repair")
             batch = None
         if batch is None:
             pending = self.store.signals(task.task_id, unbatched=True)
@@ -288,7 +334,7 @@ class ReviewLoop:
             newest = max(_ts(s.seen_at) for s in pending)
             if self.d.now() - newest < self.cfg.schedule.review_debounce:
                 return  # people may still be writing: wait for quiet (review_debounce)
-            stale = [s.id for s in pending if s.kind == "ci" and not self._ci_still_failing(task, [s])]
+            stale = [s.id for s in pending if self._stale(task, [s])]
             if stale:
                 self.store.drop_signals(stale, "stale")
                 pending = [s for s in pending if s.id not in stale]

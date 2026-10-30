@@ -422,6 +422,63 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 14: the review agent (code_review.py). One row per review request on a ticket, also the engine task that
+    # does it (`id`). While it is preparing, running or restoring, it holds the shared workspace. `snapshot`
+    # is what was reviewed and how to put the workspace back; `result` the runner's decision per MR, fixed
+    # before anything is posted, so a retry after a crash posts the same.
+    """
+    CREATE TABLE review_requests (
+        id               TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        n                INTEGER NOT NULL,
+        comment_id       TEXT NOT NULL,
+        author           TEXT NOT NULL,
+        asked_at_ms      INTEGER NOT NULL,
+        request          TEXT NOT NULL DEFAULT '',
+        state            TEXT NOT NULL CHECK (state IN ('pending', 'preparing', 'running', 'restoring', 'publishing',
+                                                        'done', 'refused')),
+        snapshot         TEXT NOT NULL DEFAULT '{}',
+        verdict          TEXT,
+        result           TEXT,
+        outcome          TEXT,
+        reason           TEXT,
+        started_at       TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (task_id, comment_id)
+    );
+    CREATE INDEX review_requests_state ON review_requests (state);
+    """
+)
+
+
+MIGRATIONS.append(
+    # 15: what a code review found that has to change goes back to the author as a signal of its own
+    # (code_review.py, review_agent.fix_rounds). The table is rebuilt as it is, as in 9, for the CHECK.
+    """
+    CREATE TABLE signals_v15 (
+        id               TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        kind             TEXT NOT NULL CHECK (kind IN ('review', 'ci', 'conflict', 'ticket', 'moved', 'closed',
+                                                       'code_review')),
+        repo             TEXT,
+        discussion_id    TEXT,
+        author           TEXT NOT NULL,
+        body             TEXT NOT NULL,
+        seen_at          TEXT NOT NULL,
+        batch_id         TEXT,
+        replied          INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO signals_v15 (id, task_id, kind, repo, discussion_id, author, body, seen_at, batch_id, replied)
+        SELECT id, task_id, kind, repo, discussion_id, author, body, seen_at, batch_id, replied FROM signals;
+    DROP TABLE signals;
+    ALTER TABLE signals_v15 RENAME TO signals;
+    CREATE INDEX signals_task ON signals (task_id, batch_id);
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -725,8 +782,83 @@ class Batch:
     authors: str = "[]"  # JSON: everyone whose words are in `text`, earlier notes of its threads included
 
 
+# A review in these states has the shared workspace switched to what it reviews (code_review.py).
+REVIEW_HOLDS = ("preparing", "running", "restoring")
+REVIEW_FIELDS = ("state", "snapshot", "verdict", "result", "outcome", "reason", "started_at")
+
+
+@dataclass(frozen=True)
+class ReviewRequest:
+    id: str              # also the engine task's id: <ticket key>.review-<n>
+    task_id: str         # the ticket's task
+    n: int
+    comment_id: str
+    author: str
+    asked_at_ms: int
+    request: str         # what the comment said after the command
+    state: str
+    snapshot: str        # JSON
+    verdict: str | None  # JSON: what the reviewer wrote, as read
+    result: str | None   # JSON: the runner's decision per MR
+    outcome: str | None  # approved | ready | attention | changes | unverified | nothing | refused | …
+    reason: str | None
+    started_at: str | None
+    created_at: str = ""
+    updated_at: str = ""
+
+
 class ReviewStore(TaskStore):
     """The review loop's records, next to the tasks."""
+
+    # -- the review agent (code_review.py) --
+
+    def add_review(self, task_id: str, comment_id: str, author: str, asked_at_ms: int, request: str,
+                   state: str = "pending", outcome: str | None = None, reason: str | None = None) -> ReviewRequest | None:
+        """A new request, numbered after the ticket's earlier ones. None when this comment was recorded before."""
+        if self.review_of_comment(task_id, comment_id):
+            return None
+        n = self.conn.execute("SELECT COUNT(*) FROM review_requests WHERE task_id = ?", (task_id,)).fetchone()[0] + 1
+        rid = f"{task_id}.review-{n}"
+        self.conn.execute(
+            "INSERT INTO review_requests (id, task_id, n, comment_id, author, asked_at_ms, request, state, outcome,"
+            " reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (rid, task_id, n, str(comment_id), author, asked_at_ms, request, state, outcome, reason))
+        return self.review(rid)
+
+    def review(self, review_id: str) -> ReviewRequest | None:
+        r = self.conn.execute("SELECT * FROM review_requests WHERE id = ?", (review_id,)).fetchone()
+        return ReviewRequest(**dict(r)) if r else None
+
+    def review_of_comment(self, task_id: str, comment_id: str) -> ReviewRequest | None:
+        r = self.conn.execute("SELECT id FROM review_requests WHERE task_id = ? AND comment_id = ?",
+                              (task_id, str(comment_id))).fetchone()
+        return self.review(r["id"]) if r else None
+
+    def reviews(self, *states: str, task_id: str | None = None) -> list[ReviewRequest]:
+        q, args = "SELECT * FROM review_requests WHERE 1 = 1", []
+        if states:
+            q += f" AND state IN ({', '.join('?' * len(states))})"
+            args += states
+        if task_id:
+            q += " AND task_id = ?"
+            args.append(task_id)
+        return [ReviewRequest(**dict(r)) for r in self.conn.execute(q + " ORDER BY created_at, n", args).fetchall()]
+
+    def update_review(self, review_id: str, **fields) -> ReviewRequest:
+        unknown = set(fields) - set(REVIEW_FIELDS)
+        if unknown:
+            raise ValueError(f"cannot update {unknown}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(f"UPDATE review_requests SET {sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                          " WHERE id = ?", (*fields.values(), review_id))
+        review = self.review(review_id)
+        assert review is not None
+        return review
+
+    def review_holding(self) -> ReviewRequest | None:
+        """The review that has the shared workspace now, if any."""
+        found = self.reviews(*REVIEW_HOLDS)
+        return found[0] if found else None
 
     def task_mrs(self, task_id: str) -> list[TaskMR]:
         rows = self.conn.execute("SELECT * FROM task_mrs WHERE task_id = ? ORDER BY repo", (task_id,)).fetchall()
@@ -797,6 +929,11 @@ class ReviewStore(TaskStore):
         """A comment already used another way (an answer to the agent's question): never a review."""
         self.add_signal(sig_id, task_id, kind, author, body, at)
         self.conn.execute("UPDATE signals SET batch_id = ? WHERE id = ? AND batch_id IS NULL", (how, sig_id))
+
+    def signals_of_kind(self, task_id: str, kind: str) -> list[Signal]:
+        rows = self.conn.execute("SELECT * FROM signals WHERE task_id = ? AND kind = ? ORDER BY seen_at, id",
+                                 (task_id, kind)).fetchall()
+        return [Signal(**{**dict(r), "replied": bool(r["replied"])}) for r in rows]
 
     def signal(self, sig_id: str) -> Signal | None:
         r = self.conn.execute("SELECT * FROM signals WHERE id = ?", (sig_id,)).fetchone()

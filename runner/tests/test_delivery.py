@@ -18,6 +18,7 @@ from arceus_runner.db import ReviewStore as TaskStore
 from arceus_runner.engine import Engine
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git, GitAuth
+from arceus_runner.progress import task_key
 
 from .conftest import GL_TOKEN, FakeClock, example_raw, providers, read_events
 from .fakes import FakeGitLab, FakeScreen, FakeYouTrack
@@ -39,7 +40,7 @@ def no_real_tools(monkeypatch):
 
 class World:
     def __init__(self, tmp: Path, secrets, engine_dir: Path | None = None, engine_env: dict | None = None,
-                 claude_checks: dict | None = None):
+                 claude_checks: dict | None = None, settings: dict | None = None):
         self.tmp = tmp
         self.engine_env = engine_env or {}
         if engine_dir is None:
@@ -82,6 +83,8 @@ class World:
         raw["bulava"]["mcp_config"] = None
         raw["bulava"]["claude_checks"].update(claude_checks or {})
         raw["health"].pop("devstack_check", None)
+        for section, values in (settings or {}).items():  # a test's own settings, section by section
+            raw[section] = {**raw.get(section, {}), **values} if isinstance(values, dict) else values
         self.cfg = Config.model_validate(raw)
         self.secrets = secrets
         self.clock = FakeClock()
@@ -129,6 +132,7 @@ class World:
         return self.cfg.paths.workspace / "acme-platform"
 
     def agent_commits(self, name: str = "feature.txt") -> str:
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
         (self.repo / name).write_text("work\n")
         git(self.repo, "add", name)
         git(self.repo, "commit", "-q", "-m", f"add {name}")
@@ -276,6 +280,96 @@ def test_debt_is_not_published(w):
     [note] = [t for t in w.bot_comments() if "did not pass review" in t]
     assert "tests are missing" in note       # what the review found is kept, who said it is not
     assert not re.search(r"Codex|Claude|Bulava", note)
+
+
+EMPTY_DIFF_WHY = ("Declared 'succeeded_no_change' with an empty diff — no machine verification of a no-change/"
+                  "research claim is possible; needs human review.")
+
+
+def passed_earlier(w: World, sha: str, passed: str | None) -> None:
+    """A first attempt committed `sha` and passed without declaring an outcome; the next one only declared it."""
+    w.settle("ACME-1", "failed", review="debt", state_reason="debt",
+             outcome={"result": "succeeded_no_change", "summary": "Shows when each link was created"})
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(review_why=EMPTY_DIFF_WHY))
+    f = w.cfg.paths.bulava_state / "tasks" / task_key("ACME-1") / "task.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"repo_reviewed": {str(w.repo): passed} if passed else {}}))
+
+
+def test_work_an_earlier_attempt_passed_is_published_when_the_next_only_declares_it(w):
+    # Staging, TTTLIN-29: the agent committed, Codex passed it, the run ended without an outcome; on /continue it
+    # declared "no change" and the engine banked the empty diff as debt.
+    take(w)
+    sha = w.agent_commits()
+    passed_earlier(w, sha, sha)
+    w.tick()
+    assert w.remote_branch("agent/ACME-1-fix-login-page") == sha and len(w.gl.mrs) == 1
+    assert w.store.task("ACME-1").state == "code_review" and w.events_named("published_earlier_pass")
+
+
+def test_commits_no_passing_review_saw_are_not_published_on_an_empty_diff(w):
+    take(w)
+    first = w.agent_commits()
+    w.agent_commits("more.txt")
+    passed_earlier(w, first, first)                      # HEAD moved past what the review passed
+    w.tick()
+    assert w.remote_branch("agent/ACME-1-fix-login-page") is None and w.gl.mrs == []
+    assert w.store.task("ACME-1").state == "failed" and not w.events_named("published_earlier_pass")
+
+
+def test_an_empty_diff_without_any_passing_review_stays_debt(w):
+    take(w)
+    passed_earlier(w, w.agent_commits(), None)
+    w.tick()
+    assert w.gl.mrs == [] and w.store.task("ACME-1").state == "failed"
+
+
+def passed_without_outcome(w: World, sha: str, passed: str | None) -> None:
+    """The attempt passed review but declared no outcome: `waiting_review`, no receipt, the repos in `task show`."""
+    def fn(s):
+        t = s["tasks"]["ACME-1"]
+        t.update(state="waiting_review", state_reason="passed", attempt_live=False, receipt=None, outcome=None)
+        t["attempts"][-1].update(ended_at="now", review="passed")
+        t["repos"] = [{**r, "branch": t["branch"], "clean": True,
+                       "reviewed_sha": sha if Path(r["path"]) == w.repo else r["base_sha"]} for r in t["repos"]]
+    w.set_engine(fn)
+    f = w.cfg.paths.bulava_state / "tasks" / task_key("ACME-1") / "task.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"repo_reviewed": {str(w.repo): passed} if passed else {}}))
+
+
+def test_a_pass_without_a_declared_outcome_is_published(w):
+    # Staging, TTTLIN-37: Codex passed the round, the agent stopped without declaring the outcome, and Bulava
+    # wrote no receipt; what the review accepted is in `task show` and `repo_reviewed`.
+    take(w)
+    sha = w.agent_commits()
+    passed_without_outcome(w, sha, sha)
+    w.tick()
+    assert w.remote_branch("agent/ACME-1-fix-login-page") == sha and len(w.gl.mrs) == 1
+    assert w.store.task("ACME-1").state == "code_review" and w.events_named("published_without_outcome")
+
+
+def test_a_later_round_without_a_summary_keeps_what_the_mr_says(w):
+    take(w)
+    w.agent_commits()
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Imports links from a CSV file"})
+    w.tick()
+    assert "Imports links from a CSV file" in w.gl.mrs[0]["description"]
+    w.store.update_task("ACME-1", state="dispatched")          # a review round
+    sha = w.agent_commits("more.txt")
+    passed_without_outcome(w, sha, sha)
+    w.tick()
+    assert w.remote_branch("agent/ACME-1-fix-login-page") == sha
+    assert "Imports links from a CSV file" in w.gl.mrs[0]["description"]
+
+
+def test_a_pass_without_an_outcome_publishes_only_what_the_review_saw(w):
+    take(w)
+    seen = w.agent_commits()
+    sha = w.agent_commits("more.txt")
+    passed_without_outcome(w, sha, seen)
+    w.tick()
+    assert w.gl.mrs == [] and w.store.task("ACME-1").state == "failed"
 
 
 def test_question_goes_to_the_ticket_and_the_answer_back(w):

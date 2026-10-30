@@ -97,6 +97,8 @@ class TrackerStates(Strict):
     queued: str
     in_progress: str
     code_review: str
+    # Where the ticket goes once every MR is merged. Most boards call it Testing; null leaves it in Code Review.
+    merged: str | None = "Testing"
 
 
 def _url(v: str) -> str:
@@ -132,6 +134,15 @@ class GitAuthor(Strict):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+$")
 
 
+class Approver(Strict):
+    """A second account on the code host that approves merge requests for the review agent. The bot
+    opens the MRs, and a host usually does not let an author approve their own (GitLab's default)."""
+    user: str = Field(min_length=1)
+    token_env: str  # its token in secrets.env
+
+    _check_env = field_validator("token_env")(_env_name)
+
+
 class CodeHostConfig(Strict):
     """The `code_host:` section: what the runner needs from any host of git repositories with merge
     requests. A provider (gitlab.py) subclasses it with its own keys; `type` says which provider."""
@@ -142,6 +153,7 @@ class CodeHostConfig(Strict):
     exclude_repos: list[str] = []  # repositories of the scope the agent never gets
     branch_prefix: str = "agent/"
     mr_label: str = "agent"
+    approver: Approver | None = None  # review_agent: who approves; without it the review only comments
 
     _gone = _refuse_gone("code_host")
     _check_env = field_validator("token_env")(_env_name)
@@ -152,6 +164,14 @@ class CodeHostConfig(Strict):
         if not v.endswith("/") or v.startswith("/") or " " in v:
             raise ValueError("must look like 'agent/'")
         return v
+
+    @model_validator(mode="after")
+    def _approver(self) -> CodeHostConfig:
+        if self.approver and self.approver.user == self.bot_user:
+            raise ValueError("approver.user must be another account than bot_user: the bot authors the MRs")
+        if self.approver and self.approver.token_env == self.token_env:
+            raise ValueError("approver.token_env must name the approver's own token, not the bot's")
+        return self
 
 
 class SlackConfig(Strict):
@@ -352,6 +372,74 @@ class SecurityConfig(Strict):
     timeout: Duration = timedelta(minutes=3)
 
 
+# What a person reviews before merge whatever the review agent thinks of it: a changed file that matches
+# one of these is never approved by the runner alone. A pattern without `/` matches the file name at any
+# depth; `**` crosses folders, `*` does not.
+# Changed files a person is always asked to look at, whatever the reviewer says: the security boundary and secrets.
+# A short list on purpose (staging, TTTLIN: a list with Makefile, Dockerfile and package.json turned 7 of 9 clean
+# reviews into "a person has to look", for verified changes the tickets asked for). Migrations are read with care
+# instead: one that drops, rewrites or narrows data reaches a person through the reviewer (its prompt, point 3), one
+# that only adds is a note for whoever deploys it (TTTLIN-42: an Alembic setup the ticket asked for, held by path).
+ATTENTION_PATHS = [
+    "**/auth/**", "*auth*", "*permission*", "*security*", "*crypt*", "*secret*", ".env*",
+]
+# Files the reviewer is told to read with extra care. They reach a person only when the reviewer names them by the
+# rules of its prompt (point 3): a deployment or production change of substance, a major runtime upgrade, a removed or
+# weakened check.
+REVIEW_HINT_PATHS = [
+    # CI, build and delivery
+    ".gitlab-ci.yml", ".github/**", "Jenkinsfile", "Dockerfile*", "docker-compose*", "compose*.y*ml", "Makefile",
+    "*.tf", "**/helm/**", "**/k8s/**", "**/deploy/**", "**/infra/**",
+    # dependencies
+    "requirements*.txt", "pyproject.toml", "setup.py", "setup.cfg", "package.json", "*.lock", "package-lock.json",
+    "go.mod", "Gemfile", "pom.xml", "build.gradle*",
+    # configuration
+    "settings*.py", "**/settings/**", "*.ini", "*.conf", "*.cfg",
+    # schema and stored data
+    "**/migrations/**", "*.sql",
+]
+# Ordinary test code: left out of the default ATTENTION_PATHS (`test_auth.py` is not the auth boundary). A list set in
+# config.yaml applies to tests as well.
+TEST_PATHS = ["**/tests/**", "**/test/**", "**/__tests__/**", "**/e2e/**", "e2e/**", "tests/**", "test/**",
+              "test_*", "*_test.*", "*.spec.*", "*.test.*", "conftest.py"]
+# Prose: left out of the default ATTENTION_PATHS the same way (`docs/auth.md` describes the boundary, it is not it).
+DOC_PATHS = ["*.md", "*.rst", "docs/**", "**/docs/**"]
+
+
+class ReviewAgentConfig(Strict):
+    """The review agent (code_review.py): a person writes `command` (or mentions the tracker bot and says
+    `review`) on a ticket in Code Review, and a separate Bulava task reviews the task's open MRs against
+    the ticket. The runner approves only what the review passed and the rules below allow; anything else
+    gets a note saying why. Off by default: with it off, such a comment is an ordinary comment."""
+    enabled: bool = False
+    command: str = Field(default="/review", pattern=r"^/[a-z][a-z0-9-]*$")
+    attention_paths: list[str] = ATTENTION_PATHS
+    review_hint_paths: list[str] = REVIEW_HINT_PATHS
+    # true: an MR is approved only when the code host's newest CI run is for the reviewed commit and passed.
+    require_green_ci: bool = True
+    timeout: Duration = timedelta(hours=2)  # the review's run; past it the run is stopped, nothing approved
+    max_suggestions: int = Field(default=5, ge=0, le=20)  # non-blocking ideas per MR the reviewer may list
+    max_per_ticket: int = Field(default=10, ge=1)  # reviews of one ticket, refused or not
+    # A review that finds something to change sends it to the agent that wrote the code, and once the agent has
+    # pushed new commits the runner reviews them again, without anyone asking. This many times per ticket;
+    # after that a person takes over. 0: findings only go back when a person passes them on.
+    fix_rounds: int = Field(default=3, ge=0, le=10)
+
+    @field_validator("command")
+    @classmethod
+    def _command(cls, v: str) -> str:
+        if v in ("/continue", "/security-allow", "/security-reject"):
+            raise ValueError(f"{v} is already a command of the runner")
+        return v
+
+    @field_validator("attention_paths", "review_hint_paths")
+    @classmethod
+    def _paths(cls, v: list[str]) -> list[str]:
+        if any(not p.strip() or p.startswith("/") for p in v):
+            raise ValueError("patterns are relative to the repository: no empty ones, none starting with /")
+        return v
+
+
 class CleanupProtect(Strict):
     """What cleanup never touches, besides the observability stack and anything labelled arceus.keep=true."""
     compose_projects: list[str] = []  # e.g. the project's dev stack: [omnis-dev]
@@ -458,6 +546,7 @@ class Config(Strict):
     health: HealthConfig = HealthConfig()
     bulava: BulavaConfig = BulavaConfig()
     security: SecurityConfig = SecurityConfig()
+    review_agent: ReviewAgentConfig = ReviewAgentConfig()
     cleanup: CleanupConfig = CleanupConfig()
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
@@ -542,9 +631,10 @@ class Secrets:
     tracker: str
     code_host: str
     slack: str | None
+    approver: str | None = None  # code_host.approver's token
 
     def values(self) -> list[str]:
-        return [v for v in (self.tracker, self.code_host, self.slack) if v]
+        return [v for v in (self.tracker, self.code_host, self.slack, self.approver) if v]
 
     def __repr__(self) -> str:  # never print tokens by accident
         return "Secrets(<redacted>)"
@@ -573,10 +663,13 @@ def load_secrets(cfg: Config, environ: dict[str, str] | None = None) -> Secrets:
     wanted = {"tracker": cfg.tracker.token_env, "code_host": cfg.code_host.token_env}
     if cfg.slack:
         wanted["slack"] = cfg.slack.token_env
+    if cfg.code_host.approver:
+        wanted["code_host.approver"] = cfg.code_host.approver.token_env
     found = {k: get(v) for k, v in wanted.items()}
     for k, v in wanted.items():
         if not found[k]:
             problems.append(f"{k}.token_env: {v} is not set in {path} or the environment")
     if problems:
         raise ConfigError(problems)
-    return Secrets(tracker=found["tracker"], code_host=found["code_host"], slack=found.get("slack"))
+    return Secrets(tracker=found["tracker"], code_host=found["code_host"], slack=found.get("slack"),
+                   approver=found.get("code_host.approver"))

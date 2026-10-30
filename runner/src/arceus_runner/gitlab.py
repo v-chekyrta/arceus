@@ -17,8 +17,9 @@ from pydantic import Field, field_validator
 from arceus_runner.checks import Check, Status
 from arceus_runner.config import CodeHostConfig, HttpConfig, _url
 from arceus_runner.gitops import GitAuth
-from arceus_runner.http import AuthError, ServiceClient, ServiceError
+from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError
 from arceus_runner.integrations import (
+    Approval,
     CIStatus,
     CodeHostType,
     FailedJob,
@@ -144,7 +145,7 @@ class GitLabReview(GitLabWriter):
             state=_state(d.get("state")), sha=d.get("sha") or "",
             conflict=_conflict(d.get("detailed_merge_status") or d.get("merge_status") or ""),
             ci_id=p.get("id"), ci_status=_ci_status(p.get("status")), ci_sha=p.get("sha"), ci_url=p.get("web_url"),
-            closed_by=(d.get("closed_by") or {}).get("username") or "")
+            closed_by=(d.get("closed_by") or {}).get("username") or "", target=d.get("target_branch") or "")
 
     def notes(self, project_id: int, iid: int, mr_url: str) -> list[Note]:
         """Every note of every discussion, so a late reply in an old thread is seen too."""
@@ -193,6 +194,25 @@ class GitLabReview(GitLabWriter):
         self.c.request("PUT", f"/api/v4/projects/{project_id}/merge_requests/{iid}", json={"state_event": "close"})
 
 
+class GitLabApprover(GitLab):
+    """The approver's own client: a refusal (401/403) pauses this token's client, never the bot's."""
+
+    def approved_by(self, project_id: int, iid: int) -> set[str]:
+        d = self.c.get_json(f"/api/v4/projects/{project_id}/merge_requests/{iid}/approvals")
+        return {(a.get("user") or {}).get("username") or "" for a in d.get("approved_by") or []}
+
+    def approve(self, project_id: int, iid: int, sha: str) -> None:
+        # `sha`: GitLab answers 409 when the source branch is no longer at it, so a newer push is never approved.
+        self.c.request("POST", f"/api/v4/projects/{project_id}/merge_requests/{iid}/approve", json={"sha": sha})
+
+    def unapprove(self, project_id: int, iid: int) -> None:
+        self.c.request("POST", f"/api/v4/projects/{project_id}/merge_requests/{iid}/unapprove")
+
+    def note_mr(self, project_id: int, iid: int, body: str) -> None:
+        """The code review's note, signed by the approver rather than by the bot that wrote the code."""
+        self.c.request("POST", f"/api/v4/projects/{project_id}/merge_requests/{iid}/notes", json={"body": body})
+
+
 # -- the code host ----------------------------------------------------------------------------------
 
 
@@ -223,13 +243,35 @@ class GitLabHost:
     scope_kind = "group"
     supports_uploads = True
 
-    def __init__(self, cfg: GitLabConfig, client: ServiceClient, token: str):
+    def __init__(self, cfg: GitLabConfig, client: ServiceClient, token: str, approver: ServiceClient | None = None):
         self.cfg = cfg
         self.client = client
         self.api = GitLabReview(client)
         self.scope = cfg.group
         self._token = token
         self._mention = mentions(cfg.bot_user)
+        self.approver_client = approver
+        self.approver_api = GitLabApprover(approver) if approver else None
+        self.approver = cfg.approver.user if cfg.approver and approver else ""
+
+    @property
+    def supports_approval(self) -> bool:
+        return self.approver_api is not None
+
+    @property
+    def reviewer(self) -> str:
+        return self.approver or self.cfg.bot_user
+
+    def note_review(self, repo_id: Id, iid: Id, body: str) -> None:
+        # The bot posts it when the approver cannot: its token was refused (that pauses its client) or lost its
+        # rights. A review that cannot be signed by the reviewer is still a review people must see.
+        if self.approver_api and self.approver_client.available():
+            try:
+                self.approver_api.note_mr(repo_id, iid, body)
+                return
+            except AuthError:
+                pass
+        self.api.note_mr(repo_id, iid, body)
 
     def identity(self) -> str:
         return f"gitlab {self.cfg.url} group {self.cfg.group}"
@@ -281,6 +323,40 @@ class GitLabHost:
     def upload(self, repo_id: Id, name: str, data: bytes, mime: str) -> str:
         return self.api.upload(repo_id, name, data, mime)
 
+    def approve(self, repo_id: Id, iid: Id, sha: str) -> Approval:
+        a = self.approver_api
+        if a is None:
+            return Approval(False, "no approver account is configured")
+        try:
+            if self.approver in a.approved_by(repo_id, iid):
+                # An approval GitLab kept across a push is not one for `sha`: take it back rather than claim it.
+                if (a.c.get_json(f"/api/v4/projects/{repo_id}/merge_requests/{iid}").get("sha") or sha) != sha:
+                    a.unapprove(repo_id, iid)
+                    return Approval(False, "the merge request has commits newer than the reviewed one", stale=True)
+                return Approval(True, "already approved")
+            a.approve(repo_id, iid, sha)
+        except AuthError as e:  # the account may not approve here: the author rule, its role, a lost token
+            return Approval(False, f"GitLab refused the approval by {self.approver}: {e}")
+        except NotFound:
+            return Approval(False, f"GitLab did not find the merge request for {self.approver}")
+        except BadRequest as e:
+            if e.status == 409:
+                return Approval(False, "the merge request has commits newer than the reviewed one", stale=True)
+            return Approval(False, f"GitLab refused the approval: {e}")
+        return Approval(True)
+
+    def revoke(self, repo_id: Id, iid: Id) -> bool:
+        a = self.approver_api
+        if a is None:
+            return False
+        try:
+            if self.approver not in a.approved_by(repo_id, iid):
+                return False
+            a.unapprove(repo_id, iid)
+        except (AuthError, NotFound, BadRequest):
+            return False
+        return True
+
     def git_auth(self) -> GitAuth:
         return GitAuth(self.cfg.url, self.cfg.bot_user, self._token)
 
@@ -294,7 +370,10 @@ class GitLabHost:
             return Check("gitlab.token_expiry", "warn", f"cannot read token info: {e}")
 
     def check(self, warn_days: int, today: date | None = None) -> list[Check]:
-        return check_gitlab(self.cfg, self.api, warn_days, today)
+        out = check_gitlab(self.cfg, self.api, warn_days, today)
+        if self.approver_api:
+            out.append(_check_approver(self.cfg, self.approver_api))
+        return out
 
 
 def gitlab_client(cfg: GitLabConfig, token: str, http: HttpConfig, transport=None) -> ServiceClient:
@@ -344,6 +423,24 @@ def check_gitlab(g: GitLabConfig, gl: GitLab, warn_days: int, today: date | None
     return out
 
 
+def _check_approver(g: GitLabConfig, gl: GitLab) -> Check:
+    """The approver's token is the approver's and may use the API; whether it may approve in each repository
+    (its role, the project's approval settings) only an approval shows, and the review says so when refused."""
+    want = g.approver.user
+    try:
+        me = gl.me()
+        scopes = gl.token_self().get("scopes") or []
+    except ServiceError as e:
+        return Check("gitlab.approver", "fail", f"{want}: {e}")
+    if me.get("username") != want:
+        return Check("gitlab.approver", "fail", f"the approver's token belongs to {me.get('username')!r}, "
+                                                f"config says {want!r}")
+    if "api" not in scopes:
+        return Check("gitlab.approver", "fail", f"the approver's token needs scope 'api', has {scopes}")
+    return Check("gitlab.approver", "ok", f"{want}; it needs at least the Developer role in every repository "
+                                          "of the group to approve")
+
+
 def _expiry_check(warn_days: int, tok: dict, today: date) -> Check:
     exp = tok.get("expires_at")
     if not exp:
@@ -353,8 +450,13 @@ def _expiry_check(warn_days: int, tok: dict, today: date) -> Check:
     return Check("gitlab.token_expiry", status, f"expires {exp} ({left} days)")
 
 
-def _build(cfg: GitLabConfig, token: str, http: HttpConfig, transport=None) -> GitLabHost:
-    return GitLabHost(cfg, gitlab_client(cfg, token, http, transport), token)
+def _build(cfg: GitLabConfig, token: str, http: HttpConfig, transport=None, approver_token: str | None = None) \
+        -> GitLabHost:
+    approver = None
+    if cfg.approver and approver_token:
+        approver = ServiceClient("gitlab-approver", cfg.url, {"PRIVATE-TOKEN": approver_token}, http,
+                                 transport=transport)
+    return GitLabHost(cfg, gitlab_client(cfg, token, http, transport), token, approver)
 
 
 CODE_HOST = CodeHostType(config=GitLabConfig, build=_build)

@@ -63,6 +63,7 @@ def cmd_check(args) -> int:
     probe = bulava_mod.probe(cfg.paths.bulava)
     checks.append(models_check(cfg, probe))
     checks.append(claude_checks(cfg, probe))
+    checks.append(review_agent_check(cfg))
     if not args.offline:
         checks += run_online_checks(cfg, secrets)
     return EXIT_OK if _print_checks(checks, args.json) else EXIT_CHECK_FAILED
@@ -80,6 +81,18 @@ def models_check(cfg: Config, probe: bulava_mod.Probe) -> Check:
         return Check("config.models", "fail", f"{shown}; the engine in {cfg.paths.bulava} does not take "
                                               f"{', '.join(missing)}: update it (setup.sh) or set them to auto")
     return Check("config.models", "ok", shown)
+
+
+def review_agent_check(cfg: Config) -> Check:
+    """Whether people can ask for a code review on a ticket, and whether it can approve (code_review.py)."""
+    r = cfg.review_agent
+    if not r.enabled:
+        return Check("config.review_agent", "ok", "off")
+    how = f"`{r.command}` or a mention of {cfg.tracker.bot_user} with `review`, on a ticket in Code Review"
+    if not cfg.code_host.approver:
+        return Check("config.review_agent", "warn", f"on ({how}), but it can only comment: approving needs "
+                                                    "code_host.approver, a second account (the bot authors the MRs)")
+    return Check("config.review_agent", "ok", f"on ({how}); approves as {cfg.code_host.approver.user}")
 
 
 def cmd_doctor(args) -> int:
@@ -211,6 +224,11 @@ def _cleanup_now(cfg: Config, as_json: bool) -> int:
             active = store.tasks(*ACTIVE_STATES)
             if active:
                 print(f"cleanup: {active[0].task_id} holds the workspace ({active[0].state}); not now", file=sys.stderr)
+                return EXIT_CHECK_FAILED
+            review = store.review_holding()
+            if review:
+                print(f"cleanup: the code review {review.id} holds the workspace ({review.state}); not now",
+                      file=sys.stderr)
                 return EXIT_CHECK_FAILED
             engine = Engine(cfg) if bulava_mod.probe(cfg.paths.bulava).installed else None
             cleanup = make_cleanup(cfg, store, events, engine)
