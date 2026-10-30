@@ -273,9 +273,15 @@ KIND_WORDS = {
     "answer": "the answer to the agent's question",
     "continue": "the `/continue` request",
     "review": "this round of MR comments, CI logs and ticket comments",
+    "review_request": "the code review request, with the ticket and its comments",
 }
 ALLOW, REJECT = "/security-allow", "/security-reject"
 _DECISION = re.compile(r"^\s*(/security-(?:allow|reject))\s+([0-9a-f]{12})\b", re.I)
+
+
+def is_decision(text: str) -> bool:
+    """A security reviewer's `/security-allow <code>` or `/security-reject <code>`: for the runner, never the agent."""
+    return bool(_DECISION.match(text))
 
 
 class Gate:
@@ -430,7 +436,22 @@ class Gate:
 
     def _reject(self, task, hold, who: str) -> None:
         """The task fails, the text is refused everywhere from now on, and what it came with is dropped: one
-        transaction, so a crash cannot leave a task that is neither held nor failed."""
+        transaction, so a crash cannot leave a task that is neither held nor failed. A code review request is
+        only dropped: the work under review goes on as it was."""
+        if hold["kind"] == "review_request":
+            code = hold["digest"][:12]
+            with self.store.transaction():
+                self.store.decide_screening(hold["digest"], "rejected", who, self.d.now().isoformat())
+                self.store.close_hold(task.task_id, hold["digest"], "rejected", who, self.d.now().isoformat())
+                self.store.update_task(task.task_id, state=hold["resume_state"])
+                self._drop(hold["kind"], hold["ref"])
+                self.store.action_intent(f"{task.task_id}:comment:security-rejected:{code}", task.task_id, "comment",
+                                         json.dumps({"kind": f"security-rejected:{code}", "text": (
+                                             f"{who} rejected it: no code review was run.")}))
+            self.events.emit("security_rejected", task_id=task.task_id, code=code, by=who, kind=hold["kind"])
+            self.d.retry_pending()
+            return
+
         def record() -> None:
             self.store.decide_screening(hold["digest"], "rejected", who, self.d.now().isoformat())
             self.store.close_hold(task.task_id, hold["digest"], "rejected", who, self.d.now().isoformat())
@@ -445,6 +466,16 @@ class Gate:
 
     def _refuse(self, task, kind: str, key: str, row, ref: str | None) -> None:
         """The same text again after a reviewer rejected it: not held a second time."""
+        if kind == "review_request":
+            with self.store.transaction():
+                self._drop(kind, ref)
+                self.store.action_intent(f"{task.task_id}:comment:security-refused:{key[:12]}:{ref}", task.task_id,
+                                         "comment", json.dumps({"kind": f"security-refused:{key[:12]}:{ref}", "text": (
+                                             f"{row['decided_by'] or 'A security reviewer'} already rejected this "
+                                             "exact text in security review; no code review was run.")}))
+            self.events.emit("security_refused", task_id=task.task_id, kind=kind, code=key[:12])
+            self.d.retry_pending()
+            return
         self.d.fail(task, f"{row['decided_by'] or 'a security reviewer'} already rejected this exact text in "
                           f"security review ({KIND_WORDS[kind]}); change it before asking again",
                     also=lambda: self._drop(kind, ref))
@@ -455,6 +486,10 @@ class Gate:
             self.store.batch_sent(ref, "stale")
         elif ref and kind == "continue":
             self.store.action_done(ref, "rejected")
+        elif ref and kind == "review_request" and hasattr(self.store, "update_review"):
+            review = self.store.review(ref)
+            if review and review.state == "pending":  # screened before the workspace is switched, never after
+                self.store.update_review(ref, state="refused", outcome="refused", reason="security")
 
     # -- health ----------------------------------------------------------------------------------
 

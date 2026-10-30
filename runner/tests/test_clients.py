@@ -75,6 +75,16 @@ def test_youtrack_check_reports_each_mistake_separately(cfg, secrets):
         "youtrack.tags.failed",
     ]
     assert "available: Open, In Progress, Code Review" in results["youtrack.states.queued"].detail
+    # The default merged state is only a guess at the board: missing, it warns and names the setting.
+    assert results["youtrack.states.merged"].status == "warn"
+    assert "tracker.states.merged" in results["youtrack.states.merged"].detail
+
+
+def test_a_merged_state_set_in_the_config_must_exist(cfg, secrets):
+    states = type(cfg.tracker.states).model_validate(cfg.tracker.states.model_dump() | {"merged": "QA"})
+    cfg = cfg.model_copy(update={"tracker": cfg.tracker.model_copy(update={"states": states})})
+    results = {c.name: c for c in check_youtrack(cfg, secrets, FakeYouTrack())}
+    assert results["youtrack.states.merged"].status == "fail"
 
 
 def test_youtrack_check_wrong_bot(cfg, secrets):

@@ -475,3 +475,114 @@ def test_findings_go_back_to_the_agent_once_and_codex_decides(w):
     finally:
         subprocess.run([*keeper, "set-environment", "-gu", "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY"])
         obs.write({"ticket_comments": w.bot_comments(db)})
+
+
+def published_without_a_run(w: World, files: dict[str, str], summary: str, description: str) -> str:
+    """ACME-1 as if the author's run had published it: its branch on the code host with `files` on top of
+    main, one open MR with green CI, the ticket in Code Review. No model is spent on the authoring."""
+    branch = "agent/ACME-1-" + re.sub(r"[^a-z0-9]+", "-", summary.lower()).strip("-")
+    work = w.tmp / "seed-branch"
+    subprocess.run(["git", "clone", "-q", str(w.origins["acme-platform"]), str(work)], check=True)
+    git(work, "checkout", "-q", "-b", branch)
+    for rel, text in files.items():
+        (work / rel).write_text(text)
+    git(work, "add", "-A")
+    git(work, "-c", "user.name=ACME Agent", "-c", "user.email=bot@acme.example", "commit", "-q", "-m", summary)
+    git(work, "push", "-q", "origin", branch)
+    sha = git(work, "rev-parse", "HEAD")
+    w.yt.add_issue(1)
+    w.yt.issue_tags["2-1"] = set()
+    w.yt.issues[-1].update(summary=summary, description=description)
+    w.yt.issue_fields["2-1"] = {"State": {"name": "Code Review"}}
+    url = "https://gl/clients/acme/acme-platform/-/merge_requests/1"
+    w.gl.mrs.append({"project_id": 0, "iid": 1, "source_branch": branch, "target_branch": "main", "state": "opened",
+                     "web_url": url, "title": f"ACME-1: {summary}", "description": "", "sha": sha,
+                     "head_pipeline": {"id": 77, "status": "success", "sha": sha, "web_url": "https://gl/p/77"}})
+    d = w.runner.delivery
+    w.store.create_task(task_id="ACME-1", issue_db_id="2-1", state="code_review", summary=summary, tag_author="j.doe",
+                        repo="", repo_path=str(w.cfg.paths.workspace), branch=branch, base_branch="main",
+                        question_id=None, question_at_ms=None, reason=None, mr_urls=json.dumps([url]),
+                        attempt_started=None, extra_repos=json.dumps(["acme-platform", "acme-theme"]),
+                        published_at_ms=w.yt.clock)
+    w.store.upsert_mr("ACME-1", "acme-platform", 0, 1, url, sha)
+    assert d.prepare_workspace(w.store.task("ACME-1"), d._group()) is None
+    return sha
+
+
+@live
+def test_a_code_review_request_is_reviewed_without_asking_anyone(tmp_path, secrets):
+    """`/review` on a ticket in Code Review: the review is an engine task of its own with the real Claude and
+    Codex. It must finish without a question to people, publish nothing, give the workspace back, and leave
+    a verdict the runner can read; what it decided is the model's and goes to the report."""
+    from arceus_runner.config import Secrets
+    keeper = ensure_keeper()
+    secrets = Secrets(tracker=secrets.tracker, code_host=secrets.code_host, slack=None, approver="glpat-approver-789")
+    w = World(tmp_path, secrets, engine_dir=Path(ENGINE), settings={"review_agent": {"enabled": True}, "code_host": {
+        "approver": {"user": "acme-review-bot", "token_env": "GITLAB_REVIEW_TOKEN"}}})
+    w.keeper_at_start = keeper
+    w.gl.tokens["glpat-approver-789"] = "acme-review-bot"
+    w.cfg.paths.bulava_env.unlink()
+    state = w.cfg.paths.bulava_state
+    state.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path.home() / ".claude" / "supervisor" / "worker-settings.json", state / "worker-settings.json")
+    seed(w.origins["acme-platform"], tmp_path / "seed-live")
+    users = SEED["acme_platform/users.py"] + '''
+
+def count_users(conn: sqlite3.Connection) -> int:
+    return conn.execute("select count(*) from users").fetchone()[0]
+'''
+    tests = SEED["tests/test_users.py"].replace('''
+
+if __name__''', '''
+    def test_count_users(self):
+        conn = connect()
+        add_user(conn, "ann", "ann@example.com")
+        add_user(conn, "bob", "bob@example.com")
+        from acme_platform.users import count_users
+        self.assertEqual(count_users(conn), 2)
+
+
+if __name__''')
+    sha = published_without_a_run(w, {"acme_platform/users.py": users, "tests/test_users.py": tests}, "Count users",
+                                  "In acme-platform add `count_users(conn)` to acme_platform/users.py: the number "
+                                  "of users. Add a test.")
+    branch = w.store.task("ACME-1").branch
+    rid = "ACME-1.review-1"
+    obs = Observer(w, rid, "code-review")
+    say(f"— {rid}")
+    try:
+        w.yt.comment("2-1", "j.doe", "/review")
+        deadline = time.time() + ATTEMPT_LIMIT.total_seconds()
+        seen = None
+        while time.time() < deadline:
+            w.tick()
+            w.now += timedelta(seconds=POLL)
+            show_new_events(w, rid)
+            review = w.store.review(rid)
+            if review and review.state != seen:
+                seen = review.state
+                say(f"{rid}: {seen}")
+            if review and review.state in ("done", "refused"):
+                break
+            time.sleep(POLL)
+        review = w.store.review(rid)
+        assert review and review.state == "done", f"the review did not finish: {review}"
+        verdict = json.loads(review.verdict or "{}")
+        assert verdict.get("engine") not in ("needs_input", "blocked"), "the reviewer stopped to ask a person"
+        assert not [t for t in w.bot_comments("2-1") if "needs an answer" in t], "a question reached the ticket"
+        assert "agent-needs-input" not in w.yt.issue_tags.get("2-1", set())
+        assert verdict.get("mrs"), f"the reviewer left no verdict the runner could read: {verdict.get('problems')}"
+        assert w.remote_branch(branch) == sha and len(w.gl.mrs) == 1, "the review published something"
+        assert w.calls("worker-send") == [] or all(c["argv"][1] != "ACME-1" for c in w.calls("worker-send"))
+        assert w.store.review_holding() is None and git(w.repo, "branch", "--list", "arceus-review/*") == ""
+        assert not [t for t in w.bot_comments("2-1") if re.search(r"Codex|Claude|Bulava", t)], "the ticket names a model"
+    finally:
+        review = w.store.review(rid)
+        obs.write({"ticket_comments": w.bot_comments("2-1"),
+                   "mr_notes": [n["body"] for d in w.gl.discussions.get(1, []) for n in d["notes"]],
+                   "approved_by": w.gl.mrs[0].get("approved_by") if w.gl.mrs else None,
+                   "review": {"state": getattr(review, "state", None), "outcome": getattr(review, "outcome", None),
+                              "verdict": json.loads(review.verdict) if review and review.verdict else None,
+                              "result": json.loads(review.result) if review and review.result else None}})
+        w.events.close()
+        w.store.close()

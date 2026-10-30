@@ -34,7 +34,7 @@ def w(tmp_path, secrets):
     yield from _world(tmp_path, secrets)
 
 
-def _world(tmp_path, secrets, **env_over):
+def _world(tmp_path, secrets, settings=None, **env_over):
     stub = tmp_path / "wd-stub"
     stub.write_text("#!/bin/bash\nexec sleep 300\n")
     stub.chmod(0o755)
@@ -47,7 +47,7 @@ def _world(tmp_path, secrets, **env_over):
         "TMUX_TMPDIR": str(tmp_path / "tmux"), "SUPERVISOR_RELEASE_DELAY": "0",
         **env_over,
     }
-    world = World(tmp_path, secrets, engine_dir=Path(ENGINE), engine_env=env)
+    world = World(tmp_path, secrets, engine_dir=Path(ENGINE), engine_env=env, settings=settings)
     yield world
     subprocess.run(["tmux", "-L", "bulava", "kill-server"], env={**os.environ, "TMUX_TMPDIR": env["TMUX_TMPDIR"]},
                    capture_output=True)
@@ -61,10 +61,12 @@ def settle(w: World, task_id: str, disposition: str, outcome: dict) -> None:
     is the workspace folder's, where the session starts; its receipt names every repository of the task."""
     engine = w.runner.delivery.engine
     import json
+    task = w.store.task(task_id)
+    project = task.repo_path if task else str(w.cfg.paths.workspace)  # a code review runs in the workspace too
     script = f"""
 set -e
 . {shlex.quote(ENGINE)}/bin/supervisor-lib.sh
-P={shlex.quote(w.store.task(task_id).repo_path)}
+P={shlex.quote(project)}
 I="$(instance_dir "$(slug_for "$P")")"
 printf '%s' {shlex.quote(json.dumps(outcome))} > "$I/outcome.json"
 mkdir -p "$I/report"
@@ -191,5 +193,56 @@ def test_check_settings_reach_the_worker_only_when_the_engine_carries_them(tmp_p
         carried = bulava.probe(Path(ENGINE)).advertised["settings.claude_checks"]
         assert (env.get("SUPERVISOR_CLAUDE_CHECKS_ROUNDS") == "2") == carried, (carried, sorted(
             k for k in env if k.startswith("SUPERVISOR_")))
+    finally:
+        next(gen, None)
+
+
+def test_a_code_review_runs_as_its_own_engine_task(tmp_path):
+    """`/review` on the ticket: the real dispatch.sh takes a task id of its own, the review branch in the
+    home, the MR's repository listed for reading only; its research outcome publishes nothing, and the
+    workspace is back on the task branch afterwards."""
+    import json
+    from arceus_runner.config import Secrets
+    from .conftest import GL_TOKEN, YT_TOKEN
+    secrets = Secrets(tracker=YT_TOKEN, code_host=GL_TOKEN, slack=None, approver="glpat-approver-token-789")
+    gen = _world(tmp_path, secrets, settings={"review_agent": {"enabled": True}, "code_host": {
+        "approver": {"user": "acme-review-bot", "token_env": "GITLAB_REVIEW_TOKEN"}}})
+    w = next(gen)
+    try:
+        w.gl.tokens["glpat-approver-token-789"] = "acme-review-bot"
+        w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
+        w.tick()
+        sha = w.agent_commits("health.txt")
+        settle(w, "ACME-1", "passed", {"schema": 1, "result": "succeeded_changes", "summary": "done",
+                                       "task_id": "ACME-1"})
+        wait_state(w, "ACME-1", "waiting_review")
+        w.tick()
+        task = w.store.task("ACME-1")
+        assert task.state == "code_review"
+        w.gl.mrs[0].update(sha=sha, head_pipeline={"id": 9, "status": "success", "sha": sha})
+
+        w.yt.comment("2-1", "j.doe", "/review")
+        w.tick()
+        rid = "ACME-1.review-1"
+        show = wait_state(w, rid, "running")
+        assert show["branch"] == "arceus-review/ACME-1-1", show["branch"]
+        assert "Do not ask anyone a question" in show["objective"]
+        assert git(w.repo, "rev-parse", "HEAD") == sha and w.runner.delivery.engine.show("ACME-1")["state"] == \
+            "waiting_review"                                     # the author's task is untouched
+
+        verdict = w.cfg.paths.workspace / ".arceus" / "reviews" / "ACME-1" / f"{rid}.json"
+        verdict.write_text(json.dumps({"summary": "Fine.", "mrs": [{
+            "mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "none",
+            "checked": "nothing to build", "findings": [], "attention": []}]}))
+        settle(w, rid, "passed", {"schema": 1, "result": "succeeded_research", "summary": "Fine.", "task_id": rid})
+        deadline = time.time() + 30
+        while w.store.review(rid).state != "done" and time.time() < deadline:
+            w.tick()
+            time.sleep(0.3)
+        review = w.store.review(rid)
+        assert review.state == "done", (review, w.events_named("review_step_failed"))
+        assert review.outcome == "approved", json.loads(review.result)
+        assert git(w.repo, "symbolic-ref", "--short", "HEAD") == task.branch
+        assert w.remote_branch(task.branch) == sha and len(w.gl.mrs) == 1
     finally:
         next(gen, None)

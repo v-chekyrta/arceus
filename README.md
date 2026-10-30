@@ -81,6 +81,7 @@ Some capabilities are optional. Without them the flow keeps working, with less:
 | Uploads to the code host (`supports_uploads`) | screenshots go to the ticket only |
 | Attachments on the tracker (`supports_attachments`) | screenshots go to the merge requests only |
 | Assignee (`assign_to_bot`) | nothing is assigned |
+| Approval (`supports_approval`, `approve`, `revoke`; `code_host.approver`) | the review agent says what it found in a note and approves nothing |
 
 ## Status
 
@@ -91,6 +92,8 @@ Working and checked on an Ubuntu 26.04 (x86_64) VM against a real YouTrack proje
 - ticket → branches in the group's repositories → Bulava → Codex verdict → push of the reviewed commit → MR → Code Review, including questions and answers, failures with a reason on the ticket, and recovery after a crash or a reboot (tested against the installed engine with a stub instead of Claude);
 - the loop after the MR: review notes that mention the bot (also late replies in old threads, each thread sent whole), the current red pipeline with its failed jobs' logs, confirmed conflicts and ticket comments go back to the agent as follow-ups of the same task; the fix is published to the same MR, each thread gets its own answer (with the commit where code changed, without one where the agent only explained), the task is done when all its MRs are merged; an MR a person closes while others are open goes to the agent, which reverts that repository's changes, and the runner then drops the MR from the task (a revert the agent makes on its own closes the open MR the same way);
 - Grafana dashboards fed by the runner's metrics and the runner's and Bulava's events.
+
+Optional, off by default: **code review on request** (`review_agent`). `/review` on a ticket in Code Review starts a separate Bulava task that reviews the task's open MRs against the ticket, builds and tests them without changing them, and writes a verdict; the runner approves an MR (as a second GitLab account, `code_host.approver`) only when the review passed it, CI passed on that commit and nothing moved meanwhile, and otherwise says on the MR what has to change. When an approved MR touches what `attention_paths` lists (auth, permissions, secrets…) or something the reviewer says a person has to decide, its note also names those changes for a person to look at before merge; verified changes the ticket asked for do not. What only whoever deploys it needs to know (an environment variable to set, a requested runtime upgrade) is listed in the note under its own heading and does not call a person. It never asks anyone a question. What has to change goes back to the author, and its new commits are reviewed again without anyone asking, up to `fix_rounds` times per ticket (default 3); then a person takes over. Checked against the pinned engine with a stub instead of Claude; how it decides is in [setup/README.md](setup/README.md#code-review-on-request).
 
 Not there yet:
 

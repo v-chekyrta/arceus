@@ -189,6 +189,19 @@ class Git:
             raise GitError(f"git diff {default}...{sha[:12]}: {self._scrub(res.stderr.strip())[-500:]}")
         return res.returncode == 1
 
+    def changed_files(self, repo: Path, default: str, sha: str) -> list[str]:
+        """The files `sha` changes compared with where it left `default`, as a merge request shows them."""
+        out = self._run(["diff", "--name-only", "-z", f"{default}...{sha}"], repo).stdout
+        return [f for f in out.split("\0") if f]
+
+    def switch(self, repo: Path, ref: str) -> None:
+        """Check out a branch, or a commit (detached), that the repository already has."""
+        self._run(["checkout", "--quiet", ref], repo)
+
+    def branch_sha(self, repo: Path, branch: str) -> str | None:
+        res = self._run(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo, check=False)
+        return res.stdout.strip() or None
+
     def log_subjects(self, repo: Path, base: str, sha: str, limit: int = 30) -> list[str]:
         out = self._run(["log", "--format=%h %s", f"-{limit}", f"{base}..{sha}"], repo, check=False).stdout
         return [line for line in out.splitlines() if line.strip()]

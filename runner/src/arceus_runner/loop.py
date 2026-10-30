@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check
 from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Docker, Situation
+from arceus_runner.code_review import ReviewAgent
 from arceus_runner.config import Config, Schedule, Secrets
 from arceus_runner.db import ACTIVE_STATES, InstanceLock, ReviewStore, TaskStore
 from arceus_runner.delivery import Delivery
@@ -119,6 +120,8 @@ class Runner:
             self.delivery = Delivery(cfg, store, events, tracker, code_host, engine, git, classify, now=now)
             self.review = ReviewLoop(self.delivery)
             self.delivery.review = self.review
+            self.reviewer = ReviewAgent(self.delivery)
+            self.delivery.reviewer = self.reviewer
         self.progress = ProgressWatcher(cfg.paths.bulava_state, cfg.paths.workspace, store, events, now,
                                         quiet_after=cfg.limits.agent_quiet_after) if self.delivery else None
         self.last_tick: float | None = None  # wall clock of the last finished tick, for the metrics
@@ -198,6 +201,7 @@ class Runner:
         if self.delivery:
             self.delivery.check_answers()
             self.delivery.check_continue()
+            self.reviewer.check_requests()
             self.delivery.gate.check_decisions()
 
     def _observe_issue(self, issue: Issue) -> None:
@@ -266,14 +270,22 @@ class Runner:
                 self.next_due[name] = self.mono() + self._interval(client)
         if self.delivery and host_due and self.code_host.client.available() and self.tracker.client.available():
             # The open MRs: review notes, CI, conflicts, merges (on the code host's poll cadence).
+            self.delivery.published.clear()
             self.review.poll()
         if self.delivery and local_due:
             # Reconcile with `task show` every poll_local, then take new work if nothing is running.
             self.delivery.reconcile()
+            self.reviewer.reconcile()  # code reviews under way: followed, the workspace put back, published
+            if self.delivery.published and self.code_host.client.available() and self.tracker.client.available():
+                # A task published in this tick has MR notes this tick's poll could not see (they were written
+                # while it worked): read them now, so its fixes go before the next ticket as they should.
+                just, self.delivery.published = self.delivery.published, set()
+                self.review.poll(only=just)
             can_take = self.can_take()
             self.clean_up(can_take, started)  # before new work: an overdue pass goes ahead of the next ticket
             if can_take:
                 self.delivery.send_continue()  # a resumed task is new work for the workspace
+            self.reviewer.start(can_take)  # a requested code review, before a new ticket
             self.delivery.maybe_start(can_take)
         elif local_due:
             self.clean_up(False, started)  # observe: nothing runs; the pass only reports
@@ -281,8 +293,7 @@ class Runner:
             # Who holds the workspace: a change happened somewhere in this tick, so the hold before ends at its
             # start and the new one starts now; what was made in between is nobody's.
             try:
-                self.cleanup.note_holder(next(iter(self.store.tasks(*ACTIVE_STATES)), None), started,
-                                         began=self.cleanup.now())
+                self.cleanup.note_holder(self._holder(), started, began=self.cleanup.now())
             except Exception as e:
                 self.events.emit("cleanup_failed", error=f"{type(e).__name__}: {e}")
         if self.progress and (local_due or now >= self.next_due["progress"]):
@@ -300,16 +311,23 @@ class Runner:
         meanwhile; it does not depend on health, which is often what low disk has broken."""
         if not self.cleanup:
             return
-        holder = next(iter(self.store.tasks(*ACTIVE_STATES)), None)
+        holder = self._holder()
         waiting = bool(self.delivery and can_take and (
             any(not self.delivery.skipped(d) for d in self.store.accepted_untaken())
             or self.delivery._continues_waiting()
+            or self.reviewer.waiting()
             or (hasattr(self.store, "has_pending_review") and self.store.has_pending_review())))
         try:
             self.cleanup.maybe_run(Situation(holder, waiting, self.health.get("disk_free") in ("warn", "fail"),
                                              since))
         except Exception as e:  # cleanup must never stop the work it cleans up after
             self.events.emit("cleanup_failed", error=f"{type(e).__name__}: {e}")
+
+    def _holder(self):
+        """The task in the shared workspace now: a running task, or the ticket whose code review runs there."""
+        if self.delivery:
+            return self.delivery.workspace_taken()
+        return next(iter(self.store.tasks(*ACTIVE_STATES)), None)
 
     def can_take(self) -> bool:
         """New work only when nothing is failing and both the tracker and the code host answer."""
@@ -347,6 +365,8 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         stack.callback(tracker.client.close)
         host = build_code_host(cfg, secrets)
         stack.callback(host.client.close)
+        if getattr(host, "approver_client", None):
+            stack.callback(host.approver_client.close)
         bind_integrations(store, tracker, host)
         engine = git = classify = None
         if cfg.mode == "live":

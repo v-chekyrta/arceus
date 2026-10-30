@@ -25,6 +25,8 @@ tracker:
     queued: To Do
     in_progress: In Progress
     code_review: Code Review
+    # merged: Testing                  # where the ticket goes once every MR is merged; Testing by default.
+                                       # Set the board's own name for it, or null to leave it in Code Review.
   # YouTrack
   url: https://youtrack.example.com
   project: ACME                        # short name (ID) of the YouTrack project
@@ -46,6 +48,10 @@ code_host:
                                        # A task gets all of them; the agent changes whichever it needs,
                                        # and MRs are opened only where it changed something
   include_subgroups: true
+  # Who approves for review_agent: a second GitLab account (the bot authors the MRs, and GitLab does not let an
+  # author approve by default), at least Developer in the group's repositories, its token in secrets.env.
+  # Without it the review only comments.
+  # approver: { user: acme-review-bot, token_env: GITLAB_REVIEW_TOKEN }   # approves and signs the review's notes
 
 # Optional. Remove the section if there is no Slack bot yet.
 slack:
@@ -123,6 +129,32 @@ security:
     - a.smith
   model: auto                          # the classifier's model: auto | sonnet | opus | an exact id
   timeout: 3m
+
+# Code review on request (code_review.py). Off by default. With it on, someone in tracker.allowed_users
+# writes `/review` (or "@<tracker bot> review") on a ticket in Code Review, and a separate Bulava task reviews
+# the task's open MRs against the ticket, builds and tests them, and never asks anyone a question. The runner
+# approves an MR (as code_host.approver) only when the review found it ready, CI passed on the reviewed commit
+# and nothing moved meanwhile; otherwise the MR gets a note saying what has to change. An approved MR that
+# changes attention_paths, or something the reviewer says a person has to decide (a security boundary, a weakened
+# CI check, a destructive data change, behaviour the ticket did not ask for), also gets a note listing it for a
+# person before merge. What only whoever deploys it needs to know (an environment variable, a requested upgrade)
+# is listed under its own heading and keeps the MR approved. What has to change goes back to the author, and its
+# new commits are reviewed again without anyone asking, fix_rounds times per ticket; then a person takes over.
+review_agent:
+  enabled: false
+  command: /review
+  require_green_ci: true               # approve only when the newest CI run is for the reviewed commit and passed
+  timeout: 2h                          # the review's run; past it the run is stopped and nothing is approved
+  max_suggestions: 5                   # non-blocking ideas per MR
+  max_per_ticket: 10
+  fix_rounds: 3                        # review -> author fixes -> review again, unasked; 0: people pass findings on
+  # attention_paths: changed files a person is always asked to look at, whatever the reviewer says. The default
+  # (config.py, ATTENTION_PATHS) is the security boundary and secrets: auth, permission, crypt, secret, .env;
+  # ordinary test files and docs are left out of it. A list set here replaces it and applies to tests too.
+  # review_hint_paths: files the reviewer reads with extra care (CI, Docker, Makefile, dependencies, settings,
+  # migrations, SQL); they go to a person only when the reviewer names them. Default in config.py (REVIEW_HINT_PATHS). A pattern without /
+  # matches the file name anywhere; ** crosses folders.
+  #   attention_paths: ["**/migrations/**", "*auth*", ".gitlab-ci.yml"]
 
 # What agents leave behind: containers, test volumes, dev servers, files in the repositories, old media.
 # A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than

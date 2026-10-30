@@ -211,6 +211,7 @@ class MRStatus:
     ci_sha: str | None = None   # the commit that run is for: a run for an older commit is not a signal
     ci_url: str | None = None
     closed_by: str = ""         # who closed it, when it is closed
+    target: str = ""            # the branch it merges into ("" when the host does not say)
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,14 @@ class Note:
     line: int | None
     url: str
     commit: str | None = None  # the version of the merge request a diff comment was written on
+
+
+@dataclass(frozen=True)
+class Approval:
+    """What became of an approval the review agent asked for."""
+    done: bool           # the approver's approval is on the merge request now
+    detail: str = ""     # why not, in words for people
+    stale: bool = False  # the merge request has commits newer than the reviewed one
 
 
 @dataclass(frozen=True)
@@ -246,6 +255,8 @@ class CodeHost(Protocol):
     - Conflict detection: conflict=None; the agent learns of a conflict from people instead.
     - Threads: reply() posting a plain comment on the merge request; it carries the same marker.
     - Uploads: supports_uploads False; screenshots go to the ticket only.
+    - Approval: supports_approval False (no approver account, or a host without approvals); the review
+      agent then says what it found in a note and approves nothing.
     """
 
     name: str          # the service in health checks, metrics and events: "gitlab"
@@ -293,7 +304,24 @@ class CodeHost(Protocol):
     def note_mr(self, repo_id: Id, iid: Id, body: str) -> None:
         """A plain comment on the merge request."""
 
+    def note_review(self, repo_id: Id, iid: Id, body: str) -> None:
+        """The code review's note: as the approver when there is one, so the review is not signed by the author."""
+
+    reviewer: str  # who signs the code review's notes: the approver, or the bot without one
+
     def close_mr(self, repo_id: Id, iid: Id) -> None: ...
+
+    # Only when supports_approval (config `code_host.approver`): the approver's account, not the bot's.
+    supports_approval: bool
+    approver: str  # the approver's username ("" without one)
+
+    def approve(self, repo_id: Id, iid: Id, sha: str) -> Approval:
+        """Approve as the approver, for exactly `sha`: a merge request that moved on since is not approved
+        (stale). Already approved by the approver is done. A refusal by the host is an Approval with the
+        reason, never an exception; an outage raises a ServiceError and is tried again."""
+
+    def revoke(self, repo_id: Id, iid: Id) -> bool:
+        """Take the approver's approval back, if it is there. True when one was taken back."""
 
     def upload(self, repo_id: Id, name: str, data: bytes, mime: str) -> str:
         """Store a file for the merge request's description; returns the URL Markdown links to."""
@@ -363,7 +391,9 @@ def build_tracker(cfg: Config, secrets: Secrets, transport=None) -> IssueTracker
 
 
 def build_code_host(cfg: Config, secrets: Secrets, transport=None) -> CodeHost:
-    return code_host_type(cfg.code_host.type).build(cfg.code_host, secrets.code_host, cfg.http, transport)
+    # The approver's token only when one is configured: a provider without approvals never sees the keyword.
+    extra = {"approver_token": secrets.approver} if cfg.code_host.approver and secrets.approver else {}
+    return code_host_type(cfg.code_host.type).build(cfg.code_host, secrets.code_host, cfg.http, transport, **extra)
 
 
 def usable_repos(cfg: Config, repos: list[Repo]) -> list[Repo]:
