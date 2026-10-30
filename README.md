@@ -121,3 +121,16 @@ ARCEUS_REAL_ENGINE=/opt/bulava/engine .venv/bin/pytest -q   # on a machine with 
 `./verify.sh` from the root runs the runner's tests and the setup script's test. No model is called. The sandbox and its live scenarios are not part of it: they are for work on the pipeline itself and are run by hand (`sandbox/sandbox.sh test`, `sandbox/sandbox.sh live`).
 
 Where a local `sandbox/` exists, the same runs in a container before anything reaches the VM; `sandbox/README.md` there says how.
+
+## Licence
+
+**FSL-1.1-ALv2**: the Functional Source License with an Apache 2.0 future grant. See
+[LICENSE](LICENSE).
+
+In plain words: read it, change it, run it, use it inside your company, teach and research with
+it. What you may not do is sell a competing product or service built on it. Two years after each
+version is published, that version becomes available under Apache 2.0 as well, and the restriction
+no longer applies to it.
+
+The licence covers Arceus's own code. Bulava is not part of this repository: `setup.sh` fetches it
+from `BULAVA_SOURCE`, and it comes under its own licence, FSL-1.1-ALv2 as well.
