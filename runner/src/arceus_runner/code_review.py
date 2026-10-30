@@ -51,6 +51,7 @@ from pathlib import Path
 
 from arceus_runner.config import DOC_PATHS, TEST_PATHS
 from arceus_runner.db import ACTIVE_STATES, ReviewRequest, ReviewStore, Task
+from arceus_runner.delivery import ProjectNotesError
 from arceus_runner.engine import EngineError
 from arceus_runner.gitops import HOME_BRANCH, GitError
 from arceus_runner.http import ServiceError
@@ -461,6 +462,12 @@ class ReviewAgent:
                                                "review.", outcome="nothing")
             return
         group = {r.relative_path: r for r in self.d._group()}
+        try:
+            self.d.task_notes(task)  # the task's own, for the reviewer to judge by the rules the work had
+        except ProjectNotesError as e:
+            self._refuse(row, task, "project_notes", f"the project's notes for the agent cannot be given to the "
+                                                     f"reviewer ({e}); no review was run.", outcome="unverified")
+            return
         ws = self.cfg.paths.workspace
         branch = self._branch(row)
         mrs, dirty = [], []
@@ -531,6 +538,13 @@ class ReviewAgent:
         task = self.store.task(row.task_id)
         ws = self.cfg.paths.workspace
         branch = snap["branch"]
+        # The review's branch of the home starts from main: main gets the task's notes, not the newest.
+        try:
+            notes = self.d.task_notes(task)
+        except ProjectNotesError as e:  # kept when the review was prepared, then removed by hand
+            self._settled(row, None, f"the project's notes for the agent cannot be given to the reviewer ({e})")
+            return
+        self.d.prepare_home(self.d._group(), notes)
         for m in snap["mrs"]:
             self.git.start_branch(ws / m["repo"], branch, m["sha"])
         extra = self._extra_dirs(row)

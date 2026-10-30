@@ -485,6 +485,8 @@ class Paths(Strict):
     secrets: ExpandedPath = Path("~/arceus/data/secrets.env").expanduser()
     db: ExpandedPath = Path("~/arceus/data/runner.db").expanduser()
     events: ExpandedPath = Path("~/arceus/data/events.jsonl").expanduser()
+    # The project's own notes for the agent, put into the workspace's AGENTS.md (delivery.home_files)
+    project_notes: ExpandedPath | None = None
 
 
 def _provider_section(kind: str):

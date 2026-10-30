@@ -180,3 +180,6 @@ paths:
   secrets: ~/arceus/data/secrets.env # the runner reads it itself; tokens never enter its environment
   db: ~/arceus/data/runner.db
   events: ~/arceus/data/events.jsonl
+  # The project's own notes for the agent (setup.sh creates it from config/project-notes.example.md):
+  # added to the AGENTS.md every task starts with. Remove the line for none.
+  project_notes: ~/arceus/data/project-notes.md
