@@ -921,6 +921,9 @@ class ReviewStore(TaskStore):
                 self.conn.execute("UPDATE signals SET batch_id = ? WHERE id = ?", (batch_id, sid))
         return self.batch(batch_id)
 
+    def set_batch_text(self, batch_id: str, text: str) -> None:
+        self.conn.execute("UPDATE batches SET text = ? WHERE id = ?", (text, batch_id))
+
     def batch_sent(self, batch_id: str, at: str) -> None:
         self.conn.execute("UPDATE batches SET sent_at = ? WHERE id = ?", (at, batch_id))
 

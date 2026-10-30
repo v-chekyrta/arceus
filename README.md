@@ -98,7 +98,6 @@ Optional, off by default: **code review on request** (`review_agent`). `/review`
 Not there yet:
 
 - **The agent pushing its own branch.** The agent's git is set up (fetch and pull work), but Bulava's server profile refuses `git push` inside a run; a setting for it is requested from Bulava. Until then the runner pushes the reviewed commit itself.
-- **Branch protection on the code host** is not set up by `setup.sh`. `setup/checks/gitlab-protection.py` reports repositories where Developers (and so the bot) may merge into `main` or force push; a GitLab admin has to change it.
 - An outbound traffic allowlist, alerts, and the metrics that need MR history.
 
 ## Repository

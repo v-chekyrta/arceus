@@ -189,6 +189,16 @@ class Git:
             raise GitError(f"git diff {default}...{sha[:12]}: {self._scrub(res.stderr.strip())[-500:]}")
         return res.returncode == 1
 
+    def unreviewed_below(self, repo: Path, base: str, sha: str, target: str, limit: int = 10) -> list[str]:
+        """Commits `sha` would bring into `target` that a review of `base..sha` never saw: those it shares with
+        `base` and `target` lacks. None when `base` is on `target`; a `base` that a rebase left off the branch
+        still leaves its shared history to check."""
+        bases = self._run(["merge-base", "--all", base, sha], repo, check=False).stdout.split()
+        if not bases:
+            return []
+        out = self._run(["log", "--format=%h %s", f"-{limit}", *bases, "--not", target], repo).stdout
+        return [line for line in out.splitlines() if line.strip()]
+
     def changed_files(self, repo: Path, default: str, sha: str) -> list[str]:
         """The files `sha` changes compared with where it left `default`, as a merge request shows them."""
         out = self._run(["diff", "--name-only", "-z", f"{default}...{sha}"], repo).stdout
@@ -306,9 +316,46 @@ class Git:
         """Delete the branch only if it still points at `sha`: a commit made since keeps it."""
         self._run(["update-ref", "-d", f"refs/heads/{branch}", sha], repo)
 
-    def push_sha(self, repo: Path, sha: str, branch: str) -> None:
-        """Push exactly this commit to the branch. No force: a diverged remote branch is an error."""
-        self._run(["push", "--quiet", "origin", f"{sha}:refs/heads/{branch}"], repo, network=True)
+    def push_sha(self, repo: Path, sha: str, branch: str, replaces: str | None = None) -> None:
+        """Push exactly this commit to the branch. Without `replaces` only a fast-forward: a diverged remote
+        branch is an error. With it the branch is rewritten (a rebased MR branch), but only while the code host
+        still has exactly that commit there: anything pushed since makes the push fail, and nothing is lost."""
+        lease = [f"--force-with-lease=refs/heads/{branch}:{replaces}"] if replaces else []
+        self._run(["push", "--quiet", *lease, "origin", f"{sha}:refs/heads/{branch}"], repo, network=True)
+
+    def carries(self, repo: Path, sha: str, base: str, tip: str) -> bool:
+        """`sha` already holds everything `tip` changed since `base`: merging `tip` into it would change nothing.
+
+        Judged by content, not by commits: a change carried over by a rebase or a cherry-pick counts, one
+        reverted since, or a merge commit's own conflict resolution left behind, does not."""
+        res = self._run(["merge-tree", "--write-tree", f"--merge-base={base}", sha, tip], repo, check=False)
+        if res.returncode not in (0, 1):
+            raise GitError(f"git merge-tree: {self._scrub(res.stderr.strip())[-500:]}")
+        tree = res.stdout.split("\n", 1)[0].strip()
+        return res.returncode == 0 and tree == self._run(["rev-parse", f"{sha}^{{tree}}"], repo).stdout.strip()
+
+    def unfinished(self, repo: Path) -> str | None:
+        """The git operation started here and neither finished nor aborted: "rebase", "cherry-pick", "revert",
+        "merge", or None."""
+        def there(name: str) -> bool:
+            return (repo / self._run(["rev-parse", "--git-path", name], repo).stdout.strip()).exists()
+        if there("rebase-merge") or there("rebase-apply"):
+            return "rebase"
+        if there("CHERRY_PICK_HEAD"):
+            return "cherry-pick"
+        if there("REVERT_HEAD"):
+            return "revert"
+        if there("MERGE_HEAD"):
+            return "merge"
+        if there("sequencer/todo"):  # a cherry-pick or revert of several commits, stopped between two of them
+            return "revert" if "revert" in (repo / self._run(["rev-parse", "--git-path", "sequencer/opts"],
+                                                             repo).stdout.strip()).read_text(errors="replace") \
+                else "cherry-pick"
+        return None
+
+    def abort(self, repo: Path, operation: str) -> None:
+        """Back to where the operation started: the commits made before it are kept, the half-done part goes."""
+        self._run([operation, "--abort"], repo)
 
 
 def write_git_credentials(base_url: str, username: str, token: str, home: Path | None = None) -> bool:
