@@ -272,6 +272,76 @@ def test_metrics_show_the_step_activity_and_the_last_tick(w):
     assert value("runner_last_tick_seconds") == T0.timestamp()
 
 
+def review_running(w, did: str = "review-dispatch-1") -> str:
+    """The ticket waits on people in code_review while its review runs as an engine task of its own."""
+    w.store.update_task("ACME-1", state="code_review")
+    row = w.store.add_review("ACME-1", "c1", "j", 1, "")
+    w.store.update_review(row.id, state="running")
+    d = w.state / "tasks" / task_key(row.id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "task.json").write_text(json.dumps({"task_id": row.id, "state": "running", "attempts": [
+        {"n": 1, "dispatch_id": did, "instance": str(w.instance)}]}))
+    return row.id
+
+
+def test_a_code_review_is_followed_by_its_own_id_while_the_engine_has_it(w):
+    rid = review_running(w)
+    w.step("deliver", "delivered", 1000, did="review-dispatch-1")
+    w.step("gate", "running", 2000, did="review-dispatch-1")
+    p = w.watcher()
+    p.poll()
+    steps = w.emitted("engine_step")
+    assert [(s["task_id"], s["stage"]) for s in steps] == [(rid, "deliver"), (rid, "gate")]
+    [cur] = p.snapshot()
+    assert (cur.task_id, cur.step.stage) == (rid, "gate")
+
+    again = w.watcher()  # a restart: the review's cursor holds, nothing is written twice
+    again.poll()
+    assert len(w.emitted("engine_step")) == 2 and again.snapshot()[0].step.stage == "gate"
+
+    w.step("run", "done", 3000, did="review-dispatch-1")
+    w.store.update_review(rid, state="restoring")  # the run is over: the workspace is being put back
+    again.poll()
+    assert [s["stage"] for s in w.emitted("engine_step")] == ["deliver", "gate", "run"]
+    assert again.snapshot() == []
+
+
+def test_a_code_review_counts_as_busy_only_while_it_holds_the_workspace(w):
+    w.store.update_task("ACME-1", state="code_review")
+    row = w.store.add_review("ACME-1", "c1", "j", 1, "")
+
+    def busy(state: str) -> float:
+        w.store.update_review(row.id, state=state)
+        m = Metrics()
+        m.update_busy(w.store)
+        return m.registry.get_sample_value("runner_agent_busy")
+
+    assert [busy(s) for s in ("pending", "preparing", "running", "restoring", "publishing", "done")] == [
+        0, 1, 1, 1, 0, 0]
+
+
+def test_metrics_show_a_running_code_review(w):
+    rid = review_running(w)
+    w.step("gate.verify", "running", 1_792_929_000_000, did="review-dispatch-1")
+    p = w.watcher()
+    p.poll()
+
+    class R:
+        progress = p
+        last_tick = T0.timestamp()
+
+    m = Metrics()
+    m.update_progress(R)
+    value = m.registry.get_sample_value
+    assert value("runner_task_step_since_seconds",
+                 {"task_id": rid, "stage": "gate.verify", "state": "running"}) == 1_792_929_000
+    w.store.update_review(rid, state="restoring")
+    p.poll()
+    m.update_progress(R)
+    assert value("runner_task_step_since_seconds",
+                 {"task_id": rid, "stage": "gate.verify", "state": "running"}) is None
+
+
 def test_engine_state_is_written_when_it_changes_and_not_on_every_tick(w, cfg):
     d = Delivery(cfg, w.store, w.events, None, None, None, None, None)
     task = w.store.task("ACME-1")

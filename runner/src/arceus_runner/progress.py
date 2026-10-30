@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from arceus_runner.db import TaskStore
+from arceus_runner.db import ReviewStore
 from arceus_runner.events import EventLog
 
 NOTE_LIMIT = 300
@@ -113,7 +113,7 @@ def tool_target(name: str, args: dict, workspace: Path) -> str:
 
 
 class ProgressWatcher:
-    def __init__(self, state_dir: Path, workspace: Path, store: TaskStore, events: EventLog,
+    def __init__(self, state_dir: Path, workspace: Path, store: ReviewStore, events: EventLog,
                  now: Callable[[], datetime] = lambda: datetime.now(UTC), *,
                  activity_every: timedelta = timedelta(minutes=1), quiet_after: timedelta = timedelta(minutes=20),
                  projects_dir: Path | None = None):
@@ -130,7 +130,10 @@ class ProgressWatcher:
     # -- one look ---------------------------------------------------------------------------------
 
     def poll(self) -> None:
-        active = {t.task_id for t in self.store.tasks("dispatched")}
+        # A code review runs as an engine task of its own (<ticket key>.review-<n>) while its ticket waits in
+        # code_review: it is followed by that id, like any dispatched task. Only while the engine has it: before
+        # the dispatch there are no steps yet, and once it is restoring the workspace the run's steps are over.
+        active = {t.task_id for t in self.store.tasks("dispatched")} | {r.id for r in self.store.reviews("running")}
         for gone in set(self.tasks) - active:
             # Over, or waiting on a person: nothing runs, nothing more to show. The steps the engine wrote
             # since the last look (the gate's verdict that ended the attempt) are read once more first.

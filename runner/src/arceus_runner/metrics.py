@@ -28,7 +28,7 @@ class Metrics:
         self.health = Gauge("runner_health", "Health check: 0 ok, 1 warn, 2 fail", ["check"], registry=r)
         self.tasks = Gauge("runner_tasks", "Tasks the runner took, by runner state", ["state"], registry=r)
         self.queue = Gauge("runner_queue_length", "Accepted tickets waiting to be taken", registry=r)
-        self.busy = Gauge("runner_agent_busy", "1 while a task holds the agent", registry=r)
+        self.busy = Gauge("runner_agent_busy", "1 while a task or a code review holds the agent", registry=r)
         self.can_take = Gauge("runner_can_take", "1 when health allows new work", registry=r)
         # role: tracker or code_host, so a dashboard reads them whichever provider config.yaml names.
         self.service_up = Gauge("runner_service_up", "1 when the service answers", ["service", "role"], registry=r)
@@ -91,7 +91,7 @@ class Metrics:
         for state, n in counts.items():
             self.tasks.labels(state).set(n)
         self.queue.set(len(runner.store.accepted_untaken()))
-        self.busy.set(1 if runner.store.tasks("claimed", "dispatched", "publishing") else 0)
+        self.update_busy(runner.store)
         self.can_take.set(1 if runner.can_take() else 0)
 
         for role, client in (("tracker", runner.tracker.client), ("code_host", runner.code_host.client)):
@@ -102,6 +102,12 @@ class Metrics:
         self.update_usage(cfg.paths.bulava_state)
         self.update_progress(runner)
         self.update_cleanup(getattr(runner, "cleanup", None))
+
+    def update_busy(self, store) -> None:
+        # A code review is a record of its own: its ticket sits in code_review, waiting on people, while the
+        # review has the workspace and the engine.
+        busy = store.tasks("claimed", "dispatched", "publishing") or store.review_holding()
+        self.busy.set(1 if busy else 0)
 
     def update_cleanup(self, cleanup) -> None:
         self.cleanup_ok.clear()

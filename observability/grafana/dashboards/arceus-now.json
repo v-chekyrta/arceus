@@ -20,7 +20,7 @@
       "id": 1,
       "type": "stat",
       "title": "Agent",
-      "description": "Working while a task holds the agent: taken, in Bulava, or being published. It says nothing about whether the agent is moving; see Step, Agent quiet and Runner loop.",
+      "description": "Working while a task holds the agent (taken, in Bulava, or being published) or a code review has the workspace. It says nothing about whether the agent is moving; see Step, Agent quiet and Runner loop.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -453,7 +453,7 @@
       "id": 7,
       "type": "stat",
       "title": "Step",
-      "description": "The engine's current step of the running task, from the run's own journal: preparation stages, deliver (the brief reached the agent), gate, gate.verify (build and tests), gate.review (Codex), outcome, run (the verdict). waiting means a usage limit or an unavailable reviewer.",
+      "description": "The engine's current step of the running task or code review, from the run's own journal: preparation stages, deliver (the brief reached the agent), gate, gate.verify (build and tests), gate.review (Codex), outcome, run (the verdict). waiting means a usage limit or an unavailable reviewer.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -874,7 +874,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{source=~\"runner|bulava\", event=~\"task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|review_sent|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|created|attempt-started|attempt-ended|stale-verdict\"} | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{else if eq .event \"engine_step\"}}step  {{.task_id}}  {{.stage}} · {{.state}}{{with .note}}  — {{.}}{{end}}{{with .ms_taken}}  ({{.}} ms){{end}}{{else if eq .event \"agent_activity\"}}agent  {{.task_id}}  {{.tools}} tool calls, last {{.last_tool}}{{with .last_target}}: {{.}}{{end}}{{else if eq .event \"agent_quiet\"}}agent  {{.task_id}}  nothing written for {{.minutes}} min{{with .step}} (step {{.}}){{end}}{{else if eq .event \"engine_state\"}}engine  {{.task_id}}  {{.state}}, attempt {{.attempt}}{{if and (eq .state \"running\") (eq .attempt_live \"false\")}}, no live session{{end}}{{with .state_reason}}  — {{.}}{{end}}{{else if eq .event \"engine_call_started\"}}{{.call}}  {{.task_id}}  started{{else if eq .event \"engine_call_finished\"}}{{.call}}  {{.task_id}}  {{.result}} in {{.seconds}} s{{with .reason}}  — {{.}}{{end}}{{else}}{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .repo}}  {{.}}{{end}}{{with .seconds}}  {{.}} s{{end}}{{with .reason}}  — {{.}}{{end}}{{with .url}}  {{.}}{{end}}{{end}}`",
+          "expr": "{source=~\"runner|bulava\", event=~\"task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|review_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|created|attempt-started|attempt-ended|stale-verdict\"} | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{else if eq .event \"engine_step\"}}step  {{.task_id}}  {{.stage}} · {{.state}}{{with .note}}  — {{.}}{{end}}{{with .ms_taken}}  ({{.}} ms){{end}}{{else if eq .event \"agent_activity\"}}agent  {{.task_id}}  {{.tools}} tool calls, last {{.last_tool}}{{with .last_target}}: {{.}}{{end}}{{else if eq .event \"agent_quiet\"}}agent  {{.task_id}}  nothing written for {{.minutes}} min{{with .step}} (step {{.}}){{end}}{{else if eq .event \"engine_state\"}}engine  {{.task_id}}  {{.state}}, attempt {{.attempt}}{{if and (eq .state \"running\") (eq .attempt_live \"false\")}}, no live session{{end}}{{with .state_reason}}  — {{.}}{{end}}{{else if eq .event \"engine_call_started\"}}{{.call}}  {{.task_id}}  started{{else if eq .event \"engine_call_finished\"}}{{.call}}  {{.task_id}}  {{.result}} in {{.seconds}} s{{with .reason}}  — {{.}}{{end}}{{else}}{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .repo}}  {{.}}{{end}}{{with .seconds}}  {{.}} s{{end}}{{with .reason}}  — {{.}}{{end}}{{with .url}}  {{.}}{{end}}{{end}}`",
           "datasource": {
             "type": "loki",
             "uid": "loki"

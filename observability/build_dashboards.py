@@ -125,7 +125,7 @@ BULAVA_LINE = (' | json | line_format "{{.kind}}  {{.task_id}}  attempt {{.attem
 # run's journal, the agent's activity, and Bulava's task stream (its `kind` is the event label there).
 PROGRESS_EVENTS = ("task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|"
                    "workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|"
-                   "review_sent|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|"
+                   "review_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|"
                    "created|attempt-started|attempt-ended|stale-verdict")
 PROGRESS_LINE = (' | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}'
                  '{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}'
@@ -220,8 +220,9 @@ def now_dashboard():
     panels = [
         stat("Agent", "runner_agent_busy", grid(0, 0, 4, 4),
              mappings=mapping([(1, "Working", SERIES[0]), (0, "Idle", MUTED)]),
-             desc="Working while a task holds the agent: taken, in Bulava, or being published. It says nothing about "
-                  "whether the agent is moving; see Step, Agent quiet and Runner loop."),
+             desc="Working while a task holds the agent (taken, in Bulava, or being published) or a code review has "
+                  "the workspace. It says nothing about whether the agent is moving; see Step, Agent quiet and Runner "
+                  "loop."),
         stat("Queue", "runner_queue_length", grid(4, 0, 4, 4), color="text",
              desc="Tickets tagged by an allowed person and not taken yet."),
         stat("Takes new work", "runner_can_take", grid(8, 0, 4, 4),
@@ -236,8 +237,8 @@ def now_dashboard():
              desc="observe: reads and logs only. live: takes tasks and opens MRs."),
         stat("Step", "runner_task_step_since_seconds", grid(0, 4, 9, 4), color=SERIES[0], name="{{stage}} · {{state}}",
              no_value="No step running",
-             desc="The engine's current step of the running task, from the run's own journal: preparation stages, "
-                  "deliver (the brief reached the agent), gate, gate.verify (build and tests), gate.review (Codex), "
+             desc="The engine's current step of the running task or code review, from the run's own journal: "
+                  "preparation stages, deliver (the brief reached the agent), gate, gate.verify (build and tests), gate.review (Codex), "
                   "outcome, run (the verdict). waiting means a usage limit or an unavailable reviewer."),
         stat("In this step", "time() - max(runner_task_step_since_seconds)", grid(9, 4, 5, 4), unit="s", color="text",
              desc="How long the task has been in the step on the left."),
