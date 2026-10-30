@@ -93,7 +93,7 @@ def _mr(d: dict) -> MergeRequest:
     closed = d.get("closed_at")
     return MergeRequest(iid=d["iid"], url=d.get("web_url") or "", state=_state(d.get("state")),
                         closed_at_ms=int(datetime.fromisoformat(closed.replace("Z", "+00:00")).timestamp() * 1000)
-                        if closed else None)
+                        if closed else None, target=d.get("target_branch") or "")
 
 
 class GitLabWriter(GitLab):

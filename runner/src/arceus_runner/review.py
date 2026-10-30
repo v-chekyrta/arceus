@@ -56,6 +56,55 @@ THREAD_CHARS = 8000  # one thread: its first note and the latest ones, the middl
 _OUR_MARKER = re.compile(r"\s*<!-- arceus:[^>]*-->")
 
 
+def conflict_text(repo: str, target: str, default: str = "") -> str:
+    """`default`: the branch the task branch was started from, when the MR now merges somewhere else."""
+    if default and default != target:
+        how = (f"The task branch was started from {default}; move only this ticket's commits onto the latest "
+               f"{target}, none of {default}'s: git fetch origin && git rebase --onto origin/{target} <base>, "
+               f"where <base> is the commit just below your first commit for this ticket (git log --oneline "
+               f"origin/{target}..HEAD lists what moves; nothing of {default} may be in it afterwards).")
+    else:
+        how = f"Rebase the task branch onto the latest {target}: git fetch origin && git rebase origin/{target}."
+    return (f"The MR in {repo} conflicts with {target}. {how} Resolve each conflict, git add the files and "
+            f"git rebase --continue until the rebase is done; never leave it half done (git status shows no "
+            f"rebase in progress), and do not merge {target} in. If earlier rounds merged {target} into the "
+            f"branch, the rebase replays its commits without those merges and their conflicts may come up again: "
+            f"resolve them the same way. "
+            f"Then run the checks again. Do not push: the runner publishes the rebased branch to the same MR.")
+
+
+def _pull_rebase(branch: str) -> str:
+    return (f"Put your commits on top of theirs: git pull --rebase origin {branch}, resolving any conflicts and "
+            f"finishing with git rebase --continue.")
+
+
+_MOVED_TAIL = "Keep every one of their changes, and do not merge. Do not push: the runner publishes the branch."
+_ROUND_RULE = ("- Make code changes with new commits on the same branch and commit everything. Rebase only "
+               "as a conflict or a push by people above asks; never merge and never push. If nothing in this "
+               "round needs a code change, change nothing and say why in your result.")
+# What earlier versions of the runner wrote into signals and rounds that may still wait in the database to be
+# sent: told to merge, where the runner now has conflicts and people's pushes taken in by rebase.
+_FORMER = [
+    (re.compile(r"The MR in (\S+) conflicts with (\S+)\. Merge the latest \2 into the task branch "
+                r"\(git fetch origin && git merge origin/\2\), resolve the conflicts and commit\. No rebase\."),
+     lambda m: conflict_text(m[1], m[2])),
+    (re.compile(r"Merge them in: git pull --no-rebase origin (\S+), resolve any conflicts and commit\. "
+                r"Do not rewrite other people's commits\."),
+     lambda m: f"{_pull_rebase(m[1])} {_MOVED_TAIL}"),
+    (re.compile(r"- Make code changes with new commits on the same branch, without rebase or force push, and "
+                r"commit everything\. If nothing in this round needs a code change, change nothing and say why "
+                r"in your result\."),
+     lambda m: _ROUND_RULE),
+]
+
+
+def current_instructions(text: str) -> str:
+    """`text` with what an earlier runner told the agent about conflicts replaced by what it tells it now."""
+    for pattern, new in _FORMER:
+        text = pattern.sub(new, text)
+    return text
+
+
 def _closed_id(mr) -> str:
     return f"closed-{key_part(mr.project_id)}-{key_part(mr.iid)}"
 
@@ -224,20 +273,26 @@ class ReviewLoop:
 
     def _conflict(self, task: Task, mr, st: MRStatus, now: str) -> None:
         # Hosts work mergeability out asynchronously: only a confirmed conflict counts, never "not known yet".
+        if st.conflict is False and mr.handled_conflict:
+            # It merges cleanly now. The target may still move on and conflict with the same commit again:
+            # that is a new conflict, so the next one is sent too.
+            self.store.update_mr(task.task_id, mr.repo, handled_conflict=None)
+            return
         if st.conflict is not True or mr.handled_conflict == st.sha:
             return
-        target = self._target(mr)
-        text = (f"The MR in {mr.repo} conflicts with {target}. Merge the latest {target} into the task branch "
-                f"(git fetch origin && git merge origin/{target}), resolve the conflicts and commit. No rebase.")
+        default = self._target(mr)
+        text = conflict_text(mr.repo, st.target or default, default)
+        sig_id = _conflict_signal(mr, st.sha)
+        if self.store.signal(sig_id):  # this commit conflicted before, then merged cleanly until the target moved
+            sig_id += f"-{key_part(now)}"
         with self.store.transaction():
-            self.store.add_signal(_conflict_signal(mr, st.sha), task.task_id, "conflict", self.host.name,
-                                  text, now, repo=mr.repo)
+            self.store.add_signal(sig_id, task.task_id, "conflict", self.host.name, text, now, repo=mr.repo)
             self.store.update_mr(task.task_id, mr.repo, handled_conflict=st.sha)
         self.events.emit("review_signal", task_id=task.task_id, kind="conflict", repo=mr.repo)
 
     def _stale(self, task: Task, signals: list[Signal]) -> bool:
         """Every signal is a CI run or a conflict that is over: the pipeline passed or was replaced, or the host
-        now says the MR merges cleanly (a `/continue` or another round merged the target in meanwhile). A
+        now says the MR merges cleanly (a `/continue` or another round rebased the branch meanwhile). A
         conflict the host cannot judge yet still counts."""
         if not signals or any(s.kind not in ("ci", "conflict") for s in signals):
             return False
@@ -378,6 +433,13 @@ class ReviewLoop:
     def _send(self, task: Task, batch) -> None:
         if self.d._workspace_waits(task):
             return  # the batch stays open and goes on a later tick
+        text = current_instructions(batch.text)
+        if text != batch.text:
+            # Made by an earlier runner, which told the agent to merge: it goes with today's instructions, and the
+            # changed text is screened afresh below.
+            self.store.set_batch_text(batch.id, text)
+            self.events.emit("review_batch_updated", task_id=task.task_id, batch=batch.id)
+            batch = self.store.batch(batch.id)
         # The batch is stored, so a held round is screened once and waits as it is; others go on meanwhile.
         authors = [*json.loads(batch.authors or "[]"),
                    *(s.author for s in self.store.signals(task.task_id, batch.id) if s.kind in ("review", "ticket"))]
@@ -468,7 +530,7 @@ class ReviewLoop:
                 continue
             mine = [s for s in signals if s.kind == kind]
             if mine:
-                lines += ["", f"## {title}", *(f"- {s.body}" for s in mine)]
+                lines += ["", f"## {title}", *(f"- {current_instructions(s.body)}" for s in mine)]
         lines += ["", "## What to do", ""]
         if threads and batch_id:
             home = self.cfg.paths.workspace.resolve()
@@ -486,9 +548,7 @@ class ReviewLoop:
                 "who asked, in English: what you changed, or the answer to their question. The runner posts "
                 f"each answer in its thread; you cannot post in {self.host.label} yourself.",
             ]
-        lines += ["- Make code changes with new commits on the same branch, without rebase or force push, and "
-                  "commit everything. If nothing in this round needs a code change, change nothing and say why "
-                  "in your result."]
+        lines += [_ROUND_RULE]
         return "\n".join(lines)
 
     # -- after the round ------------------------------------------------------------------------
@@ -592,13 +652,32 @@ class ReviewLoop:
         self.store.action_done(key)
         self.store.mark_replied(payload["signal"])
 
-    def note_moved(self, task: Task, repo: str, remote: str, sha: str) -> None:
-        """People pushed to the MR branch while the agent worked: hand it to the agent to merge in."""
+    def note_moved(self, task: Task, repo: str, remote: str, sha: str, published: str | None = None,
+                   rewritten: bool = False) -> None:
+        """People pushed to the MR branch while the agent worked: hand it to the agent to bring their commits in.
+
+        `rewritten`: the agent's work no longer builds on the runner's last push there (it rebased the branch).
+        Their commits then go on top of it, so the runner may publish it over theirs (Delivery._replaceable);
+        otherwise the agent's own commits go on top of theirs and the push is a plain one.
+        """
         now = self.d.now().isoformat()
         host = self.host.label
+        sig_id = f"moved-{repo}-{remote}"
+        sig = self.store.signal(sig_id)
+        if sig and sig.batch_id:
+            batch = self.store.batch(sig.batch_id)
+            if batch and batch.sent_at and batch.sent_at != "stale":
+                self.d.fail(task, f"the agent's work in {repo} does not visibly keep the commits people pushed "
+                                  "to the MR branch",
+                            f"on {host} {remote[:12]}, reviewed {sha[:12]}; nothing was pushed, their commits stay.")
+                return
+        if rewritten and published:
+            how = (f"Your branch is rebased, so put their commits on top of it: git fetch origin && "
+                   f"git cherry-pick {published[:12]}..origin/{task.branch}, resolving any conflicts.")
+        else:
+            how = _pull_rebase(task.branch)
         text = (f"Branch {task.branch} of {repo} on {host} has commits that you do not have "
-                f"({host} {remote[:12]}, yours {sha[:12]}). Merge them in: git pull --no-rebase origin {task.branch}, "
-                f"resolve any conflicts and commit. Do not rewrite other people's commits.")
-        self.store.add_signal(f"moved-{repo}-{remote}", task.task_id, "moved", self.host.name, text, now, repo=repo)
+                f"({host} {remote[:12]}, yours {sha[:12]}). {how} {_MOVED_TAIL}")
+        self.store.add_signal(sig_id, task.task_id, "moved", self.host.name, text, now, repo=repo)
         self.store.update_task(task.task_id, state="code_review")
         self.events.emit("review_signal", task_id=task.task_id, kind="moved", repo=repo)

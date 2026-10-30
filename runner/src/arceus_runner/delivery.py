@@ -400,7 +400,9 @@ class Delivery:
 
         The workspace is shared, so another task may have switched a repository to its own branch
         in between; and people may have pushed to the MR branch. Both are put right here; nothing
-        local is rewritten (catch_up only fast-forwards).
+        local is rewritten (catch_up only fast-forwards). A repository in the middle of a rebase or a
+        cherry-pick is the agent's own unfinished work (a session cut off by a crash): it is left as it is, for
+        the agent to finish.
 
         False, with nothing touched, while the follow-up has to wait: another task works in the
         workspace, or a repository that has to change branch holds uncommitted work (a checkout
@@ -415,6 +417,8 @@ class Delivery:
         for name in self._names(task):
             path = self.cfg.paths.workspace / name
             if not (path / ".git").exists() or not self.git.branch_exists(path, task.branch):
+                continue
+            if self.git.unfinished(path):
                 continue
             repos.append((name, path, self.git.current_branch(path) != task.branch))
         # All checked before anything is switched: a follow-up never starts in a half-switched workspace.
@@ -807,6 +811,7 @@ class Delivery:
         for name in self._names(task):
             path = self.cfg.paths.workspace / name
             try:
+                self._end_unfinished(task, name, path)
                 if not (path / ".git").exists() or self.git.current_branch(path) != task.branch \
                         or self.git.is_clean(path):
                     continue
@@ -815,6 +820,20 @@ class Delivery:
                 self.events.emit("progress_saved", task_id=task.task_id, repo=name, sha=sha)
             except GitError as e:
                 self.events.emit("progress_not_saved", task_id=task.task_id, repo=name, reason=str(e))
+
+    def _end_unfinished(self, task: Task, name: str, path: Path) -> str | None:
+        """A rebase, cherry-pick, revert or merge the attempt left half done is undone: the branch is back as it
+        was before it, with every commit it had.
+
+        Committing in the middle of one would commit conflict markers (on a detached HEAD, in a rebase), and a
+        checkout would leave it hanging over the next task in this repository."""
+        if not (path / ".git").exists():
+            return None
+        operation = self.git.unfinished(path)
+        if operation:
+            self.git.abort(path, operation)
+            self.events.emit("git_operation_aborted", task_id=task.task_id, repo=name, operation=operation)
+        return operation
 
     def ask(self, task: Task, show: dict) -> None:
         q = show.get("question") or {}
@@ -1039,7 +1058,7 @@ class Delivery:
     # -- publishing the reviewed commit ---------------------------------------------------------
 
     def _why_rejected(self, path: Path, branch: str, sha: str, remote: str | None, err: GitError) -> tuple[str, str]:
-        """The branch on the code host is not the reviewed commit and cannot be moved there without force."""
+        """The branch on the code host is not the reviewed commit and is not one the runner may replace."""
         host = self.host.label
         if remote:
             try:
@@ -1051,7 +1070,8 @@ class Delivery:
             except GitError:
                 pass
             return (f"the branch on {host} has diverged from the reviewed commit",
-                    f"reviewed {sha[:12]}, on {host} {remote[:12]}; no force push")
+                    f"reviewed {sha[:12]}, on {host} {remote[:12]}; not replaced: the runner rewrites a branch only "
+                    "over its own last push")
         return "the push was rejected", str(err)
 
     def publish(self, task: Task, show: dict) -> None:
@@ -1065,6 +1085,14 @@ class Delivery:
             show = show | {"receipt": receipt}
         if receipt.get("review") != "passed":
             self.fail(task, f"the review verdict is \"{receipt.get('review')}\", nothing to publish",
+                      attempt=len(show.get("attempts") or []))
+            return
+        # Nothing half done is published, and nothing half done stays behind in the shared workspace either.
+        left = [f"{name}: a {op} was left half done; it is undone, the branch is back as it was before it"
+                for name in self._names(task)
+                if (op := self._end_unfinished(task, name, self.cfg.paths.workspace / name))]
+        if left:
+            self.fail(task, "the attempt left a git operation half done, nothing was pushed", "\n".join(left),
                       attempt=len(show.get("attempts") or []))
             return
         task = self.store.update_task(task.task_id, state="publishing")
@@ -1130,12 +1158,13 @@ class Delivery:
             self.fail(task, f"a repository is not in the {self.host.label} {self.host.scope_kind}, nothing was pushed",
                       "\n".join(missing))
             return
-        unreviewed = self._below_base(task, plan, group)
+        targets = self._targets(task, plan, group)
+        unreviewed = self._below_base(plan, group, targets)
         if unreviewed:
             self.fail(task, "the branch has commits below the reviewed range, nothing was pushed",
                       "\n".join(unreviewed), attempt=len(show.get("attempts") or []))
             return
-        plan, dropped, reopened = self._closed_mrs(task, plan, group)
+        plan, dropped, reopened = self._closed_mrs(task, plan, group, targets)
         if reopened:
             self.fail(task, "a merge request of this task was closed without merge, but its branch has changes "
                             "again; nothing was pushed", "\n".join(reopened), attempt=len(show.get("attempts") or []))
@@ -1173,20 +1202,32 @@ class Delivery:
         for path, r in plan:
             repo = group[path]
             sha, branch = r["reviewed_sha"], r["branch"]
-            if self.git.remote_sha(path, branch) != sha:
+            remote = self.git.remote_sha(path, branch)
+            if remote != sha:
+                published = stored[repo.relative_path].published_sha if repo.relative_path in stored else None
+                replaces = self._replaceable(path, branch, sha, remote, published)
                 try:
-                    self.git.push_sha(path, sha, branch)
+                    self.git.push_sha(path, sha, branch, replaces)
                 except GitError as e:
                     # The server may have taken the push before the connection broke. Ask it: the
                     # right commit there is success; an unreachable remote stays for the next tick.
                     remote = self.git.remote_sha(path, branch)
                     if remote != sha:
+                        if replaces and remote == replaces:
+                            # Nobody pushed in between, yet the rewrite was refused: the host forbids force pushes
+                            # to this branch (a protected branch), so a rebased branch cannot be published.
+                            self.fail(task, f"{self.host.label} refused to replace the MR branch with its rebased "
+                                            "version", f"{repo.relative_path}: {e}\nAllow force push to the "
+                                            f"task branches ({branch}) on {self.host.label}, then /continue.")
+                            return
                         if remote and self.store.task_mrs(task.task_id):
                             self.git.fetch_branch(path, branch)
                             if not self.git.is_ancestor(path, sha, remote):
                                 # A person pushed to the MR branch while the agent was fixing: their
-                                # commits stay, and the agent merges them in on the next round.
-                                self.review.note_moved(task, repo.relative_path, remote, sha)
+                                # commits stay, and the agent brings them in on the next round.
+                                rewritten = bool(published) and self.git.has_commit(path, published) \
+                                    and not self.git.is_ancestor(path, published, sha)
+                                self.review.note_moved(task, repo.relative_path, remote, sha, published, rewritten)
                                 return
                             # The reviewed commit is already in, people added more on top: theirs to own.
                             self.events.emit("branch_ahead_of_review", task_id=task.task_id,
@@ -1202,7 +1243,7 @@ class Delivery:
                 return
             self.events.emit("pushed", task_id=task.task_id, repo=repo.relative_path, branch=branch, sha=sha)
             shots = self._mr_media(task, repo.id, repo.relative_path, media.for_repo(visuals, repo.relative_path))
-            description = self._mr_description(task, show, path, r, shots)
+            description = self._mr_description(task, show, path, r, shots, targets[path])
             existed = {m.repo: m for m in self.store.task_mrs(task.task_id)}.get(repo.relative_path)
             mr = self._open_mr(repo, task, branch, description, after_closed=bool(r.get("after_closed")))
             if (existed or mr.state != "opened" or self.store.task_mrs(task.task_id)) \
@@ -1232,6 +1273,25 @@ class Delivery:
         self.events.emit("task_published", task_id=task.task_id, mrs=urls, round=follow_up)
         self.published.add(task.task_id)
 
+    def _replaceable(self, path: Path, branch: str, sha: str, remote: str | None, published: str | None) -> str | None:
+        """The commit on the code host that the reviewed one may replace, when the agent rebased the MR branch.
+
+        Only a branch the runner published itself: its own last push there, or that push with people's commits
+        on top whose changes the reviewed commit holds (the agent cherry-picked them onto its rebased branch).
+        Anything else is left in place: the push is then a plain one and fails, and nothing anyone pushed is lost.
+        """
+        if not remote or not published:
+            return None
+        self.git.fetch_branch(path, branch)
+        if self.git.is_ancestor(path, remote, sha):
+            return None  # a fast-forward needs no force
+        if remote == published:
+            return remote
+        if self.git.has_commit(path, published) and self.git.is_ancestor(path, published, remote) \
+                and self.git.carries(path, sha, published, remote):
+            return remote
+        return None
+
     def _open_mr(self, repo: Repo, task: Task, branch: str, description: str, after_closed: bool) -> MergeRequest:
         """The branch's MR, created unless it already has one (a retry after a crash, or a person closed it).
 
@@ -1245,8 +1305,21 @@ class Delivery:
                                    title=f"{task.task_id}: {task.summary}"[:250], description=description,
                                    label=self.cfg.code_host.mr_label)
 
-    def _below_base(self, task: Task, plan: list[tuple[Path, dict]], group: dict) -> list[str]:
-        """Repositories whose reviewed range does not start where the branch left the default branch.
+    def _targets(self, task: Task, plan: list[tuple[Path, dict]], group: dict) -> dict[Path, str]:
+        """The remote branch each repository's work merges into: the target of its MR when it has one (a person
+        may have pointed it at a release branch, and the agent rebased onto that), else the default branch."""
+        out = {}
+        for path, r in plan:
+            default = group[path].default_branch or task.base_branch or "main"
+            mr = self.host.branch_mr(group[path].id, r["branch"])
+            target = mr.target if mr and mr.target else default
+            if target != default:
+                self.git.fetch_branch(path, target)
+            out[path] = f"origin/{target}"
+        return out
+
+    def _below_base(self, plan: list[tuple[Path, dict]], group: dict, targets: dict[Path, str]) -> list[str]:
+        """Repositories whose reviewed range leaves out commits the branch would bring into its target.
 
         Codex saw `base_sha..reviewed_sha`. A base above the branch point (an engine that measured
         from the start of the attempt, not of the task) leaves the commits below it unreviewed,
@@ -1254,19 +1327,20 @@ class Delivery:
         """
         out = []
         for path, r in plan:
-            default = f"origin/{group[path].default_branch or task.base_branch or 'main'}"
-            if self.git.is_ancestor(path, r["base_sha"], default):
+            target = targets[path]
+            if self.git.is_ancestor(path, r["base_sha"], target):
                 continue
-            below = self.git.log_subjects(path, default, r["base_sha"], limit=10)
-            out.append(f"{group[path].relative_path}: the review started at {r['base_sha'][:12]}, which is not on "
-                       f"{default}; never reviewed: " + ("; ".join(below) or "unknown commits"))
+            below = self.git.unreviewed_below(path, r["base_sha"], r["reviewed_sha"], target)
+            if below:
+                out.append(f"{group[path].relative_path}: the review started at {r['base_sha'][:12]}, which is "
+                           f"not on {target}; never reviewed: " + "; ".join(below))
         return out
 
-    def _closed_mrs(self, task: Task, plan: list[tuple[Path, dict]], group: dict) \
+    def _closed_mrs(self, task: Task, plan: list[tuple[Path, dict]], group: dict, targets: dict[Path, str]) \
             -> tuple[list[tuple[Path, dict]], list[tuple[str, MergeRequest, str]], list[str]]:
         """Split off the repositories whose branch has nothing left to merge, and those the code host refuses.
 
-        A branch whose commits add up to nothing against the default branch (the agent reverted its
+        A branch whose commits add up to nothing against its target (the agent reverted its
         work there, its way of taking a repository out of the task) is not pushed and gets no MR; its
         MR leaves the task, closed by the runner when it is still open. A branch that does change
         something while a person closed its MR cannot go anywhere: that decision stands, and the
@@ -1275,8 +1349,7 @@ class Delivery:
         kept, dropped, refused = [], [], []
         for path, r in plan:
             repo = group[path]
-            default = f"origin/{repo.default_branch or task.base_branch or 'main'}"
-            changed = self.git.changes_since_fork(path, default, r["reviewed_sha"])
+            changed = self.git.changes_since_fork(path, targets[path], r["reviewed_sha"])
             mr = self.host.branch_mr(repo.id, r["branch"])
             if changed and mr and mr.state == "closed" and self._asked_after(task, mr):
                 kept.append((path, {**r, "after_closed": True}))  # a new MR next to the closed one
@@ -1368,10 +1441,14 @@ class Delivery:
                 continue
             self.store.action_done(key)
 
-    def _mr_description(self, task: Task, show: dict, path: Path, r: dict, shots: list[str] = ()) -> str:
-        """What the MR says: the ticket, what the agent says it did, the commits, how it was checked."""
+    def _mr_description(self, task: Task, show: dict, path: Path, r: dict, shots: list[str] = (),
+                        target: str | None = None) -> str:
+        """What the MR says: the ticket, what the agent says it did, the commits, how it was checked.
+
+        The commits are those the MR brings into `target`: after a rebase the reviewed range also holds the
+        target's own newer commits, which are not the task's."""
         outcome = (show.get("outcome") or {}).get("summary") or ""
-        commits = self.git.log_subjects(path, r["base_sha"], r["reviewed_sha"])
+        commits = self.git.log_subjects(path, target or r["base_sha"], r["reviewed_sha"])
         others = [m.url for m in self.store.task_mrs(task.task_id) if m.repo != self._repo_name(path)]
         parts = [f"Ticket: [{task.task_id}]({self.tracker.issue_url(task.task_id)}) — {task.summary}"]
         if outcome:

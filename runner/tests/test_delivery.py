@@ -547,8 +547,8 @@ def test_push_taken_by_the_server_before_an_error_still_gets_its_mr(w, monkeypat
     git_ops = w.runner.delivery.git
     real_push = git_ops.push_sha
 
-    def push_then_break(repo, s, branch):
-        real_push(repo, s, branch)
+    def push_then_break(repo, s, branch, replaces=None):
+        real_push(repo, s, branch, replaces)
         raise GitError("git push: connection reset")
 
     monkeypatch.setattr(git_ops, "push_sha", push_then_break)

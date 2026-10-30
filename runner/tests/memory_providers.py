@@ -246,7 +246,7 @@ class MemoryHost:
         return f"{self.cfg.base_url}/{pr.repo_id}/pull/{pr.iid}"
 
     def _mr(self, pr: PullRequest) -> MergeRequest:
-        return MergeRequest(pr.iid, self._url(pr), pr.state, pr.closed_at_ms)
+        return MergeRequest(pr.iid, self._url(pr), pr.state, pr.closed_at_ms, pr.target)
 
     # integrations.CodeHost
     def identity(self) -> str:

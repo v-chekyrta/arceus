@@ -196,6 +196,7 @@ class MergeRequest:
     url: str
     state: MRState
     closed_at_ms: int | None = None
+    target: str = ""     # the branch it merges into ("" when the host does not say)
 
 
 @dataclass(frozen=True)

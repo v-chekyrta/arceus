@@ -78,7 +78,7 @@ More checks, each exits 0 only if everything it looks at is right:
 ```bash
 python3 -I ~/arceus/setup/checks/browser-mcp.py                                      # Chrome really opens a page via the installed chrome-devtools-mcp
 /opt/arceus-runner/venv/bin/python -I ~/arceus/setup/checks/youtrack-roundtrip.py OMD-3  # YouTrack: every write the runner makes, on a test ticket, then puts it back
-/opt/arceus-runner/venv/bin/python -I ~/arceus/setup/checks/gitlab-protection.py     # GitLab: the bot is a Developer and cannot push, merge or force-push to the default branch
+/opt/arceus-runner/venv/bin/python -I ~/arceus/setup/checks/gitlab-protection.py     # GitLab: the bot is a Developer and cannot push, merge or force-push to the default branch, and may push and force-push to its task branches
 ```
 
 While it runs, the runner calls `night-shift doctor --server` at start and every 10 minutes, checks the code host token's expiry every hour (where the host reports it, as GitLab does), and runs `health.devstack_check` (if set) every `poll_local`. While any check fails it takes no new tasks; tasks already started are still followed.

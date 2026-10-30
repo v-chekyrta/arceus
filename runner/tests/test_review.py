@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -213,7 +214,291 @@ def test_only_a_confirmed_conflict_is_repaired(w):
     w.tick()
     later(w)
     [send] = sends(w)
-    assert "conflicts with main" in send["argv"][-1] and "git merge origin/main" in send["argv"][-1]
+    assert "conflicts with main" in send["argv"][-1] and "git rebase origin/main" in send["argv"][-1]
+    assert "git merge" not in send["argv"][-1]
+
+
+def test_a_conflict_is_resolved_against_the_target_of_the_mr(w):
+    published(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict", sha="abc", target_branch="release/2.0")
+    w.tick()
+    later(w)
+    [send] = sends(w)
+    assert "conflicts with release/2.0" in send["argv"][-1] and "rebase --onto origin/release/2.0" in send["argv"][-1]
+
+
+def test_a_conflict_that_went_and_came_back_with_the_same_commit_is_sent_again(w):
+    """The target moved, the MR conflicted; the conflict went (someone fixed the target); the target moved again."""
+    published(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict", sha="abc")
+    w.tick()
+    w.gl.mrs[0].update(detailed_merge_status="mergeable")
+    later(w)                                                   # dropped as stale before it went out
+    assert sends(w) == [] and w.store.task_mrs("ACME-1")[0].handled_conflict is None
+    w.gl.mrs[0].update(detailed_merge_status="conflict")       # the source is still "abc"
+    w.tick()
+    later(w)
+    assert len([e for e in w.events_named("review_signal") if e.get("kind") == "conflict"]) == 2
+    [send] = sends(w)
+    assert "git rebase origin/main" in send["argv"][-1]
+
+
+def test_a_rebase_onto_the_release_branch_an_mr_was_pointed_at_is_published_to_that_mr(w):
+    """main and release/2.0 have gone apart; a person points the MR at release/2.0, where it conflicts."""
+    m1 = push_to_main(w, "main-only.txt", "main\n")           # main moved on before the task started
+    rel = w.tmp / "release-writer"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(w.origin), str(rel)], check=True)
+    git(rel, "checkout", "-q", "-b", "release/2.0", "HEAD~1")
+    (rel / "feature.txt").write_text("release version\n")
+    git(rel, "add", "feature.txt")
+    git(rel, "-c", "user.name=r", "-c", "user.email=r@r", "commit", "-q", "-m", "release changes feature.txt")
+    git(rel, "push", "-q", "origin", "release/2.0")
+    release = git(rel, "rev-parse", "HEAD")
+    first = published(w)
+    branch = w.store.task("ACME-1").branch
+    w.gl.mrs[0].update(target_branch="release/2.0", detailed_merge_status="conflict", sha=first)
+    w.tick()
+    later(w)
+    [send] = sends(w)
+    assert "git rebase --onto origin/release/2.0" in send["argv"][-1] and "started from main" in send["argv"][-1]
+    git(w.repo, "fetch", "-q", "origin")
+    stopped = subprocess.run(["git", "-C", str(w.repo), "rebase", "--onto", "origin/release/2.0", m1],
+                             capture_output=True)
+    assert stopped.returncode != 0
+    (w.repo / "feature.txt").write_text("release version\nwork\n")
+    git(w.repo, "add", "feature.txt")
+    git(w.repo, "-c", "core.editor=true", "rebase", "--continue")
+    sha = git(w.repo, "rev-parse", "HEAD")
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Rebased onto release/2.0"})
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and task.reason is None
+    assert w.remote_branch(branch) == sha and len(w.gl.mrs) == 1
+    assert git(w.origin, "merge-base", "--is-ancestor", release, sha) == ""
+    assert subprocess.run(["git", "-C", str(w.origin), "merge-base", "--is-ancestor", m1, sha]).returncode == 1
+    assert git(w.origin, "rev-list", "--merges", f"release/2.0..{branch}") == ""
+    commits = w.gl.mrs[0]["description"].split("## Commits", 1)[1].split("##", 1)[0]
+    assert "add feature.txt" in commits and "release changes" not in commits and "main changes" not in commits
+
+
+def push_to_main(w: World, name: str = "feature.txt", text: str = "main's version\n") -> str:
+    """Someone merges a change into main on the code host that touches what the task branch touches."""
+    other = w.tmp / "main-writer"
+    if not other.exists():
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(w.origin), str(other)], check=True)
+    (other / name).write_text(text)
+    git(other, "add", name)
+    git(other, "-c", "user.name=m", "-c", "user.email=m@m", "commit", "-q", "-m", f"main changes {name}")
+    git(other, "push", "-q", "origin", "main")
+    return git(other, "rev-parse", "HEAD")
+
+
+def push_by_colleague(w: World, branch: str) -> Path:
+    other = w.tmp / "colleague"
+    subprocess.run(["git", "clone", "-q", "-b", branch, str(w.origin), str(other)], check=True)
+    (other / "colleague.txt").write_text("x")
+    git(other, "add", "colleague.txt")
+    git(other, "-c", "user.name=c", "-c", "user.email=c@c", "commit", "-q", "-m", "colleague's fix")
+    git(other, "push", "-q", "origin", branch)
+    return other
+
+
+def rebase_onto_main(w: World) -> str:
+    """What the agent does with a conflict signal: rebase, resolve, continue."""
+    git(w.repo, "fetch", "-q", "origin")
+    stopped = subprocess.run(["git", "-C", str(w.repo), "rebase", "origin/main"], capture_output=True)
+    assert stopped.returncode != 0                                # it really conflicted
+    (w.repo / "feature.txt").write_text("main's version\nwork\n")
+    git(w.repo, "add", "feature.txt")
+    git(w.repo, "-c", "core.editor=true", "rebase", "--continue")
+    return git(w.repo, "rev-parse", "HEAD")
+
+
+def conflict_round(w: World) -> str:
+    """ACME-1 published, then main moves under it and the code host reports the conflict to the agent."""
+    first = published(w)
+    main = push_to_main(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict", sha=first)
+    w.tick()
+    later(w)
+    assert len(sends(w)) == 1 and "git rebase origin/main" in sends(w)[0]["argv"][-1]
+    return main
+
+
+def test_a_rebased_branch_replaces_the_runners_own_push_in_the_same_mr(w):
+    main = conflict_round(w)
+    branch = w.store.task("ACME-1").branch
+    sha = rebase_onto_main(w)
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Rebased onto main"})
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and task.reason is None
+    assert w.remote_branch(branch) == sha and len(w.gl.mrs) == 1   # the same MR, now the rebased branch
+    assert git(w.origin, "merge-base", "--is-ancestor", main, sha) == ""   # main is under it
+    assert git(w.origin, "rev-list", "--merges", f"main..{branch}") == ""   # linear: no merge commit
+    assert not [e for e in w.events_named("review_signal") if e.get("kind") == "moved"]
+
+
+def test_a_rebase_is_not_published_over_a_branch_the_code_host_protects(w):
+    conflict_round(w)
+    branch = w.store.task("ACME-1").branch
+    before = w.remote_branch(branch)
+    git(w.origin, "config", "receive.denyNonFastForwards", "true")
+    rebase_onto_main(w)
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Rebased onto main"})
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "refused to replace the MR branch" in task.reason
+    assert w.remote_branch(branch) == before
+
+
+def rebased_while_a_person_pushed(w: World) -> tuple[str, str]:
+    """The agent rebases for a conflict while a colleague pushes to the MR branch: the push is refused, and the
+    agent is asked to bring the colleague's commit in."""
+    conflict_round(w)
+    task = w.store.task("ACME-1")
+    [mr] = w.store.task_mrs("ACME-1")
+    first = mr.published_sha
+    other = push_by_colleague(w, task.branch)
+    theirs = git(other, "rev-parse", "HEAD")
+    rebase_onto_main(w)
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Rebased onto main"})
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and task.reason is None
+    assert w.remote_branch(task.branch) == theirs                 # their commit is not overwritten
+    later(w)
+    assert len(sends(w)) == 2
+    assert f"git cherry-pick {first[:12]}..origin/{task.branch}" in sends(w)[1]["argv"][-1]
+    return theirs, first
+
+
+def test_a_person_pushing_while_the_agent_rebased_keeps_their_commit(w):
+    theirs, first = rebased_while_a_person_pushed(w)
+    branch = w.store.task("ACME-1").branch
+    git(w.repo, "fetch", "-q", "origin")
+    git(w.repo, "cherry-pick", f"{first}..origin/{branch}")
+    sha = git(w.repo, "rev-parse", "HEAD")
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Rebased onto main, kept the colleague's fix"})
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review"
+    assert w.remote_branch(branch) == sha
+    assert git(w.origin, "show", f"{sha}:colleague.txt") == "x"
+    assert git(w.origin, "log", "-1", "--format=%an %s", sha) == "c colleague's fix"
+    assert git(w.origin, "rev-list", "--merges", f"main..{branch}") == ""
+
+
+def test_work_that_still_leaves_out_a_persons_commit_goes_to_a_person(w):
+    theirs, _ = rebased_while_a_person_pushed(w)
+    branch = w.store.task("ACME-1").branch
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Nothing to bring in"})   # the agent ignored it
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "commits people pushed" in task.reason
+    assert w.remote_branch(branch) == theirs
+
+
+def test_a_rebase_left_half_done_by_a_failed_attempt_is_undone(w):
+    take(w)
+    sha = w.agent_commits()
+    branch = w.store.task("ACME-1").branch
+    push_to_main(w)
+    git(w.repo, "fetch", "-q", "origin")
+    assert subprocess.run(["git", "-C", str(w.repo), "rebase", "origin/main"], capture_output=True).returncode != 0
+    w.now += timedelta(minutes=30)
+    w.settle("ACME-1", "failed", review="needs-user", state_reason="needs-user", reviewed=sha)
+    w.tick()
+    assert w.store.task("ACME-1").state == "failed"
+    assert not (w.repo / ".git" / "rebase-merge").exists() and not (w.repo / ".git" / "rebase-apply").exists()
+    assert git(w.repo, "symbolic-ref", "--short", "HEAD") == branch
+    assert git(w.repo, "rev-parse", "HEAD") == sha and git(w.repo, "status", "--porcelain") == ""
+    assert [(e["repo"], e["operation"]) for e in w.events_named("git_operation_aborted")] == [("acme-platform",
+                                                                                               "rebase")]
+
+
+def test_a_rebase_left_half_done_under_a_passed_review_is_undone_and_nothing_published(w):
+    take(w)
+    sha = w.agent_commits()
+    branch = w.store.task("ACME-1").branch
+    push_to_main(w)
+    git(w.repo, "fetch", "-q", "origin")
+    assert subprocess.run(["git", "-C", str(w.repo), "rebase", "origin/main"], capture_output=True).returncode != 0
+    w.settle("ACME-1", "waiting_review", reviewed=git(w.repo, "rev-parse", "HEAD"))
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "half done" in task.reason
+    assert w.remote_branch(branch) is None and w.gl.mrs == []
+    assert not (w.repo / ".git" / "rebase-merge").exists() and not (w.repo / ".git" / "rebase-apply").exists()
+    assert git(w.repo, "symbolic-ref", "--short", "HEAD") == branch and git(w.repo, "rev-parse", "HEAD") == sha
+    assert git(w.repo, "status", "--porcelain") == ""
+    take(w, 2, summary="Another ticket")                    # the shared workspace is free for the next task
+    assert w.store.task("ACME-2").state == "dispatched"
+
+
+def test_a_cherry_pick_of_several_commits_left_half_done_is_undone(w):
+    """The agent brings people's commits onto its rebased branch, the second one conflicts, and the attempt fails."""
+    take(w)
+    sha = w.agent_commits()
+    branch = w.store.task("ACME-1").branch
+    git(w.repo, "checkout", "-q", "-b", "theirs", f"{sha}~1")
+    w.agent_commits("theirs.txt")
+    (w.repo / "feature.txt").write_text("their version\n")
+    git(w.repo, "add", "feature.txt")
+    git(w.repo, "commit", "-q", "-m", "theirs changes feature.txt")
+    git(w.repo, "checkout", "-q", branch)
+    picked = subprocess.run(["git", "-C", str(w.repo), "cherry-pick", "theirs~2..theirs"], capture_output=True)
+    assert picked.returncode != 0 and git(w.repo, "rev-parse", "HEAD") != sha   # the first one went in, then stopped
+    w.now += timedelta(minutes=30)
+    w.settle("ACME-1", "failed", review="needs-user", state_reason="needs-user", reviewed=sha)
+    w.tick()
+    assert w.store.task("ACME-1").state == "failed"
+    assert git(w.repo, "rev-parse", "HEAD") == sha and git(w.repo, "status", "--porcelain") == ""
+    assert git(w.repo, "symbolic-ref", "--short", "HEAD") == branch
+    assert not (w.repo / ".git" / "CHERRY_PICK_HEAD").exists() and not (w.repo / ".git" / "sequencer").exists()
+    assert "<<<<<<<" not in subprocess.run(["git", "-C", str(w.repo), "log", "-p", f"main..{branch}"],
+                                           capture_output=True, text=True).stdout
+    assert [e["operation"] for e in w.events_named("git_operation_aborted")] == ["cherry-pick"]
+
+
+OLD_CONFLICT = ("The MR in acme-platform conflicts with main. Merge the latest main into the task branch "
+                "(git fetch origin && git merge origin/main), resolve the conflicts and commit. No rebase.")
+OLD_MOVED = ("Branch agent/ACME-1-fix-login-page of acme-platform on GitLab has commits that you do not have "
+             "(GitLab 0123456789ab, yours ba9876543210). Merge them in: git pull --no-rebase origin "
+             "agent/ACME-1-fix-login-page, resolve any conflicts and commit. Do not rewrite other people's commits.")
+OLD_RULE = ("- Make code changes with new commits on the same branch, without rebase or force push, and commit "
+            "everything. If nothing in this round needs a code change, change nothing and say why in your result.")
+
+
+def test_a_signal_stored_by_an_earlier_runner_goes_out_with_the_rebase_instructions(w):
+    published(w)
+    w.gl.mrs[0].update(detailed_merge_status="conflict", sha="abc")
+    w.store.add_signal("conflict-old", "ACME-1", "conflict", "gitlab", OLD_CONFLICT, NOW.isoformat(),
+                       repo="acme-platform")
+    w.store.update_mr("ACME-1", "acme-platform", handled_conflict="abc")
+    later(w)
+    [send] = sends(w)
+    text = send["argv"][-1]
+    assert "git rebase origin/main" in text and "git merge" not in text and "No rebase" not in text
+    assert text in w.screen.payloads()
+
+
+def test_a_round_made_by_an_earlier_runner_is_rewritten_and_screened_again(w):
+    published(w)
+    w.store.add_signal("moved-old", "ACME-1", "moved", "gitlab", OLD_MOVED, NOW.isoformat(), repo="acme-platform")
+    old = "\n".join(["Review of the MRs of task ACME-1.", "", "## Conflicts with the target branch",
+                     f"- {OLD_CONFLICT}", "", "## New commits on the branch that you do not have", f"- {OLD_MOVED}",
+                     "", "## What to do", "", OLD_RULE])
+    w.store.make_batch("review-old", "ACME-1", "mr", "acme-agent-bot", old, False, NOW.isoformat(), ["moved-old"])
+    w.screen.calls.clear()
+    w.tick()
+    [send] = sends(w)
+    text = send["argv"][-1]
+    for gone in ("git merge", "No rebase", "--no-rebase", "without rebase or force push"):
+        assert gone not in text
+    assert "git rebase origin/main" in text and "git pull --rebase origin agent/ACME-1-fix-login-page" in text
+    assert "never merge and never push" in text
+    assert w.store.batch("review-old").text == text and w.screen.payloads() == [text]   # screened as sent
+    assert [e["batch"] for e in w.events_named("review_batch_updated")] == ["review-old"]
 
 
 def test_two_mrs_need_both_merged(w):
@@ -342,8 +627,13 @@ def test_a_push_by_a_person_during_the_fix_goes_back_to_the_agent(w):
     task = w.store.task("ACME-1")
     assert task.state == "code_review" and task.reason is None          # not Failed
     later(w)
-    assert len(sends(w)) == 2 and "git pull --no-rebase" in sends(w)[1]["argv"][-1]
+    assert len(sends(w)) == 2 and f"git pull --rebase origin {branch}" in sends(w)[1]["argv"][-1]
     assert git(other, "log", "-1", "--format=%s") == "colleague's fix"   # nothing force-pushed
+    git(w.repo, "pull", "-q", "--rebase", "origin", branch)
+    sha = git(w.repo, "rev-parse", "HEAD")
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Renamed as asked"})
+    w.tick()
+    assert w.remote_branch(branch) == sha and git(w.origin, "show", f"{sha}:colleague.txt") == "x"
 
 
 def test_ticket_comments_after_the_mr_are_review_too(w):
@@ -1092,3 +1382,71 @@ def test_signals_survive_the_schema_that_knows_closed_mrs(tmp_path, monkeypatch)
     assert new.add_signal("closed-1-2", "ACME-1", "closed", "gitlab", "x", "2026-10-20T07:00:00Z")
     assert new.conn.execute("SELECT count(*) FROM sqlite_master WHERE name = 'signals_task'").fetchone()[0] == 1
     new.close()
+
+
+def test_a_rewrite_replaces_only_the_commit_it_expects(tmp_path):
+    """The lease: between reading the branch and pushing, someone pushes; the rebased commit does not go over theirs."""
+    from arceus_runner.gitops import Git, GitError
+    origin, mine, theirs = tmp_path / "origin.git", tmp_path / "mine", tmp_path / "theirs"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(mine)], check=True, capture_output=True)
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    git(mine, *ident, "commit", "-q", "--allow-empty", "-m", "published")
+    git(mine, "push", "-q", "origin", "HEAD:refs/heads/topic")
+    published = git(mine, "rev-parse", "HEAD")
+    subprocess.run(["git", "clone", "-q", "-b", "topic", str(origin), str(theirs)], check=True)
+    git(theirs, *ident, "commit", "-q", "--allow-empty", "-m", "a person's commit")
+    git(theirs, "push", "-q", "origin", "topic")
+    person = git(theirs, "rev-parse", "HEAD")
+    git(mine, *ident, "commit", "-q", "--amend", "--allow-empty", "-m", "rebased")
+    rebased = git(mine, "rev-parse", "HEAD")
+    g = Git(None, "A", "a@a")
+    with pytest.raises(GitError):
+        g.push_sha(mine, rebased, "topic", replaces=published)
+    with pytest.raises(GitError):
+        g.push_sha(mine, rebased, "topic")
+    assert git(origin, "rev-parse", "topic") == person
+    g.push_sha(mine, rebased, "topic", replaces=person)
+    assert git(origin, "rev-parse", "topic") == rebased
+
+
+def test_a_persons_change_counts_as_kept_only_when_the_content_is_there(tmp_path):
+    """What lets a rebased branch replace people's commits: their changes in its tree, not commits that look alike."""
+    from arceus_runner.gitops import Git
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+
+    def commit(name: str, text: str, msg: str) -> str:
+        (repo / name).write_text(text)
+        git(repo, "add", name)
+        git(repo, *ident, "commit", "-q", "-m", msg)
+        return git(repo, "rev-parse", "HEAD")
+
+    commit("a.txt", "a\n", "base")
+    published = commit("work.txt", "work\n", "the agent's work, published")
+    theirs = commit("colleague.txt", "x\n", "a person's fix")
+    git(repo, "checkout", "-q", "-b", "rebased", "main~2")
+    commit("main.txt", "main\n", "main moved on")
+    commit("work.txt", "work\n", "the agent's work, rebased")
+    git(repo, *ident, "cherry-pick", theirs)
+    carried = git(repo, "rev-parse", "HEAD")
+    git(repo, *ident, "revert", "--no-edit", "HEAD")
+    reverted = git(repo, "rev-parse", "HEAD")
+    g = Git(None, "A", "a@a")
+    assert g.carries(repo, carried, published, theirs)
+    assert not g.carries(repo, reverted, published, theirs)          # the same patch is in history, then undone
+    assert not g.carries(repo, carried + "~1", published, theirs)     # never brought in
+    # A merge a person pushed, with a change of its own in the merge commit: the commits alone do not carry it.
+    git(repo, "checkout", "-q", "-b", "side", published)
+    side = commit("side.txt", "side\n", "side work")
+    git(repo, "checkout", "-q", "-b", "merged", theirs)
+    git(repo, *ident, "merge", "-q", "--no-commit", side)
+    (repo / "resolution.txt").write_text("by hand\n")
+    git(repo, "add", "resolution.txt")
+    git(repo, *ident, "commit", "-q", "-m", "merge with a fix")
+    merge = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", carried)
+    git(repo, *ident, "cherry-pick", side)
+    without = git(repo, "rev-parse", "HEAD")
+    assert not g.carries(repo, without, published, merge)
