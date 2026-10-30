@@ -36,6 +36,16 @@ ENGINE = os.environ.get("ARCEUS_REAL_ENGINE")
 LIVE = os.environ.get("ARCEUS_LIVE") == "1"
 REPORT = Path(os.environ.get("ARCEUS_LIVE_REPORT") or "live-report")
 live = pytest.mark.skipif(not (ENGINE and LIVE), reason="sandbox only: sandbox/sandbox.sh live")
+# How hard Claude and Codex think in a live run: the work, the independent checks and the review gate
+# alike (bulava.claude_effort and codex_effort). sandbox.sh live sets low; unset, config.yaml's own.
+EFFORT = os.environ.get("ARCEUS_LIVE_EFFORT") or None
+
+
+def live_settings(**sections) -> dict:
+    """A live world's own config.yaml sections, with the run's effort when one is set."""
+    if EFFORT:
+        sections["bulava"] = {"claude_effort": EFFORT, "codex_effort": EFFORT, **sections.get("bulava", {})}
+    return sections or None
 
 ATTEMPT_LIMIT = timedelta(minutes=75)   # one attempt: the work, two checks, Codex, the fix rounds
 POLL = 15                               # seconds between looks, as the runner's poll_local would
@@ -110,7 +120,12 @@ def w(request, tmp_path, secrets):
         say(f"the engine's tmux server was gone and is started again ({keeper})")
     param = dict(getattr(request, "param", None) or {})
     checks = param.pop("claude_checks", None)   # config.yaml's bulava.claude_checks; the rest: engine env
-    world = World(tmp_path, secrets, engine_dir=Path(ENGINE), engine_env=param, claude_checks=checks)
+    settings = {}
+    if param.pop("project_notes", False):
+        (tmp_path / "project-notes.md").write_text(PROJECT_NOTES)
+        settings["paths"] = {"project_notes": str(tmp_path / "project-notes.md")}
+    world = World(tmp_path, secrets, engine_dir=Path(ENGINE), engine_env=param, claude_checks=checks,
+                  settings=live_settings(**settings))
     world.keeper_at_start = keeper
     # The sandbox's Claude is the user's /login; the test token of the other tests would replace it.
     world.cfg.paths.bulava_env.unlink()
@@ -218,18 +233,21 @@ class Observer:
                      "stage": s["stage"], "state": s["state"], "note": s.get("note")} for s in steps]
         show = self.w.runner.delivery.engine.show(self.task_id) or {}
         data = {"scenario": self.name, "task": self.task_id, "minutes": round((time.time() - self.started) / 60, 1),
+                "models": self.w.cfg.bulava.model_profile(),
                 "runner_state": getattr(self.w.store.task(self.task_id), "state", "not taken"),
                 "engine_state": show.get("state"),
                 "attempts": [{k: a.get(k) for k in ("kind", "started_at", "ended_at", "review")}
                              for a in show.get("attempts") or []],
                 "review_why": ((show.get("receipt") or {}).get("review_why") or "")[:4000],
+                "codex_verdict": codex_verdict(self.w),
                 "checks": self.checks(), "gaps": self.gaps(), "timeline": timeline,
                 "mrs": [{k: m.get(k) for k in ("iid", "title", "source_branch")} for m in self.w.gl.mrs],
                 "keeper_at_start": getattr(self.w, "keeper_at_start", ""), "keeper_at_end": ensure_keeper(),
                 **(extra or {})}
         (REPORT / f"{self.name}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
         lines = [f"# {self.name}", "", f"{data['minutes']} min · runner `{data['runner_state']}` · engine "
-                 f"`{data['engine_state']}` · attempts {len(data['attempts'])} · MRs {len(data['mrs'])}", "",
+                 f"`{data['engine_state']}` · attempts {len(data['attempts'])} · MRs {len(data['mrs'])}",
+                 "models: " + ", ".join(f"{k} {v}" for k, v in data["models"].items()), "",
                  "## Gaps", *([f"- {g}" for g in data["gaps"]] or ["- none seen"]), "",
                  "## Checks", f"rounds used: {data['checks']['rounds_used']}"]
         for r in data["checks"]["readings"]:
@@ -313,6 +331,15 @@ def run_until(w: World, task_id: str, states: tuple[str, ...], limit: timedelta 
     show = w.runner.delivery.engine.show(task_id) or {}
     raise AssertionError(f"{task_id} not in {states} after {limit}: runner {w.store.task(task_id).state}, "
                          f"engine {show.get('state')}")
+
+
+def codex_verdict(w: World) -> str:
+    """The review gate's last verdict as Codex wrote it. The engine keeps the reasons of a FAIL in the
+    receipt (review_why), but a PASS only in its Codex log."""
+    log = w.cfg.paths.bulava_state / "codex.log"
+    text = log.read_text(errors="replace") if log.exists() else ""
+    at = text.rfind("VERDICT:")
+    return text[at:at + 4000] if at != -1 else ""
 
 
 def published_is_reviewed(w: World, task_id: str) -> None:
@@ -402,8 +429,9 @@ def test_review_comment_and_red_ci_are_follow_ups_with_their_own_checks(w):
 @pytest.mark.parametrize("w", [{"SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": "5", "claude_checks": {"timeout": "1m"}}],
                          indirect=True)
 def test_a_required_check_that_cannot_finish_stops_the_task_for_a_person(w, monkeypatch):
-    """`required: true` (the default): the checks are given five seconds, both time out, and the task stops
-    for a person — no Codex review, no merge request, and the ticket says it was the check, not Codex.
+    """`required: true` (the default): the checks are given five seconds, at least one times out (at low
+    effort a check can finish in that), and the task stops for a person — no Codex review, no merge request,
+    and the ticket says it was the check, not Codex.
 
     Five seconds is below what config.yaml can say (1m), so the engine's tmux server gets them as an
     operator would set them by hand, and the runner's health check, which would rightly refuse a gate
@@ -422,8 +450,8 @@ def test_a_required_check_that_cannot_finish_stops_the_task_for_a_person(w, monk
         # What the engine keeps, not its step journal: that is deleted with the instance when the engine
         # stops it, and can be gone before the runner reads the gate's last steps.
         readings = obs.checks()["readings"]
-        assert len(readings) == 1 and sorted(c["kind"] for c in readings[0]["checks"] if c["state"] == "failed") \
-            == ["code", "security"], f"the checks that timed out did not show as failed: {readings}"
+        assert len(readings) == 1 and [c for c in readings[0]["checks"] if c["state"] == "failed"], \
+            f"no check timed out in five seconds, so the scenario proves nothing: {readings}"
         assert [s for s in steps if s["stage"] == "gate.check"], "the checks never started"
         assert state == "failed", f"a required check that did not run let the task go on to {state}"
         assert w.store.task("ACME-1").reason.startswith("a required pre-review check"), w.store.task("ACME-1").reason
@@ -477,6 +505,51 @@ def test_findings_go_back_to_the_agent_once_and_codex_decides(w):
         obs.write({"ticket_comments": w.bot_comments(db)})
 
 
+PROJECT_NOTES = """## Conventions
+
+- PN-1. Every change to acme-theme is listed in `acme-theme/CHANGES.md`, one line per ticket:
+  `<ticket key>: <what changed>`. Create the file if it is missing.
+- PN-2. In acme-platform, the line above each new function's `def` is the comment `# owner: platform-team`.
+- PN-7. Whoever reviews work in this project names the conventions above by their IDs (PN-1, PN-2) when
+  saying whether the work keeps them.
+"""
+
+
+@live
+@pytest.mark.parametrize("w", [{"project_notes": True}], indirect=True)
+def test_the_project_notes_reach_the_agent_and_codex_across_repositories(w):
+    """Rules only the project notes give, in two repositories. The agent keeps them in its commits and
+    Codex names them in its verdict: both read the notes from the workspace's AGENTS.md. The independent
+    Claude checks are not asserted: they may read AGENTS.md for context (it is in a folder they are given),
+    but the engine tells them it is data under review, not rules (bin/lib/claude-checks.sh), so what they
+    made of it goes to the report as it is."""
+    db = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
+    w.yt.issues[-1]["summary"] = "Count users and a badge style"
+    w.yt.issues[-1]["description"] = (
+        "1. In acme-platform add `count_users(conn)` to acme_platform/users.py: the number of users. Add a test.\n"
+        "2. In acme-theme add `style.css` with a `.badge` class: rounded corners, small bold text.")
+    obs = Observer(w, "ACME-1", "project-notes")
+    home, theme = w.cfg.paths.workspace, w.cfg.paths.workspace / "acme-theme"
+    try:
+        state = run_until(w, "ACME-1", ("code_review", "failed", "needs_input"))
+        task = w.store.task("ACME-1")
+        assert state == "code_review", f"the task ended {state}: {task.reason}"
+        assert "PN-1. Every change to acme-theme" in git(home, "show", f"{task.branch}:AGENTS.md")
+        # One MR per changed repository, each with exactly the commit Codex passed.
+        reviewed = {Path(r["path"]).name: r["reviewed_sha"] for r in w.runner.delivery.engine.show("ACME-1")["repos"]}
+        for repo in ("acme-platform", "acme-theme"):
+            assert w.remote_branch(task.branch, repo) == reviewed[repo], (repo, reviewed)
+        assert {m["source_branch"] for m in w.gl.mrs} == {task.branch} and len(w.gl.mrs) == 2, w.gl.mrs
+        changes = git(theme, "show", f"{task.branch}:CHANGES.md")
+        assert re.search(r"^ACME-1: ", changes, re.M), f"PN-1 not kept, CHANGES.md: {changes!r}"
+        users = git(w.repo, "show", f"{task.branch}:acme_platform/users.py")
+        assert re.search(r"# owner: platform-team\n\s*def count_users", users), f"PN-2 not kept:\n{users}"
+        verdict = codex_verdict(w)
+        assert re.search(r"PN-[12]", verdict), f"Codex's verdict does not name the project's rules: {verdict[:2000]}"
+    finally:
+        obs.write({"ticket_comments": w.bot_comments(db)})
+
+
 def published_without_a_run(w: World, files: dict[str, str], summary: str, description: str) -> str:
     """ACME-1 as if the author's run had published it: its branch on the code host with `files` on top of
     main, one open MR with green CI, the ticket in Code Review. No model is spent on the authoring."""
@@ -517,8 +590,8 @@ def test_a_code_review_request_is_reviewed_without_asking_anyone(tmp_path, secre
     from arceus_runner.config import Secrets
     keeper = ensure_keeper()
     secrets = Secrets(tracker=secrets.tracker, code_host=secrets.code_host, slack=None, approver="glpat-approver-789")
-    w = World(tmp_path, secrets, engine_dir=Path(ENGINE), settings={"review_agent": {"enabled": True}, "code_host": {
-        "approver": {"user": "acme-review-bot", "token_env": "GITLAB_REVIEW_TOKEN"}}})
+    w = World(tmp_path, secrets, engine_dir=Path(ENGINE), settings=live_settings(review_agent={"enabled": True}, code_host={
+        "approver": {"user": "acme-review-bot", "token_env": "GITLAB_REVIEW_TOKEN"}}))
     w.keeper_at_start = keeper
     w.gl.tokens["glpat-approver-789"] = "acme-review-bot"
     w.cfg.paths.bulava_env.unlink()

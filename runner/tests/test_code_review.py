@@ -29,8 +29,10 @@ def no_real_tools(monkeypatch):
     monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
 
 
-def world(tmp_path, approver: bool = True, enabled: bool = True, **review_agent) -> World:
+def world(tmp_path, approver: bool = True, enabled: bool = True, paths: dict | None = None, **review_agent) -> World:
     settings = {"review_agent": {"enabled": enabled, **review_agent}}
+    if paths:
+        settings["paths"] = paths
     if approver:
         settings["code_host"] = {"approver": APPROVER}
     w = World(tmp_path, Secrets(tracker=YT_TOKEN, code_host=GL_TOKEN, slack=None, approver=APPROVER_TOKEN),
@@ -149,6 +151,28 @@ def test_a_request_starts_one_review_task_and_never_reaches_the_author(w):
     later(w)
     assert sends(w) == [] and len(reviews(w)) == 1          # nothing to the author, one review only
     assert w.store.task("ACME-1").state == "code_review"
+
+
+def test_the_review_judges_by_the_project_notes_the_task_worked_with(tmp_path):
+    notes = tmp_path / "project-notes.md"
+    notes.write_text("Test files are `*_spec.py`.\n")
+    w = world(tmp_path, paths={"project_notes": str(notes)})
+    home = w.cfg.paths.workspace
+    publish(w)
+    notes.write_text("Test files are `test_*.py`.\n")
+    take(w, 2, summary="Another")  # the next task gets the new notes and leaves them on main
+    w.settle("ACME-2", "failed", review="needs-user", state_reason="needs-user")
+    w.tick()
+    assert w.store.task("ACME-2").state == "failed"
+    assert "`test_*.py`" in git(home, "show", "agent/ACME-2-another:AGENTS.md")
+    notes.unlink()  # gone by the time of the review: the task's own copy is used
+    ask(w)
+    assert [c["argv"][1] for c in reviews(w)] == ["ACME-2", RID]
+    assert git(home, "symbolic-ref", "--short", "HEAD") == "arceus-review/ACME-1-1"
+    text = (home / "AGENTS.md").read_text()
+    assert text.endswith("those win.\n\nTest files are `*_spec.py`.\n") and "test_*.py" not in text
+    w.events.close()
+    w.store.close()
 
 
 def test_a_ready_merge_request_is_approved_with_a_note_and_the_workspace_is_put_back(w):

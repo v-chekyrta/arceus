@@ -15,6 +15,7 @@ from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
 from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, is_legacy, load_config, load_secrets
 from arceus_runner.db import ACTIVE_STATES, AlreadyRunning, InstanceLock, ReviewStore
+from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
 from arceus_runner.engine import Engine
 from arceus_runner.health import claude_checks, engine_doctor, local_checks
 from arceus_runner.events import EventLog
@@ -64,6 +65,7 @@ def cmd_check(args) -> int:
     checks.append(models_check(cfg, probe))
     checks.append(claude_checks(cfg, probe))
     checks.append(review_agent_check(cfg))
+    checks.append(project_notes_check(cfg))
     if not args.offline:
         checks += run_online_checks(cfg, secrets)
     return EXIT_OK if _print_checks(checks, args.json) else EXIT_CHECK_FAILED
@@ -93,6 +95,20 @@ def review_agent_check(cfg: Config) -> Check:
         return Check("config.review_agent", "warn", f"on ({how}), but it can only comment: approving needs "
                                                     "code_host.approver, a second account (the bot authors the MRs)")
     return Check("config.review_agent", "ok", f"on ({how}); approves as {cfg.code_host.approver.user}")
+
+
+def project_notes_check(cfg: Config) -> Check:
+    """Whether the project's notes for the agent can be given to it as they are (delivery.project_notes)."""
+    path = cfg.paths.project_notes
+    try:
+        notes = project_notes(path)
+    except ProjectNotesError as e:
+        return Check("config.project_notes", "fail", f"{e}; no task starts until it is fixed")
+    if path is None:
+        return Check("config.project_notes", "ok", "none")
+    if not notes:
+        return Check("config.project_notes", "ok", f"{path} is empty (comments only): the agent gets no notes")
+    return Check("config.project_notes", "ok", f"{path}: {len(notes.encode())} of {PROJECT_NOTES_LIMIT} bytes")
 
 
 def cmd_doctor(args) -> int:

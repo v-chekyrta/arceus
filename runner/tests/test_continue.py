@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from .test_delivery import World, branches, git, no_real_tools, occupy, release, take, w  # noqa: F401  (fixtures)
+from .test_delivery import World, branches, git, no_real_tools, notes_world, occupy, release, take, w  # noqa: F401  (fixtures)
 
 FAILED = "agent-failed"
 
@@ -201,6 +201,45 @@ def test_a_task_bulava_never_had_starts_again_on_the_same_branches(w):
     assert task.state == "dispatched" and FAILED not in w.yt.issue_tags["2-1"]
     assert git(w.repo, "log", "-1", "--format=%s") == "kept on the branch"
     assert any("starting this again from the ticket" in c for c in w.bot_comments())
+
+
+def test_a_task_started_again_keeps_its_project_notes_when_the_file_changes_or_goes(tmp_path, secrets):
+    w, notes = notes_world(tmp_path, secrets, "Test files are `*_spec.py`.\n")
+    home = w.cfg.paths.workspace
+    failed(w)
+    [pinned] = w.events_named("project_notes_pinned")
+    for change in ("changed", "removed"):
+        if change == "changed":
+            notes.write_text("Test files are `test_*.py`.\n")
+        else:
+            notes.unlink()
+            w.settle("ACME-1", "failed", review="needs-user", state_reason="needs-user")
+            w.tick()
+            assert w.store.task("ACME-1").state == "failed"
+        w.set_engine(lambda s: s["tasks"].pop("ACME-1"))  # Bulava lost it: started again from the ticket
+        w.yt.comment("2-1", "j.doe", f"/continue {change}")
+        w.tick()
+        w.tick()
+        task = w.store.task("ACME-1")
+        assert task.state == "dispatched", (change, task.reason)
+        assert git(home, "symbolic-ref", "--short", "HEAD") == task.branch
+        text = (home / "AGENTS.md").read_text()
+        assert text.endswith("those win.\n\nTest files are `*_spec.py`.\n") and "test_*.py" not in text, change
+    assert w.events_named("project_notes_pinned") == [pinned]  # read from the file once, at the first start
+    w.events.close()
+    w.store.close()
+
+
+def test_a_new_task_never_gets_project_notes_left_from_before(tmp_path, secrets):
+    w, notes = notes_world(tmp_path, secrets, "New rule.\n")
+    stale = w.cfg.paths.db.parent / "tasks" / "ACME-1" / "project-notes.md"  # runner.db made anew, the folder kept
+    stale.parent.mkdir(parents=True)
+    stale.write_text("Old rule.")
+    take(w)
+    assert w.store.task("ACME-1").state == "dispatched" and stale.read_text() == "New rule."
+    assert (w.cfg.paths.workspace / "AGENTS.md").read_text().endswith("those win.\n\nNew rule.\n")
+    w.events.close()
+    w.store.close()
 
 
 def test_continue_resets_the_budgets_a_person_overrides(w):

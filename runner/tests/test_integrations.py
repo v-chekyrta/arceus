@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from arceus_runner import loop
-from arceus_runner.cli import EXIT_CONFIG, EXIT_OK, main
+from arceus_runner.cli import EXIT_CHECK_FAILED, EXIT_CONFIG, EXIT_OK, main
 from arceus_runner.config import Config, ConfigError, load_config
 from arceus_runner.engine import Engine
 from arceus_runner.gitops import Git, GitAuth
@@ -284,7 +284,9 @@ def test_the_flow_does_not_reach_into_a_provider(name):
 
 
 def test_the_config_before_tracker_and_code_host_loads_as_the_same_settings():
-    assert load_config(LEGACY).model_dump() == load_config(EXAMPLE).model_dump()
+    example = load_config(EXAMPLE).model_dump()
+    example["paths"]["project_notes"] = None  # a setting newer than that layout
+    assert load_config(LEGACY).model_dump() == example
 
 
 def legacy_problems(tmp_path, change) -> list[str]:
@@ -320,6 +322,23 @@ def test_check_says_the_old_layout_still_works_but_is_old(tmp_path, capsys):
     path.write_text(yaml.safe_dump(raw))
     assert main(["--config", str(path), "check", "--offline"]) == EXIT_OK
     assert "[WARN] config.layout: the youtrack: and gitlab: sections" in capsys.readouterr().out
+
+
+def test_check_shows_the_project_notes_and_fails_on_a_missing_file(tmp_path, capsys):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_BOT_TOKEN=c\n")
+    secrets.chmod(0o600)
+    notes = tmp_path / "project-notes.md"
+    raw = example_raw()
+    raw["paths"] = {"secrets": str(secrets), "project_notes": str(notes)}
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    assert main(["--config", str(path), "check", "--offline"]) == EXIT_CHECK_FAILED
+    assert (f"[FAIL] config.project_notes: paths.project_notes: {notes} does not exist; no task starts until it "
+            "is fixed") in capsys.readouterr().out
+    notes.write_text("<!-- guidance -->\nUse pnpm.\n")
+    main(["--config", str(path), "check", "--offline"])
+    assert f"config.project_notes: {notes}: 9 of 8192 bytes" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("section,value,expected", [

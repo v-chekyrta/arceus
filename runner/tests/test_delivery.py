@@ -705,6 +705,78 @@ def test_the_home_is_never_published_and_its_commits_stay_local(w):
     assert (home / "AGENTS.md").read_text().startswith("# GitLab group `clients/acme`")
 
 
+def notes_world(tmp_path, secrets, text: str | None) -> tuple[World, Path]:
+    notes = tmp_path / "project-notes.md"
+    if text is not None:
+        notes.write_text(text)
+    return World(tmp_path, secrets, settings={"paths": {"project_notes": str(notes)}}), notes
+
+
+def test_the_project_notes_end_the_agents_notes_and_each_task_keeps_its_own(tmp_path, secrets):
+    w, notes = notes_world(tmp_path, secrets, "<!-- for people -->\n## Tests\n\nTest files are `*_spec.py`.\n")
+    home = w.cfg.paths.workspace
+    take(w)
+    task = w.store.task("ACME-1")
+    text = (home / "AGENTS.md").read_text()
+    assert text.endswith("- `acme-theme`\n\n## Project notes\n\nThese notes come from the people who run this "
+                         "project. Where they contradict the server's notes or the rules above, those win.\n\n"
+                         "## Tests\n\nTest files are `*_spec.py`.\n")
+    assert "for people" not in text and (home / "CLAUDE.md").read_text() == "@AGENTS.md\n"
+    [ev] = w.events_named("workspace_home_updated")
+    assert ev["project_notes"] == len("## Tests\n\nTest files are `*_spec.py`.") and \
+        ev["commit"] == git(home, "rev-parse", "main")
+
+    # Changed while ACME-1 works: ACME-1 keeps what it started with, through its review, the next task gets the new.
+    notes.write_text("Test files are `test_*.py`.\n")
+    w.tick()
+    assert "`*_spec.py`" in (home / "AGENTS.md").read_text()
+    w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review"
+    take(w, 2, summary="Another")
+    assert git(home, "symbolic-ref", "--short", "HEAD") == "agent/ACME-2-another"
+    assert (home / "AGENTS.md").read_text().endswith("those win.\n\nTest files are `test_*.py`.\n")
+    assert "`*_spec.py`" in git(home, "show", f"{task.branch}:AGENTS.md")
+    w.runner.delivery.git.home_on(home, task.branch)  # how a later round of ACME-1 gets its folder
+    assert "`*_spec.py`" in (home / "AGENTS.md").read_text()
+
+
+def test_notes_of_comments_only_change_nothing(tmp_path, secrets):
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "noted").mkdir()
+    plain = World(tmp_path / "plain", secrets)
+    take(plain)
+    w, _ = notes_world(tmp_path / "noted", secrets, "<!--\nWhat the agent should know about the project.\n-->\n")
+    take(w)
+    assert (w.cfg.paths.workspace / "AGENTS.md").read_text() == \
+        (plain.cfg.paths.workspace / "AGENTS.md").read_text().replace(str(plain.cfg.paths.workspace.resolve()),
+                                                                     str(w.cfg.paths.workspace.resolve()))
+    assert "Project notes" not in (w.cfg.paths.workspace / "AGENTS.md").read_text()
+    assert git(w.cfg.paths.workspace, "rev-list", "--count", "main") == "1"
+    assert w.events_named("workspace_home_updated")[0]["project_notes"] == 0
+    for world in (plain, w):
+        world.events.close()
+        world.store.close()
+
+
+@pytest.mark.parametrize("text,reason", [
+    (None, "does not exist"),
+    ("x" * 8193, "is 8193 bytes without comments, more than 8192; shorten it"),
+    (b"\xff\xfe", "cannot be read"),
+])
+def test_notes_that_cannot_be_given_whole_stop_the_task(tmp_path, secrets, text, reason):
+    w, notes = notes_world(tmp_path, secrets, text if isinstance(text, str) else None)
+    if isinstance(text, bytes):
+        notes.write_bytes(text)
+    take(w)
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and task.reason.startswith("paths.project_notes: ") and reason in task.reason
+    assert w.calls("dispatch") == [] and not (w.cfg.paths.workspace / "AGENTS.md").exists()
+    w.events.close()
+    w.store.close()
+
+
 def test_a_changed_repository_missing_from_bulavas_report_blocks_publication(w):
     take(w)
     theme = w.cfg.paths.workspace / "acme-theme"

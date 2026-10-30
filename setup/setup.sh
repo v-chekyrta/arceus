@@ -405,7 +405,8 @@ check_runner() {
   [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] || return 1
   [ "$(cat "$RUNNER_OPT/.source-sha256" 2>/dev/null)" = "$(runner_source_hash)" ] || return 1
   runner_installed_matches || return 1
-  [ -f "$DATA_DIR/config.yaml" ] && [ -f "$DATA_DIR/secrets.env" ] && [ -f "$DATA_DIR/bulava.env" ] || return 1
+  [ -f "$DATA_DIR/config.yaml" ] && [ -f "$DATA_DIR/secrets.env" ] && [ -f "$DATA_DIR/bulava.env" ] \
+    && [ -f "$DATA_DIR/project-notes.md" ] || return 1
   ! grep -q '^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-replace-me$' "$DATA_DIR/bulava.env" || return 1
   [ "$(stat -c '%a %U' "$DATA_DIR/secrets.env")" = "600 $RUN_USER" ] \
     && [ "$(stat -L -c '%a %U' "$DATA_DIR/bulava.env")" = "600 $RUN_USER" ] || return 1
@@ -430,13 +431,15 @@ apply_runner() {
   chown -R root:root "$RUNNER_OPT"; chmod -R go-w "$RUNNER_OPT"
   # Examples are copied once. Whatever is there already is the operator's and stays untouched.
   local target example
-  for target in config.yaml:config.example.yaml secrets.env:secrets.env.example bulava.env:bulava.env.example; do
+  for target in config.yaml:config.example.yaml secrets.env:secrets.env.example bulava.env:bulava.env.example \
+      project-notes.md:project-notes.example.md; do
     example="${target#*:}"; target="${target%%:*}"
     if [ ! -e "$DATA_DIR/$target" ]; then
       install -m 600 -o "$RUN_USER" -g "$RUN_GROUP" "$REPO_DIR/config/$example" "$DATA_DIR/$target"
       [ "$target" != config.yaml ] || [ "$ARCEUS_HOME" = "$RUN_HOME/arceus" ] \
         || sed -i "s#~/arceus/#$ARCEUS_HOME/#g" "$DATA_DIR/$target"
       if [ "$target" = bulava.env ]; then say "  created $DATA_DIR/$target (optional, stays empty with a /login sign-in)"
+      elif [ "$target" = project-notes.md ]; then say "  created $DATA_DIR/$target: the project's notes for the agent, comments only until written"
       else say "  created $DATA_DIR/$target from $example: fill it in"; fi
     fi
   done

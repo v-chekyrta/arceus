@@ -14,6 +14,7 @@ missing instead of doing anything twice:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -73,9 +74,38 @@ HOME_IGNORE = """\
 """
 
 
-def home_files(where: str, repos: list[Repo], home: Path) -> dict[str, str]:
-    """What the agent finds where its session starts: what the folder is, its path, and the repositories.
-    `where` names the scope: GitLab group `clients/acme`."""
+PROJECT_NOTES_LIMIT = 8 * 1024  # bytes: every session of every task reads them whole
+PROJECT_NOTES_HEAD = ("These notes come from the people who run this project. Where they contradict the server's "
+                      "notes or the rules above, those win.")
+
+
+class ProjectNotesError(Exception):
+    """paths.project_notes is set, but the agent cannot be given what it holds."""
+
+
+def project_notes(path: Path | None) -> str:
+    """The project's notes as the agent gets them: HTML comments (the template's guidance) left out.
+    Empty when none are set. A file that is set but missing, unreadable or too long is an error, never skipped
+    or cut short: the agent would work without rules the project counts on."""
+    if path is None:
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ProjectNotesError(f"paths.project_notes: {path} does not exist") from None
+    except (OSError, UnicodeDecodeError) as e:
+        raise ProjectNotesError(f"paths.project_notes: {path} cannot be read ({e})") from None
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S).strip()
+    size = len(text.encode())
+    if size > PROJECT_NOTES_LIMIT:
+        raise ProjectNotesError(f"paths.project_notes: {path} is {size} bytes without comments, more than "
+                                f"{PROJECT_NOTES_LIMIT}; shorten it")
+    return text
+
+
+def home_files(where: str, repos: list[Repo], home: Path, notes: str = "") -> dict[str, str]:
+    """What the agent finds where its session starts: what the folder is, its path, the repositories, and
+    the project's notes when there are any. `where` names the scope: GitLab group `clients/acme`."""
     lines = [f"# {where}", "",
              "This folder is not a project. Each folder in it is a separate git repository of the group,",
              "cloned by the Arceus runner and switched to the task's branch.", "",
@@ -87,6 +117,8 @@ def home_files(where: str, repos: list[Repo], home: Path) -> dict[str, str]:
              "  changed repository.", "", "## Repositories", ""]
     for r in sorted(repos, key=lambda r: r.relative_path):
         lines.append(f"- `{r.relative_path}`" + (f": {' '.join(r.description.split())}" if r.description else ""))
+    if notes:
+        lines += ["", "## Project notes", "", PROJECT_NOTES_HEAD, "", notes]
     return {".gitignore": HOME_IGNORE, "AGENTS.md": "\n".join(lines) + "\n", "CLAUDE.md": "@AGENTS.md\n"}
 
 
@@ -279,6 +311,7 @@ class Delivery:
             extra_repos=json.dumps(names))
         self.events.emit("task_claimed", task_id=task.task_id, author=task.tag_author, repos=names,
                          branch=task.branch)
+        self._notes_file(task).unlink(missing_ok=True)  # left by a runner.db made anew: not this task's
         self._take(task, repos, details)
         return True
 
@@ -321,6 +354,10 @@ class Delivery:
         --dirty fail). A reason is returned instead when the work cannot start.
         """
         mine = self._task_repos(task, repos)
+        try:
+            notes = self.task_notes(task)
+        except ProjectNotesError as e:
+            return str(e)
         started = self.now()
         self.events.emit("workspace_preparing", task_id=task.task_id, repos=len(mine))
         for repo in mine:
@@ -334,19 +371,40 @@ class Delivery:
             self.git.start_branch(self.cfg.paths.workspace / repo.relative_path, task.branch,
                                   f"origin/{repo.default_branch or 'main'}")
         if not task.repo:
-            self._prepare_home(repos)
+            self.prepare_home(repos, notes)
         self._write_extra_dirs(task)
         self.events.emit("workspace_ready", task_id=task.task_id, repos=len(mine),
                          seconds=round((self.now() - started).total_seconds(), 1))
         return None
 
-    def _prepare_home(self, repos: list[Repo]) -> None:
-        """The workspace folder as the git project Bulava runs in, on main with the current notes."""
+    def _notes_file(self, task: Task) -> Path:
+        return self.cfg.paths.db.parent / "tasks" / task.task_id / "project-notes.md"
+
+    def task_notes(self, task: Task) -> str:
+        """The project's notes this task works with. Read from paths.project_notes when the task first starts
+        and kept with its other files, so a restart, a `/continue` or a code review of it gets the same ones
+        whatever the file says by then, or if it is gone."""
+        f = self._notes_file(task)
+        if f.exists():
+            return f.read_text(encoding="utf-8")
+        notes = project_notes(self.cfg.paths.project_notes)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_text(notes, encoding="utf-8")
+        tmp.replace(f)
+        self.events.emit("project_notes_pinned", task_id=task.task_id, bytes=len(notes.encode()),
+                         sha256=hashlib.sha256(notes.encode()).hexdigest())
+        return notes
+
+    def prepare_home(self, repos: list[Repo], notes: str) -> None:
+        """The workspace folder as the git project Bulava runs in, on main with these notes: the task's own
+        (task_notes). The branch of whatever runs next starts from this commit."""
         home = self.cfg.paths.workspace
         h = self.host
-        if self.git.write_home(home, home_files(f"{h.label} {h.scope_kind} `{h.scope}`", repos, home.resolve()),
-                               f"Arceus: workspace of {h.label} {h.scope_kind} {h.scope}"):
-            self.events.emit("workspace_home_updated", path=str(home), repos=len(repos))
+        files = home_files(f"{h.label} {h.scope_kind} `{h.scope}`", repos, home.resolve(), notes)
+        if self.git.write_home(home, files, f"Arceus: workspace of {h.label} {h.scope_kind} {h.scope}"):
+            self.events.emit("workspace_home_updated", path=str(home), repos=len(repos),
+                             project_notes=len(notes.encode()), commit=self.git.head(home))
         if not (home / ".git" / PREPARED_MARK).exists():
             self.engine.prepare_repo(home)
             (home / ".git" / PREPARED_MARK).write_text("trust, mcp-decide skip\n")
