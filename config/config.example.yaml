@@ -21,12 +21,15 @@ tracker:
     queue: agent
     needs_input: agent-needs-input
     failed: agent-failed
+    research: agent-research           # with the queue tag: answer the ticket's question, open no merge request
   states:
     queued: To Do
     in_progress: In Progress
     code_review: Code Review
     # merged: Testing                  # where the ticket goes once every MR is merged; Testing by default.
                                        # Set the board's own name for it, or null to leave it in Code Review.
+    # answered: Code Review            # where a research ticket goes once its answer is posted; code_review
+                                       # by default. null leaves it In Progress for a person to move.
   # YouTrack
   url: https://youtrack.example.com
   project: ACME                        # short name (ID) of the YouTrack project

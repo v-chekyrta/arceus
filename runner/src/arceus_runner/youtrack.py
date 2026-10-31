@@ -342,8 +342,8 @@ def check_youtrack(c: YouTrackConfig, yt: YouTrack) -> list[Check]:
                          f"field {c.state_field!r} not in project; fields: {', '.join(sorted(fields))}"))
     else:
         values = bundle_values(state)
-        for key in ("queued", "in_progress", "code_review", "merged"):
-            want = getattr(c.states, key)
+        for key in ("queued", "in_progress", "code_review", "merged", "answered"):
+            want = c.states.answered_state if key == "answered" else getattr(c.states, key)
             if want is None:
                 continue
             if want in values:
@@ -358,10 +358,15 @@ def check_youtrack(c: YouTrackConfig, yt: YouTrack) -> list[Check]:
                                  f"{want!r} is not a {c.state_field} value; available: {', '.join(values)}"))
 
     tags = yt.tag_names()
-    for key in ("queue", "needs_input", "failed"):
+    for key in ("queue", "needs_input", "failed", "research"):
         want = getattr(c.tags, key)
         if want in tags:
             out.append(Check(f"youtrack.tags.{key}", "ok", want))
+        elif key == "research":
+            # Only research tickets need it: everything else works without, so it is not a reason to stop.
+            out.append(Check(f"youtrack.tags.{key}", "warn",
+                             f"tag {want!r} does not exist or is not shared with {c.bot_user}, so nobody can ask "
+                             "the agent a research question; create it to use research tickets"))
         else:
             out.append(Check(f"youtrack.tags.{key}", "fail",
                              f"tag {want!r} does not exist or is not shared with {c.bot_user}"))

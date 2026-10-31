@@ -142,6 +142,53 @@ def _short(text: str, limit: int = 1500) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+ANSWER_PART = 12_000  # characters per ticket comment: a long answer is posted whole, as several, in order
+ANSWER_BYTES = 512 * 1024  # an answer file larger than this is not read: the agent is asked to shorten it
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def research_brief(answer: Path) -> str:
+    """What the agent is told, after the ticket's own text, when the ticket asks a question instead of a change."""
+    return "\n".join([
+        "## How this ticket is handled", "",
+        "This is a research ticket: the people who queued it want an answer, not a code change. No merge request "
+        "is opened for it, and nothing you commit is published.", "",
+        "- Read the code, its history and whatever else you need, and run what helps you answer: tests, a script, "
+        "the app. Leave every repository as you found it: commit nothing, and undo whatever you changed to check "
+        "something.",
+        f"- Write the full answer in Markdown to `{answer}`. Start with the answer itself, then the evidence for it "
+        "(files and lines, commands and what they showed). Keep what you verified apart from what you assume or "
+        "recommend. The runner posts the file on the ticket as it is, so write it for the people who asked, in "
+        "English.",
+        "- Then declare the outcome succeeded_research, with the answer in a few sentences as the summary.",
+        "- When the answer depends on a decision or access only a person has, ask, as on any ticket.",
+    ])
+
+
+def split_answer(text: str, limit: int = ANSWER_PART) -> list[str]:
+    """The answer in pieces of at most `limit` characters, cut between lines. A code block that a cut falls in is
+    closed at the end of one piece and opened again at the start of the next, so each piece renders on its own."""
+    room = limit - 16  # for the closing fence
+    lines = [ln[i:i + room] for ln in text.splitlines() for i in range(0, max(len(ln), 1), room)]
+    parts: list[str] = []
+    cur: list[str] = []
+    fence: str | None = None  # the opening line of the code block the current piece is inside
+    for line in lines:
+        if cur and sum(len(x) + 1 for x in cur) + len(line) > room:
+            parts.append(_close_piece(cur, fence))
+            cur = [fence] if fence else []
+        cur.append(line)
+        if _FENCE.match(line):
+            fence = None if fence else line.strip()
+    parts.append(_close_piece(cur, fence))
+    return [p for p in parts if p.strip()]
+
+
+def _close_piece(lines: list[str], fence: str | None) -> str:
+    closing = [_FENCE.match(fence).group(1)] if fence else []
+    return "\n".join([*lines, *closing]).strip()
+
+
 MEDIA_BEGIN, MEDIA_END = "<!-- arceus:media -->", "<!-- /arceus:media -->"
 
 
@@ -289,9 +336,11 @@ class Delivery:
         if now.author not in c.allowed_users:
             return self._not_taken(decision, f"{now.author} is no longer in allowed_users")
 
+        # A question instead of a change: decided once, here, and kept for every follow-up and restart.
+        kind = "research" if c.tags.research in tags else "code"
         base = dict(task_id=details.key, issue_db_id=details.db_id, summary=details.summary[:300],
                     tag_author=decision.author, base_branch="", question_id=None, question_at_ms=None,
-                    reason=None, mr_urls="[]", attempt_started=None)
+                    reason=None, mr_urls="[]", attempt_started=None, kind=kind)
         repos = self._group()
         if not repos:
             task = self.store.create_task(**base, state="claimed", repo="", repo_path="", branch="",
@@ -310,7 +359,7 @@ class Delivery:
             branch=f"{self.cfg.code_host.branch_prefix}{details.key}-{slugify(details.summary)}",
             extra_repos=json.dumps(names))
         self.events.emit("task_claimed", task_id=task.task_id, author=task.tag_author, repos=names,
-                         branch=task.branch)
+                         branch=task.branch, kind=task.kind)
         self._notes_file(task).unlink(missing_ok=True)  # left by a runner.db made anew: not this task's
         self._take(task, repos, details)
         return True
@@ -324,6 +373,8 @@ class Delivery:
         # Screened as it is now, at the start, not when it was tagged: anyone may have edited it since.
         # A held ticket is not claimed: it stays in the queue state, its workspace untouched.
         text = f"{task.task_id}: {details.summary}\n\n{details.description}".strip()
+        if task.research:
+            text += "\n\n" + research_brief(self.answer_file(task, self.research_run(task)))
         clearance = self.gate.clear(task, "ticket", text, authors=[task.tag_author, *details.writers],
                                     resume_state="claimed")
         if clearance is None:
@@ -376,6 +427,12 @@ class Delivery:
         self.events.emit("workspace_ready", task_id=task.task_id, repos=len(mine),
                          seconds=round((self.now() - started).total_seconds(), 1))
         return None
+
+    def answer_file(self, task: Task, run: int) -> Path:
+        """Where the agent writes its answer to a research ticket in run `run`: the workspace's notes folder for the
+        ticket, which no repository holds and the cleanup knows. A file of its own per run, so what an earlier run
+        left there can never be taken for this run's answer."""
+        return self.cfg.paths.workspace.resolve() / ".arceus" / "notes" / task.task_id / f"answer-{run}.md"
 
     def _notes_file(self, task: Task) -> Path:
         return self.cfg.paths.db.parent / "tasks" / task.task_id / "project-notes.md"
@@ -518,6 +575,12 @@ class Delivery:
         except BadRequest as e:
             self.events.emit("assignee_not_set", task_id=task.task_id, reason=str(e))
         n = len(self._names(task))
+        if task.research:
+            self.comment_once(task, "claim", f"The agent has taken this ticket as a question: it reads the code of the "
+                                             f"{n} {'repository' if n == 1 else 'repositories'} of "
+                                             f"{self.host.scope_kind} `{self.host.scope}` and answers here. No merge "
+                                             "request will be opened.")
+            return
         self.comment_once(task, "claim", f"The agent has taken this ticket: branch `{task.branch}` in the "
                                          f"{n} {'repository' if n == 1 else 'repositories'} of "
                                          f"{self.host.scope_kind} `{self.host.scope}`. It decides which of them "
@@ -580,6 +643,8 @@ class Delivery:
                 self._resume(task, len(attempts))
         elif state == "waiting_review":
             self.publish(task, show)
+        elif state == "done" and task.research:
+            self.answer(task, show, reviewed=True)
         elif state == "done" and self.store.task_mrs(task.task_id):
             # A follow-up the agent answered without changing code: say why, stay in Code Review.
             self.review.answered_without_changes(task, (show.get("outcome") or {}).get("summary") or "")
@@ -597,6 +662,12 @@ class Delivery:
             outcome = show.get("outcome") or {}
             receipt = show.get("receipt") or {}
             if why == "stalled" and self._nudge_stalled(task, len(attempts)):
+                return
+            if why == "debt" and task.research \
+                    and outcome.get("result") in ("succeeded_no_change", "succeeded_research"):
+                # The engine reviews code; an answer that changed none it cannot verify and banks as debt.
+                # That is how a research ticket normally ends, so the answer goes out, marked as not reviewed.
+                self.answer(task, show, reviewed=False)
                 return
             if why == "debt" and self.store.task_mrs(task.task_id) \
                     and outcome.get("result") in ("succeeded_no_change", "succeeded_research"):
@@ -831,10 +902,14 @@ class Delivery:
             f"failed:n{self.store.count_actions(f'{task.task_id}:comment:failed:') + 1}"
         if task.state in ("dispatched", "needs_input") and task.branch:
             self._save_progress(task)
-        body = f"Arceus could not take this ticket to a merge request: {reason}."
+        body = (f"Arceus could not answer this ticket: {reason}." if task.research else
+                f"Arceus could not take this ticket to a merge request: {reason}.")
         if details:
             body += f"\n\n{_short(details)}"
-        if task.branch:
+        if task.branch and task.research:
+            body += (f"\n\nTo have Arceus try again, reply with a comment that starts with `{CONTINUE}`, followed "
+                     "by anything it should know.")
+        elif task.branch:
             body += (f"\n\nTo have Arceus pick this up again, reply with a comment that starts with "
                      f"`{CONTINUE}`, followed by anything it should know (what was fixed, what to do "
                      f"differently). Its branches and commits are kept.")
@@ -892,6 +967,163 @@ class Delivery:
             self.git.abort(path, operation)
             self.events.emit("git_operation_aborted", task_id=task.task_id, repo=name, operation=operation)
         return operation
+
+    def answer(self, task: Task, show: dict, reviewed: bool) -> None:
+        """A research ticket's result: the agent's answer on the ticket, whole, and nothing published.
+
+        The answer is copied out of the workspace before anything is posted, so a retry after a crash or a tracker
+        failure posts the same text even once the workspace is cleaned. Each piece goes through comment_once:
+        pieces posted before a failure are not posted again. The task is done only once every piece is on the
+        ticket. Pieces and the copy are named by the research run (research_run), not by the engine's attempt:
+        the engine starts counting again when it lost a task and `/continue` started it anew."""
+        run = self.research_run(task)
+        text, why = self._kept_answer(task, run)
+        if not text:
+            self._no_answer(task, show, run, why)
+            return
+        head = ("Arceus looked into this ticket and changed no code; the answer passed review." if reviewed else
+                "Arceus looked into this ticket and changed no code.")
+        foot = [f"For a follow-up question, reply with a comment that starts with `{CONTINUE}`, followed by the "
+                "question."]
+        unpublished = self._research_commits(task, show)
+        if unpublished:
+            foot.insert(0, f"The agent also committed changes on branch `{task.branch}` in "
+                           f"{', '.join(unpublished)}. A research ticket publishes nothing, so they stay on the server.")
+        pieces = split_answer(text)
+        posted = []
+        for i, piece in enumerate(pieces, 1):
+            parts = [head] if i == 1 else []
+            if len(pieces) > 1:
+                parts.append(f"**Answer, part {i} of {len(pieces)}**")
+            parts.append(piece)
+            if i == len(pieces):
+                parts += foot
+            posted.append(self.comment_once(task, f"answer:{run}:{i}", "\n\n".join(parts)))
+        self._leave_clean(task)
+        answered = self.cfg.tracker.states.answered_state
+        with self.store.transaction():
+            self.store.update_task(task.task_id, state="done", reason="answered", question_id=None,
+                                   question_at_ms=None, published_at_ms=posted[0][1] if posted[0] else None)
+            if answered:
+                self.store.action_intent(f"{task.task_id}:state:answered:{run}", task.task_id, "state",
+                                         json.dumps({"state": answered, "while": ["done"]}))
+        self.events.emit("task_done", task_id=task.task_id, kind=task.kind, reviewed=reviewed, run=run,
+                         comments=len(pieces), answer_chars=len(text), unpublished_commits=unpublished or None)
+        self.retry_pending()
+
+    # -- research runs: the start and one per `/continue`, counted in the journal ------------------------
+
+    def research_run(self, task: Task) -> int:
+        """The number of the research ticket's current run: 1 for the start, one more for every `/continue`."""
+        return self.store.count_actions(f"{task.task_id}:research-run:") + 1
+
+    def _new_research_run(self, task: Task, cid: str) -> None:
+        """A `/continue` starts the next run: counted once, by the comment that asked for it."""
+        key = f"{task.task_id}:research-run:{cid}"
+        if not task.research or self.store.action(key):
+            return
+        self.store.action_intent(key, task.task_id, "research-run")
+        self.store.action_done(key)
+
+    def _no_answer(self, task: Task, show: dict, run: int, why: str) -> None:
+        """The run ended without an answer the runner can post. The agent is asked once, saying why, to write it
+        where it belongs; a run that was asked already fails, with what the agent said instead."""
+        attempt = len(show.get("attempts") or [])
+        key = f"{task.task_id}:answer-asked:{run}"
+        act = self.store.action(key)
+        if act and act[0] == "done":
+            summary = unattributed((show.get("outcome") or {}).get("summary") or "").strip()
+            self.fail(task, f"the agent did not leave an answer the runner can post ({why})",
+                      f"What the agent said instead: {summary}" if summary else "", attempt=attempt)
+            return
+        if not act:
+            self.store.action_intent(key, task.task_id, "answer-asked")
+        if not self._followup_ready(task):
+            return  # asked once the workspace is free
+        text = (f"The runner cannot post your answer: {why}. Write the whole answer in Markdown to "
+                f"`{self.answer_file(task, run)}`, a plain file of at most {ANSWER_BYTES // 1024} KB, commit nothing, and "
+                "declare the outcome succeeded_research again.")
+        reply = self.engine.send(task_id=task.task_id, message_id=f"answer-{task.task_id}-{run}", source="other",
+                                 author=self.cfg.tracker.bot_user, repo=Path(task.repo_path), text=text,
+                                 clearance=trusted(text), extra_dirs=self._extra_dirs_file(task))
+        if reply.rc == 6:
+            self.events.emit("send_busy", task_id=task.task_id, reason=reply.why())
+            return
+        if not reply.accepted:
+            self.store.action_done(key, "refused")
+            self.fail(task, f"the agent did not leave an answer the runner can post ({why}), and the execution "
+                            f"engine did not take the request to write it ({reply.why()})", attempt=attempt)
+            return
+        with self.store.transaction():
+            self.store.update_task(task.task_id, state="dispatched", attempt_started=self.now().isoformat())
+            self.store.action_done(key, json.dumps({"attempt": reply.data.get("attempt")}))
+        self.events.emit("answer_requested", task_id=task.task_id, run=run, reason=why, tier=reply.tier)
+
+    def _answer_copy(self, task: Task, run: int) -> Path:
+        return self.cfg.paths.db.parent / "tasks" / task.task_id / f"answer-{run}.md"
+
+    def _kept_answer(self, task: Task, run: int) -> tuple[str, str]:
+        """The run's answer as the runner keeps it, read from the agent's file once and kept with the task's other
+        files; the names of the tools behind it left out. ("", why) when there is none to post."""
+        copy = self._answer_copy(task, run)
+        if copy.exists():
+            return copy.read_text(encoding="utf-8"), ""
+        text, why = self._read_answer(task, run)
+        # Nothing in it may pass for the runner's own comment markers (comment_once finds its comments by them).
+        text = re.sub(r"\[arceus:", "[arceus :", unattributed(text)).strip()
+        if not text:
+            return "", why or "the answer file is empty"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        tmp = copy.with_name(copy.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(copy)
+        return text, ""
+
+    def _read_answer(self, task: Task, run: int) -> tuple[str, str]:
+        """The agent's answer file and, when it cannot be posted, why. Read as untrusted: the agent writes the
+        folder, and the runner reads with its own rights and posts what it reads. A symlink (it could point at the
+        runner's secrets), a file that is not where it should be, or one past the size limit is not read."""
+        f = self.answer_file(task, run)
+        try:
+            if f.is_symlink() or f.parent.is_symlink():
+                why = "the answer file is a symbolic link"
+            elif not f.is_file():
+                return "", f"there is no answer file at {f}"
+            elif f.resolve().parent != f.parent.resolve() or f.parent.parent.resolve() != f.parent.parent:
+                why = "the answer file is outside the notes folder"
+            elif f.stat().st_nlink > 1:
+                why = "the answer file is a hard link to another file"
+            elif f.stat().st_size > ANSWER_BYTES:
+                why = f"the answer file is larger than {ANSWER_BYTES // 1024} KB"
+            else:
+                return f.read_text(encoding="utf-8", errors="replace"), ""
+            self.events.emit("answer_refused", task_id=task.task_id, reason=why)
+            return "", why
+        except OSError as e:
+            self.events.emit("answer_unreadable", task_id=task.task_id, reason=str(e))
+            return "", f"the answer file cannot be read ({e.strerror or e})"
+
+    def _research_commits(self, task: Task, show: dict) -> list[str]:
+        """The repositories where a research attempt committed anyway: past their base, the home left out."""
+        home = self.cfg.paths.workspace.resolve()
+        repos = (show.get("receipt") or {}).get("repos") or show.get("repos") or []
+        return sorted(Path(r["path"]).name for r in repos
+                      if r.get("path") and Path(r["path"]).resolve() != home
+                      and (r.get("reviewed_sha") or "") != (r.get("base_sha") or ""))
+
+    def _leave_clean(self, task: Task) -> None:
+        """What a research attempt left uncommitted goes to the stash, so the next task does not find the shared
+        workspace dirty (a dirty repository refuses its start). Nothing is deleted."""
+        for name in self._names(task):
+            path = self.cfg.paths.workspace / name
+            try:
+                if not (path / ".git").exists() or self.git.is_clean(path):
+                    continue
+                self._end_unfinished(task, name, path)
+                stash = self.git.stash_all(path, f"arceus: what the research of {task.task_id} left")
+                self.events.emit("research_leftovers_stashed", task_id=task.task_id, repo=name, stash=stash)
+            except GitError as e:
+                self.events.emit("research_leftovers_kept", task_id=task.task_id, repo=name, reason=str(e))
 
     def ask(self, task: Task, show: dict) -> None:
         q = show.get("question") or {}
@@ -958,13 +1190,15 @@ class Delivery:
     # -- picking a failed task up again ---------------------------------------------------------
 
     def check_continue(self) -> None:
-        """A `/continue` comment from an allowed person after a failure: recorded, sent by send_continue()."""
+        """A `/continue` comment from an allowed person after a failure, or after the answer to a research ticket
+        (a follow-up question): recorded, sent by send_continue()."""
         c = self.cfg.tracker
         window = self.cfg.limits.continue_window
-        for task in self.store.tasks("failed"):
-            if not task.failed_at_ms or not task.branch:
+        for task in [*self.store.tasks("failed"), *(t for t in self.store.tasks("done") if t.research)]:
+            since = task.failed_at_ms if task.state == "failed" else task.published_at_ms
+            if not since or not task.branch:
                 continue  # failed before any work existed (no repositories), or before this was possible
-            if self.now() - datetime.fromtimestamp(task.failed_at_ms / 1000, UTC) > window:
+            if self.now() - datetime.fromtimestamp(since / 1000, UTC) > window:
                 continue
             try:
                 comments = self.tracker.comments(task.issue_db_id)
@@ -972,7 +1206,7 @@ class Delivery:
                 self.events.emit("reconcile_failed", task_id=task.task_id, reason=str(e))
                 return
             for x in comments:
-                if x.created < task.failed_at_ms or x.author == c.bot_user or x.author not in c.allowed_users:
+                if x.created < since or x.author == c.bot_user or x.author not in c.allowed_users:
                     continue
                 if not x.text.strip().lower().startswith(CONTINUE):
                     continue
@@ -992,7 +1226,7 @@ class Delivery:
             data = json.loads(payload or "{}")
             if task and task.state == "security_hold":
                 continue  # the request itself waits for a security reviewer
-            if not task or task.state != "failed":
+            if not task or not self._continuable(task):
                 self.store.action_done(key, "stale")  # it moved on by another way meanwhile
                 continue
             if self._workspace_waits(task):
@@ -1002,6 +1236,10 @@ class Delivery:
             except (ServiceError, EngineError, GitError) as e:
                 self.events.emit("reconcile_failed", task_id=task.task_id, reason=str(e))
             return  # one at a time
+
+    @staticmethod
+    def _continuable(task: Task) -> bool:
+        return task.state == "failed" or (task.research and task.state == "done")
 
     def _send_continue(self, task: Task, key: str, data: dict) -> None:
         if self._workspace_waits(task):
@@ -1014,11 +1252,20 @@ class Delivery:
             return
         if not self._followup_ready(task):
             return  # the request stays pending
-        text = (f"{data['author']} asked you to continue this task after it failed ({task.reason}). "
-                f"Pick it up from where the work stands and finish it.")
+        # A research ticket's `/continue` is its next run, with an answer file of its own (_new_research_run).
+        answer = self.answer_file(task, self.research_run(task) + 1) if task.research else None
+        if task.state == "done":
+            text = (f"{data['author']} has a follow-up to your answer on the ticket. Answer it the same way: the "
+                    f"full answer in `{answer}`, then the outcome succeeded_research. Commit nothing.")
+        else:
+            text = (f"{data['author']} asked you to continue this task after it failed ({task.reason}). "
+                    f"Pick it up from where the work stands and finish it.")
+            if answer:
+                text += (f" This run's answer goes to `{answer}`, whatever an earlier run wrote elsewhere; then "
+                         "declare the outcome succeeded_research. Commit nothing.")
         if data.get("text"):
             text += f"\n\n{data['text']}"
-            clearance = self.gate.clear(task, "continue", text, authors=[data["author"]], resume_state="failed",
+            clearance = self.gate.clear(task, "continue", text, authors=[data["author"]], resume_state=task.state,
                                         ref=key)
             if clearance is None:
                 return
@@ -1060,6 +1307,7 @@ class Delivery:
                                          if sg.kind in ("ticket", "code_review")], "continue")
             self.store.action_done(key, json.dumps({"attempt": attempt}))
             cid = key_part(data["comment"], keep_dash=True)
+            self._new_research_run(task, cid)
             self.store.action_intent(f"{task.task_id}:untag:{tag}:{cid}", task.task_id, "untag",
                                      json.dumps({"tag": tag}))
             self.store.action_intent(f"{task.task_id}:state:continue:{cid}", task.task_id, "state", json.dumps(
@@ -1133,6 +1381,10 @@ class Delivery:
         return "the push was rejected", str(err)
 
     def publish(self, task: Task, show: dict) -> None:
+        if task.research:
+            # Whatever the agent committed, a research ticket publishes nothing: its answer is the result.
+            self.answer(task, show, reviewed=False)
+            return
         receipt = show.get("receipt") or {}
         if not receipt.get("review") and self._passed_without_outcome(task, show):
             # The attempt passed review but ended without a declared outcome, so Bulava wrote no receipt (staging,

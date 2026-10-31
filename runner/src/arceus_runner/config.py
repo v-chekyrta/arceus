@@ -83,10 +83,13 @@ class TrackerTags(Strict):
     queue: str = "agent"
     needs_input: str = "agent-needs-input"
     failed: str = "agent-failed"
+    # Next to the queue tag when the ticket is taken: a question to answer on the ticket, no merge request.
+    # Who may start the agent is still read from the queue tag alone.
+    research: str = "agent-research"
 
     @model_validator(mode="after")
     def _distinct(self) -> TrackerTags:
-        names = [self.queue, self.needs_input, self.failed]
+        names = [self.queue, self.needs_input, self.failed, self.research]
         if len(set(names)) != len(names):
             raise ValueError(f"tags must be different, got {names}")
         return self
@@ -99,6 +102,13 @@ class TrackerStates(Strict):
     code_review: str
     # Where the ticket goes once every MR is merged. Most boards call it Testing; null leaves it in Code Review.
     merged: str | None = "Testing"
+    # Where a research ticket goes once its answer is posted: unset, the code_review state, since the answer
+    # waits for a person to read it the way an MR does. null leaves it in in_progress for a person to move.
+    answered: str | None = None
+
+    @property
+    def answered_state(self) -> str | None:
+        return self.answered if "answered" in self.model_fields_set else self.code_review
 
 
 def _url(v: str) -> str:

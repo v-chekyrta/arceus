@@ -478,11 +478,19 @@ MIGRATIONS.append(
     """
 )
 
+MIGRATIONS.append(
+    # 16: what a task is for. `code` ends in merge requests; `research` (the research tag on the ticket when it
+    # was taken) ends in an answer on the ticket and publishes nothing, also on a `/continue`.
+    """
+    ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'code' CHECK (kind IN ('code', 'research'));
+    """
+)
+
 
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
-               "review_answers")
+               "review_answers", "kind")
 TASK_COLUMNS = (*TASK_FIELDS, "updated_at")  # read: the last change is set by the store itself, never written
 
 
@@ -508,11 +516,16 @@ class Task:
     published_at_ms: int | None = None  # the MR comment, or the last `/continue`: later comments are review
     failed_at_ms: int | None = None     # when the task failed: a later `/continue` from a person resumes it
     review_answers: int = 0  # review rounds answered without a code change
+    kind: str = "code"       # code: merge requests; research: an answer on the ticket, nothing published
     updated_at: str = ""     # when the record last changed: for a task that is over, when it ended
 
     @property
     def active(self) -> bool:
         return self.state in ACTIVE_STATES
+
+    @property
+    def research(self) -> bool:
+        return self.kind == "research"
 
 
 class TaskStore(Store):
