@@ -20,6 +20,8 @@ step() {   # $1=what, then the command
 }
 
 step "runner tests (Mac or wherever this runs)" bash -c 'cd runner && .venv/bin/pytest -q -n auto'
+step "setup: running services are enabled for good, so they come back after a reboot" \
+  bash setup/tests/test-autostart.sh
 step "setup: the engine's source survives a rewritten upstream, the pinned commit installs" \
   bash setup/tests/test-bulava-source.sh --live
 

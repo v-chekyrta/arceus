@@ -8,6 +8,7 @@ import yaml
 
 from arceus_runner.cli import EXIT_CHECK_FAILED, EXIT_CONFIG, EXIT_OK, main
 from arceus_runner.config import ConfigError, load_config, load_secrets, parse_duration
+from arceus_runner.health import autostart  # the real one: conftest stands in for it in every other test
 
 from .conftest import EXAMPLE, example_raw
 
@@ -317,3 +318,28 @@ def test_engine_env_prints_what_setup_writes_into_the_engine_unit(capsys):
         "SUPERVISOR_CLAUDE_CHECKS=1", "SUPERVISOR_CLAUDE_CHECKS_LIST=code security",
         "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY=high", "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1",
         "SUPERVISOR_CLAUDE_CHECKS_ROUNDS=1", "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT=900"]
+
+
+def test_a_service_that_would_not_come_back_after_a_reboot_is_named(monkeypatch):
+    from subprocess import CompletedProcess
+    monkeypatch.setattr("arceus_runner.health.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def systemctl(**states):
+        # systemctl is-enabled exits 0 for enabled-runtime too: only its word tells the two apart.
+        def run(argv, **kw):
+            state = states[argv[-1].replace("-", "_")]
+            return CompletedProcess(argv, 0 if state.startswith("enabled") else 1, state + "\n", "")
+        return run
+
+    [c] = autostart(run=systemctl(bulava_engine="enabled", runner="disabled"))
+    assert c.status == "warn"
+    assert c.detail == "runner is disabled: it will not start after a reboot (sudo systemctl enable runner)"
+    [c] = autostart(run=systemctl(bulava_engine="enabled-runtime", runner="enabled"))
+    assert c.status == "warn" and c.detail.startswith("bulava-engine is enabled-runtime")
+    [c] = autostart(run=systemctl(bulava_engine="enabled", runner="not-found"))
+    assert c.status == "warn" and c.detail.startswith("runner is not-found")
+    [c] = autostart(run=systemctl(bulava_engine="enabled", runner="enabled"))
+    assert c.status == "ok"
+    assert autostart(run=systemctl(bulava_engine="not-found", runner="not-found")) == []   # a developer's machine
+    monkeypatch.setattr("arceus_runner.health.shutil.which", lambda name: None)
+    assert autostart(run=systemctl(bulava_engine="disabled", runner="disabled")) == []

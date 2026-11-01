@@ -426,6 +426,23 @@ def test_session_lost_after_reboot_is_sent_on(w):
     assert w.store.task("ACME-1").state == "dispatched"
 
 
+def test_a_reboot_is_sent_on_once_and_the_time_it_was_down_is_not_counted(w):
+    take(w)
+    w.now = datetime.now(UTC) + timedelta(hours=7)  # down for most of attempt_timeout (8 h)
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(attempt_live=False))
+    w.tick()
+    w.tick()
+    assert ["resume-ACME-1-1" in c["argv"] for c in w.calls("worker-send")] == [True]
+    w.now += timedelta(hours=5)  # 12 h since the first start, 5 h into the attempt after the reboot
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"
+    # The next week's reboot: the attempt it cut off is sent on in turn.
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(attempt_live=False))
+    w.tick()
+    assert [c["argv"][c["argv"].index("--message-id") + 1] for c in w.calls("worker-send")] \
+        == ["resume-ACME-1-1", "resume-ACME-1-2"]
+
+
 def test_hung_attempt_fails_after_the_timeout(w):
     take(w)
     w.now = datetime.now(UTC) + timedelta(hours=9)

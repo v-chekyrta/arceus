@@ -153,6 +153,20 @@ def test_a_request_starts_one_review_task_and_never_reaches_the_author(w):
     assert w.store.task("ACME-1").state == "code_review"
 
 
+def test_a_review_cut_off_by_a_reboot_goes_on_and_is_not_taken_for_a_verdict(w):
+    publish(w)
+    ask(w)
+    write_verdict(w)  # what the cut-off run had written so far
+    w.set_engine(lambda s: s["tasks"][RID].update(attempt_live=False))
+    w.tick()
+    w.tick()
+    resumes = [c for c in w.calls("worker-send") if RID in c["argv"]]
+    assert [c["argv"][c["argv"].index("--message-id") + 1] for c in resumes] == [f"resume-{RID}-1"]
+    assert w.store.review(RID).state == "running" and review_notes(w) == [] and w.gl.mrs[0].get("approved_by") in (None, [])
+    finish(w)
+    assert w.store.review(RID).outcome == "approved"
+
+
 def test_the_review_judges_by_the_project_notes_the_task_worked_with(tmp_path):
     notes = tmp_path / "project-notes.md"
     notes.write_text("Test files are `*_spec.py`.\n")

@@ -549,14 +549,32 @@ UMask=0077
 WantedBy=multi-user.target
 UNIT
 }
+# Units the operator has started but not enabled for good: they run now and are gone after the next
+# reboot, with the agent's task left waiting for a runner that never comes back. The word, not the exit
+# code: `enabled-runtime` also exits 0 and does not outlive the boot.
+not_autostarted() {
+  local u
+  for u in bulava-engine runner; do
+    systemctl is-active --quiet "$u" 2>/dev/null \
+      && [ "$(systemctl is-enabled "$u" 2>/dev/null)" != enabled ] && printf '%s\n' "$u"
+  done
+  return 0
+}
 check_systemd() {
-  same_file "$UNIT" "$(unit_text)" 644 root:root && same_file "$ENGINE_UNIT" "$(engine_unit_text)" 644 root:root
+  same_file "$UNIT" "$(unit_text)" 644 root:root && same_file "$ENGINE_UNIT" "$(engine_unit_text)" 644 root:root \
+    && [ -z "$(not_autostarted)" ]
 }
 apply_systemd() {
-  local engine_changed=0 busy
+  local engine_changed=0 busy u
   put_file "$UNIT" 644 root:root "$(unit_text)" || true
   put_file "$ENGINE_UNIT" 644 root:root "$(engine_unit_text)" && engine_changed=1
   systemctl daemon-reload
+  # Running means the operator has turned them on; enabling keeps them on through a reboot.
+  for u in $(not_autostarted); do
+    # A --runtime enable sits in /run beside the one written now and would still be what is-enabled names.
+    systemctl disable --runtime --quiet "$u" 2>/dev/null || true
+    systemctl enable --quiet "$u" && say "  $u was running but not enabled: enabled, so it starts after a reboot"
+  done
   # Installed, not started: the operator fills in config.yaml and bulava.env, runs
   # `arceus-runner check`, then `systemctl enable --now bulava-engine runner`.
   # A running engine keeps its old environment until it restarts, and a restart ends the workers'

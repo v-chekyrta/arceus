@@ -117,6 +117,31 @@ def engine_doctor(engine: Engine) -> list[Check]:
     return out or [Check("bulava.doctor", "warn", "doctor returned no checks")]
 
 
+def autostart(units: tuple[str, ...] = ("bulava-engine", "runner"), run=subprocess.run) -> list[Check]:
+    """Both services start at boot. A unit started by hand but never enabled, or enabled with --runtime
+    (gone at the next boot), is down after the weekly reboot, and with it the recovery of the task that
+    was running. Nothing on a machine without either of them (a developer's)."""
+    if not shutil.which("systemctl"):
+        return []
+    states = {}
+    for u in units:
+        try:
+            r = run(["systemctl", "is-enabled", u], capture_output=True, text=True, timeout=10,
+                    stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        states[u] = (r.stdout.split() or ["not-found"])[0]
+    if all(s == "not-found" for s in states.values()):
+        return []
+    # Only `enabled` survives a reboot: `enabled-runtime` lives in /run, and these units are never static.
+    off = [u for u, s in states.items() if s != "enabled"]
+    if off:
+        why = ", ".join(f"{u} is {states[u]}" for u in off)
+        return [Check("autostart", "warn", f"{why}: it will not start after a reboot "
+                                           f"(sudo systemctl enable {' '.join(off)})")]
+    return [Check("autostart", "ok", f"{' and '.join(units)} start at boot")]
+
+
 def devstack(cfg: Config) -> list[Check]:
     """health.devstack_check: the project's dev stack is up. Absent: not checked."""
     cmd = cfg.health.devstack_check
@@ -134,4 +159,4 @@ def devstack(cfg: Config) -> list[Check]:
 
 
 def local_checks(cfg: Config, probe: Probe) -> list[Check]:
-    return [disk(cfg), ram(cfg), bulava(probe), claude_checks(cfg, probe), *tools(), *devstack(cfg)]
+    return [disk(cfg), ram(cfg), bulava(probe), claude_checks(cfg, probe), *tools(), *autostart(), *devstack(cfg)]

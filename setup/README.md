@@ -40,8 +40,8 @@ Setup never overwrites `data/config.yaml`, `secrets.env`, `bulava.env` or `proje
 | `/var/lib/arceus/bulava.git` | root | a mirror of the Bulava repository that keeps every commit setup installed (`refs/arceus/<commit>`), so a pinned commit stays installable after Bulava rewrites its branches |
 | `/opt/bulava-local/mcp.json` | root | the headless browser for Bulava (`SUPERVISOR_AUTOMATION_MCP_CONFIG`), without `npx` |
 | `/opt/arceus-observability` | root | the Docker Compose stack for Grafana, Prometheus, Loki, Alloy and node_exporter |
-| `/etc/systemd/system/bulava-engine.service` | root | the tmux server the workers run in (`tmux -L bulava`). Installed, not enabled |
-| `/etc/systemd/system/runner.service` | root | the runner. `KillMode=process`: restarting it does not kill the engine's watchdogs. Installed, not enabled |
+| `/etc/systemd/system/bulava-engine.service` | root | the tmux server the workers run in (`tmux -L bulava`). Installed; the operator starts it, and setup keeps a running one enabled for reboots |
+| `/etc/systemd/system/runner.service` | root | the runner. `KillMode=process`: restarting it does not kill the engine's watchdogs. Installed; the operator starts it, and setup keeps a running one enabled for reboots |
 | `~/arceus/data/` | the user, 700 | `config.yaml`, `secrets.env` (600), `runner.db`, `events.jsonl`, `grafana-admin-password` |
 | `~/.git-credentials` | the user, 600 | the code host bot's credentials, for that host only; written by the runner at start |
 | `/var/lib/arceus/facts.json` | root | what is actually installed: OS, versions, the user, the status of each phase |
@@ -133,6 +133,12 @@ sudo systemctl enable --now bulava-engine runner
 ```
 
 When observing shows what you expect, set `mode: live` and run `sudo systemctl restart runner`. If the installed engine lacks a contract the runner needs, `live` does not start and lists what is missing (`arceus-runner probe-bulava`).
+
+## Reboots
+
+A reboot ends the agent's session: Claude, Codex and their tmux server stop with the machine. The task itself survives. Its record, the workspace with uncommitted files and the runner's database are all on disk. When the machine is back, `bulava-engine` and then `runner` start on their own, and on its first pass the runner finds the task `running` with no live session. It sends it on with `continue` in a fresh session, in the same workspace and on the same branch. A cut-off code review is sent on the same way, and whatever it had written before the reboot does not count as a verdict. The hours the machine was down do not count toward `attempt_timeout`. Nothing gets published twice: a push, MR or comment cut off halfway is repeated only after checking what the code host already has.
+
+This needs both services enabled, not just started. `setup.sh` enables for good any that are running but not enabled, or enabled only with `--runtime` (that one is forgotten at the next boot), and `--check` lists them as `todo`. `arceus-runner doctor` and the `autostart` health check warn about a service that will not come back after a reboot.
 
 ## Independent checks before Codex
 
