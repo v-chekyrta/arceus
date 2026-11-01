@@ -49,13 +49,14 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from arceus_runner import materials
 from arceus_runner.config import DOC_PATHS, TEST_PATHS
 from arceus_runner.db import ACTIVE_STATES, ReviewRequest, ReviewStore, Task
 from arceus_runner.delivery import ProjectNotesError
 from arceus_runner.engine import EngineError
 from arceus_runner.gitops import HOME_BRANCH, GitError
 from arceus_runner.http import ServiceError
-from arceus_runner.integrations import Approval, Comment, IssueDetails, key_part
+from arceus_runner.integrations import Approval, Comment, IssueDetails, MRStatus, key_part
 from arceus_runner.replies import decisions_file, unattributed
 from arceus_runner.screening import is_decision, trusted
 
@@ -313,7 +314,24 @@ class ReviewAgent:
         bot = self.cfg.tracker.bot_user
         people = [[str(x.id), x.author, x.text] for x in self._ticket_comments(task)
                   if x.author != bot and self.request(x.text) is None]
-        return hashlib.sha256(json.dumps([_digest(issue), people]).encode()).hexdigest()
+        # The files people attached count too: a mockup replaced or removed is a changed requirement.
+        files = [[a.id, a.name, a.size, a.created, a.comment_id] for a in self._attachments(task) if a.author != bot]
+        return hashlib.sha256(json.dumps([_digest(issue), people, *([files] if files else [])]).encode()).hexdigest()
+
+    def _requirements(self, task: Task, issue: IssueDetails) -> str:
+        """What the ticket asks for, without the conversation: the summary, the description and the files people
+        attached. An approval outlives a comment ("merged, thanks"), not a change of these."""
+        bot = self.cfg.tracker.bot_user
+        files = [[a.id, a.name, a.size, a.created, a.comment_id] for a in self._attachments(task) if a.author != bot]
+        return hashlib.sha256(json.dumps([_digest(issue), files]).encode()).hexdigest()
+
+    def _attachments(self, task: Task) -> list:
+        return self.tracker.attachments(task.issue_db_id) if getattr(self.tracker, "reads_attachments", False) else []
+
+    def _files(self, task: Task, comments: list[Comment]) -> list[materials.Material]:
+        """The ticket's files for the reviewer, as the author got them at the start."""
+        bot = self.cfg.tracker.bot_user
+        return self.d.ticket_files(task, None, [x for x in comments if x.author != bot])
 
     def _ticket_problem(self, task: Task, snap: dict) -> str | None:
         """Why the ticket no longer backs the review's verdict, or None."""
@@ -513,15 +531,20 @@ class ReviewAgent:
                                                             "stands.", outcome="refused")
                 return
         comments = self._ticket_comments(task)
+        files = self._files(task, comments)
         text = self._compose(row, task, issue, comments, mrs)
-        authors = [row.author, *issue.writers, *(x.author for x in comments)]
+        if files:
+            texts = [("the description", None, issue.description),
+                     *((f"the comment by {x.author} of {_when(x.created)}", str(x.id), x.text) for x in comments)]
+            text, files = materials.with_section(text, files, self.d._files_folder(task), texts)
+        authors = [row.author, *issue.writers, *(x.author for x in comments), *(m.attachment.author for m in files)]
         clearance = self.d.gate.clear(task, "review_request", text, authors=authors, resume_state=task.state,
-                                      ref=row.id)
+                                      ref=row.id, files=materials.screen_files(files))
         if clearance is None:
             return  # held for a security reviewer, refused, or the screen is down: nothing switched
         snapshot = {"branch": branch, "text": text, "authors": authors,
                     "home_prev": self.git.current_branch(home) if (home / ".git").exists() else None,
-                    "ticket": {"context": context}, "mrs": mrs}
+                    "ticket": {"context": context, "requirements": self._requirements(task, issue)}, "mrs": mrs}
         row = self.store.update_review(row.id, state="preparing", snapshot=json.dumps(snapshot),
                                        started_at=self.d.now().isoformat())
         self._waiting.pop(row.id, None)
@@ -553,10 +576,14 @@ class ReviewAgent:
         # Read, build and test there, never edit: no writable-directories.txt beside the list.
         (extra.parent / "writable-directories.txt").unlink(missing_ok=True)
         self._verdict_file(row).parent.mkdir(parents=True, exist_ok=True)
+        # The files the brief names, fetched again (or kept from the fetch above): screened with it once more.
+        files = self._files(task, self._ticket_comments(task)) if materials.SECTION_HEAD in snap["text"] else []
+        files = materials.given_in(snap["text"], files, self.d._files_folder(task))
         clearance = self.d.gate.clear(task, "review_request", snap["text"], authors=snap["authors"],
-                                      resume_state=task.state, ref=row.id)
+                                      resume_state=task.state, ref=row.id, files=materials.screen_files(files))
         if clearance is None:
             return  # the screen is down right now: the switched workspace stays held, tried again next tick
+        self.d.publish_files(task, files)
         reply = self.d.engine.dispatch(task_id=row.id, message_id=f"review-{row.id}", author=row.author,
                                        source=self.tracker.engine_source, branch=branch, base=HOME_BRANCH,
                                        repo=Path(ws), text=snap["text"], clearance=clearance, extra_dirs=extra)
@@ -973,11 +1000,13 @@ class ReviewAgent:
             return f"CI {self._ci_words(ci)}"
         return self._ticket_problem(task, json.loads(row.snapshot)) or ""
 
-    def approval_outlived(self, task: Task, project_id, iid, head: str) -> None:
-        """The newest finished review approved this MR at a commit it no longer points at: take the approval back,
-        once, and say so on the MR. GitLab keeps an approval across pushes unless the project resets approvals on
-        push, which not every edition offers; the runner's own approval stands for one commit only."""
-        if not head or not getattr(self.host, "supports_approval", False):
+    def approval_outlived(self, task: Task, project_id, iid, st: MRStatus) -> None:
+        """The newest finished review approved this MR, and what it approved is no longer what the MR is: new
+        commits, another target branch, or a ticket that now asks for something else (its description or files).
+        Take the approval back, once, and say so on the MR. GitLab keeps an approval across pushes unless the
+        project resets approvals on push, which not every edition offers; the runner's own approval stands for one
+        commit, one target and one version of the ticket."""
+        if not st.sha or not getattr(self.host, "supports_approval", False):
             return
         done = [r for r in self.store.reviews("done", task_id=task.task_id) if r.result]
         for row in reversed(done):
@@ -986,35 +1015,50 @@ class ReviewAgent:
             if mr is None:
                 continue
             approval = self._approval(row, task, mr)
-            if not (approval and approval["done"]) or mr["sha"] == head:
-                return  # the newest review of this MR gave no approval, or the approval is for this commit
+            if not (approval and approval["done"]):
+                return  # the newest review of this MR gave no approval
             key = f"{self._keys(row, mr)}:outlived"
             act = self.store.action(key)
             if act and act[0] == "done":
                 return
+            # A revoke begun before a failure or a crash is finished for the reason it began with.
+            why = json.loads(act[1])["why"] if act and act[1] else self._outlived_by(row, task, mr, st)
+            if not why:
+                return
             if not act:
-                self.store.action_intent(key, task.task_id, "review-revoke")
+                self.store.action_intent(key, task.task_id, "review-revoke", json.dumps({"why": why}))
             by = approval.get("by") or self.host.reviewer
-            revoked = self.host.revoke(mr["project_id"], mr["iid"])
+            # Begun before (act): the approval may be gone already, taken back by that attempt; the note still says so.
+            revoked = self.host.revoke(mr["project_id"], mr["iid"]) or (act is not None and by == self.host.reviewer)
             if revoked or by != self.host.reviewer:
                 # An approval given by an account the runner no longer approves as (the approver was changed in the
                 # config) cannot be taken back by the runner: the note says so and who has to remove it.
                 marker = f"<!-- arceus:{row.id}:{mr['label']}:outlived -->"
                 signer = {self.host.reviewer, self.cfg.code_host.bot_user}  # the bot posts it when the approver cannot
-                head_line = (f"It was given for commit `{mr['sha'][:12]}`; the merge request now has new commits "
-                             f"(head `{head[:12]}`) that nobody reviewed.")
+                head_line = f"It was given for commit `{mr['sha'][:12]}`; {why}."
                 text = (f"**Code review: the approval was taken back.** {head_line}" if revoked else
                         f"**Code review: the approval by {by} is out of date.** {head_line} The runner now approves "
                         f"as {self.host.reviewer} and cannot take it back: {by}, remove it on the merge request.")
                 if not any(marker in n.body and n.author in signer
                            for n in self.host.notes(mr["project_id"], mr["iid"], mr["url"])):
                     self.host.note_review(mr["project_id"], mr["iid"],
-                                          f"{text} Write `{self.rc.command}` on the ticket to review them.\n\n{marker}")
+                                          f"{text} Write `{self.rc.command}` on the ticket to review it again.\n\n"
+                                          f"{marker}")
                 self.events.emit("review_approval_revoked" if revoked else "review_approval_outdated",
-                                 task_id=task.task_id, review=row.id, url=mr["url"],
-                                 reason="new commits since the review", sha=head, by=by)
+                                 task_id=task.task_id, review=row.id, url=mr["url"], reason=why, sha=st.sha, by=by)
             self.store.action_done(key)
             return
+
+    def _outlived_by(self, row: ReviewRequest, task: Task, mr: dict, st: MRStatus) -> str:
+        """Why the approval no longer holds, in words for the MR note, or "" while it does."""
+        if st.sha != mr["sha"]:
+            return f"the merge request now has new commits (head `{st.sha[:12]}`) that nobody reviewed"
+        if st.target and mr.get("target") and st.target != mr["target"]:
+            return f"the merge request now merges into {st.target}, not {mr['target']}, which the review checked"
+        then = json.loads(row.snapshot or "{}").get("ticket", {}).get("requirements")
+        if then and self._requirements(task, self.tracker.issue(task.task_id)) != then:
+            return "the ticket's description or attached files changed since the review"
+        return ""
 
     def _approval(self, row: ReviewRequest, task: Task, mr: dict) -> dict | None:
         act = self.store.action(f"{self._keys(row, mr)}:approve")

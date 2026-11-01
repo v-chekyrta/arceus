@@ -62,7 +62,8 @@ ONEOFF_LABEL = "com.docker.compose.oneoff"  # "True" on a `docker compose run` c
 BUILTIN_NETWORKS = ("bridge", "host", "none")
 ANONYMOUS_LABEL = "com.docker.volume.anonymous"  # Docker 23+ puts it on the volumes it names itself
 WORKSPACE_OWN = {"AGENTS.md", "CLAUDE.md"}  # delivery.home_files; dot-files are the runner's and the tools' own
-FOLDER_KINDS = {"media": "keep_media", "notes": "keep_notes", "reviews": "keep_notes"}  # .arceus/<kind>/<KEY> → how long it stays
+FOLDER_KINDS = {"media": "keep_media", "notes": "keep_notes", "reviews": "keep_notes", "replies": "keep_notes",
+                "ticket": "keep_notes"}  # .arceus/<kind>/<KEY> → how long it stays
 WAITING_STATES = ("needs_input", "code_review", "security_hold", "failed", "stopped")
 LIVE_ENGINE_STATES = ("queued", "running")
 ENGINE_BUSY_RECHECK = timedelta(minutes=10)

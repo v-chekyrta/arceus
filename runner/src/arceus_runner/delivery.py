@@ -22,7 +22,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from arceus_runner import media
+from arceus_runner import materials, media
 from arceus_runner.replies import unattributed
 from arceus_runner.config import Config
 from arceus_runner.db import ACTIVE_STATES, TaskStore, Task, TriggerDecision
@@ -33,6 +33,7 @@ from arceus_runner.progress import task_key
 from arceus_runner.http import BadRequest, NotFound, ServiceError
 from arceus_runner.integrations import (
     CodeHost,
+    Comment,
     Issue,
     IssueDetails,
     IssueTracker,
@@ -74,6 +75,8 @@ HOME_IGNORE = """\
 """
 
 
+FETCHED_KEPT = 4  # deliveries whose fetched files are kept in memory while they wait (Delivery._fetched): at most
+                  # 4 × materials.MAX_TOTAL_BYTES
 PROJECT_NOTES_LIMIT = 8 * 1024  # bytes: every session of every task reads them whole
 PROJECT_NOTES_HEAD = ("These notes come from the people who run this project. Where they contradict the server's "
                       "notes or the rules above, those win.")
@@ -232,6 +235,16 @@ def _log_hint(log: Path) -> str:
     return _short(hint, 200)
 
 
+def comments_section(comments: list[Comment]) -> str:
+    """People's comments on the ticket, for the agent, oldest first."""
+    lines = ["## Comments on the ticket, oldest first", "",
+             "What people wrote on the ticket. Later comments may change or narrow what the description asks.", ""]
+    for x in comments:
+        body = x.text.strip().replace("\n", "\n  ") or "(no text, only files: see below)"
+        lines.append(f"- {x.author or 'someone unknown'}, {materials._when(x.created)}: {body}")
+    return "\n".join(lines)
+
+
 class Delivery:
     def __init__(self, cfg: Config, store: TaskStore, events: EventLog, tracker: IssueTracker, host: CodeHost,
                  engine: Engine, git: Git, classify: Classify, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
@@ -247,6 +260,9 @@ class Delivery:
         self._engine_seen: dict[str, tuple] = {}  # task id → the engine's state last written as engine_state
         self._waiting: dict[str, tuple] = {}  # task id → why its follow-up waits, as last written as followup_waits
         self.published: set[str] = set()  # tasks published since the loop last read their MRs (loop.tick)
+        # (task id, comment ids) → the files as fetched, and what the tracker said of them: a follow-up that waits
+        # for the workspace is not downloaded again on every tick.
+        self._fetched: dict[tuple, tuple[tuple, list[materials.Material]]] = {}
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
         self.reviewer = None  # code_review.ReviewAgent, set by the loop: its runs hold the workspace too
 
@@ -372,19 +388,91 @@ class Delivery:
     def _take(self, task: Task, repos: list[Repo], details: IssueDetails) -> None:
         # Screened as it is now, at the start, not when it was tagged: anyone may have edited it since.
         # A held ticket is not claimed: it stays in the queue state, its workspace untouched.
+        # The comments and the files people attached are part of what the ticket asks: screened with it, in one go.
+        comments = self._people_comments(task)
+        files = self.ticket_files(task, None, comments)
         text = f"{task.task_id}: {details.summary}\n\n{details.description}".strip()
-        if task.research:
-            text += "\n\n" + research_brief(self.answer_file(task, self.research_run(task)))
-        clearance = self.gate.clear(task, "ticket", text, authors=[task.tag_author, *details.writers],
-                                    resume_state="claimed")
+        if comments:
+            text += "\n\n" + comments_section(comments)
+        brief = research_brief(self.answer_file(task, self.research_run(task))) if task.research else ""
+        if files:
+            texts = [("the description", None, details.description),
+                     *((f"the comment by {x.author} of {materials._when(x.created)}", str(x.id), x.text) for x in comments)]
+            # The research brief goes below the files and counts with them against what the screen reads.
+            text, files = materials.with_section(text, files, self._files_folder(task), texts, after=brief)
+        elif brief:
+            text += "\n\n" + brief
+        authors = [task.tag_author, *details.writers, *(x.author for x in comments),
+                   *(m.attachment.author for m in files)]
+        clearance = self.gate.clear(task, "ticket", text, authors=authors, resume_state="claimed",
+                                    files=materials.screen_files(files))
         if clearance is None:
             return
         why = self.prepare_workspace(task, repos)
         if why:
             self.fail(task, why)
             return
+        self.publish_files(task, files, fresh=True)
         self.claim_on_ticket(task)
         self.dispatch(task, text, clearance)
+
+    # -- what people wrote and attached on the ticket ---------------------------------------------
+
+    def _people_comments(self, task: Task) -> list[Comment]:
+        """The ticket's comments from people, oldest first: not the runner's own, not a security reviewer's decision,
+        not a bare `/continue` (a command to the runner that says nothing of the work, and would make a text a
+        reviewer rejected look new), not a request to the code reviewer (its, as for an answer: check_answers)."""
+        bot = self.cfg.tracker.bot_user
+        return [x for x in self.tracker.comments(task.issue_db_id) if x.author != bot and not is_decision(x.text)
+                and x.text.strip().lower() != CONTINUE
+                and not (self.reviewer and self.reviewer.claims(task.task_id, x))]
+
+    def _files_folder(self, task: Task) -> Path:
+        return materials.folder(self.cfg.paths.workspace.resolve(), task.task_id)
+
+    def ticket_files(self, task: Task, only: set[str] | None, comments: list[Comment]) -> list[materials.Material]:
+        """The files on the ticket for one delivery, fetched: on the ticket itself and on `comments` when `only` is
+        None (the start), or only those on the comments with the ids in `only` (a follow-up). Files the runner
+        attached itself are its own screenshots, not material. Empty when the tracker cannot read attachments."""
+        if not getattr(self.tracker, "reads_attachments", False):
+            return []
+        bot = self.cfg.tracker.bot_user
+        where: dict[str | None, str] = {None: "the ticket"}
+        where |= {str(x.id): f"a comment by {x.author}" + (f" of {materials._when(x.created)}" if x.created else "")
+                  for x in comments}
+        mine = [a for a in self.tracker.attachments(task.issue_db_id) if a.author != bot
+                and (a.comment_id in only if only is not None else (a.comment_id is None or a.comment_id in where))]
+        if not mine:
+            return []
+        key = (task.task_id, None if only is None else frozenset(only))
+        seen = tuple((a.id, a.name, a.size, a.created, a.comment_id) for a in mine)
+        kept = self._fetched.get(key)
+        if kept and kept[0] == seen:
+            return kept[1]
+        items = materials.fetch(self.tracker, mine, where)
+        self._fetched.pop(key, None)
+        if all(m.status != "unavailable" for m in items):  # a file the bot could not read is asked for again
+            self._fetched[key] = (seen, items)
+            while len(self._fetched) > FETCHED_KEPT:
+                del self._fetched[next(iter(self._fetched))]
+        self.events.emit("ticket_files_fetched", task_id=task.task_id, files=len(items),
+                         given=sum(m.status == "ok" for m in items),
+                         skipped=[f"{m.attachment.id}: {m.reason}" for m in items if m.status != "ok"])
+        return items
+
+    def publish_files(self, task: Task, files: list[materials.Material], fresh: bool = False) -> None:
+        """The screened files into the workspace, right before the text that names them goes to the agent."""
+        if files or fresh:
+            materials.publish(files, self.cfg.paths.workspace.resolve(), task.task_id, fresh=fresh)
+        for key in [k for k in self._fetched if k[0] == task.task_id]:
+            del self._fetched[key]  # delivered: the bytes are on disk, nothing waits for them any more
+
+    def commented_files(self, task: Task) -> set[str]:
+        """The ids of the comments people attached files to: such a comment says something even without text."""
+        if not getattr(self.tracker, "reads_attachments", False):
+            return set()
+        bot = self.cfg.tracker.bot_user
+        return {a.comment_id for a in self.tracker.attachments(task.issue_db_id) if a.comment_id and a.author != bot}
 
     def _group(self) -> list[Repo]:
         return usable_repos(self.cfg, self.host.repos())
@@ -1173,34 +1261,44 @@ class Delivery:
                 # >=: a reply in the same millisecond as the question counts. The engine dedups by
                 # message id, so a comment seen twice is sent once.
                 # A request for a code review is the reviewer's (code_review.py), never an answer to the agent.
-                answer = next((x for x in self.tracker.comments(task.issue_db_id)
-                               if x.created >= after and x.author != c.bot_user and x.author in c.allowed_users
-                               and x.text.strip() and not is_decision(x.text)
-                               and not (self.reviewer and self.reviewer.claims(task.task_id, x))),
-                              None)
+                candidates = [x for x in self.tracker.comments(task.issue_db_id)
+                              if x.created >= after and x.author != c.bot_user and x.author in c.allowed_users
+                              and not is_decision(x.text)
+                              and not (self.reviewer and self.reviewer.claims(task.task_id, x))]
+                # A comment with a file and no text (a screenshot) is an answer too.
+                with_files = self.commented_files(task) if any(not x.text.strip() for x in candidates) else set()
+                answer = next((x for x in candidates if x.text.strip() or str(x.id) in with_files), None)
                 if not answer:
                     self._unanswered(task)
                     continue
                 if self._workspace_waits(task):
                     continue  # the answer is read again on a later tick; the task stays in needs_input
-                clearance = self.gate.clear(task, "answer", answer.text, authors=[answer.author],
-                                            resume_state="needs_input")
+                files = self.ticket_files(task, {str(answer.id)}, [answer])
+                text = answer.text if answer.text.strip() else f"{answer.author} answered with files only."
+                if files:
+                    text, files = materials.with_section(
+                        text, files, self._files_folder(task),
+                        [(f"the answer by {answer.author}", str(answer.id), answer.text)])
+                clearance = self.gate.clear(task, "answer", text, authors=[answer.author,
+                                                                           *(m.attachment.author for m in files)],
+                                            resume_state="needs_input", files=materials.screen_files(files))
                 if clearance is None or not self._followup_ready(task):
                     continue
+                self.publish_files(task, files)
                 # The engine dedups by message id: the comment's id escaped (unchanged for YouTrack's), and the
                 # plain retry after a `:`, which an escaped id never contains.
                 comment = key_part(answer.id, keep_dash=True)
                 reply = self.engine.send(task_id=task.task_id, message_id=f"yt-comment-{comment}",
                                          source=self.tracker.engine_source, author=answer.author,
                                          repo=Path(task.repo_path),
-                                         text=answer.text, clearance=clearance, answers=task.question_id,
+                                         text=text, clearance=clearance, answers=task.question_id,
                                          extra_dirs=self._extra_dirs_file(task))
                 if reply.rc == 4 and task.question_id:
                     # The question is no longer open on the engine's side: send it as plain follow-up.
                     reply = self.engine.send(task_id=task.task_id, message_id=f"yt-comment-{comment}:plain",
                                              source=self.tracker.engine_source, author=answer.author,
                                              repo=Path(task.repo_path),
-                                             text=answer.text, clearance=clearance,
+                                             text=text, clearance=clearance,
                                              extra_dirs=self._extra_dirs_file(task))
                 if self._after_send(task, reply, "answer_sent", untag=c.tags.needs_input, author=answer.author):
                     if hasattr(self.store, "consume_signal"):
@@ -1293,14 +1391,23 @@ class Delivery:
             if answer:
                 text += (f" This run's answer goes to `{answer}`, whatever an earlier run wrote elsewhere; then "
                          "declare the outcome succeeded_research. Commit nothing.")
+        asked = Comment(str(data["comment"]), "", data["author"], data.get("created") or 0)
+        files = self.ticket_files(task, {asked.id}, [asked])
         if data.get("text"):
             text += f"\n\n{data['text']}"
-            clearance = self.gate.clear(task, "continue", text, authors=[data["author"]], resume_state=task.state,
-                                        ref=key)
+        if files:
+            text, files = materials.with_section(
+                text, files, self._files_folder(task),
+                [(f"the request by {data['author']}", asked.id, data.get("text") or "")])
+        if data.get("text") or files:
+            clearance = self.gate.clear(task, "continue", text, authors=[data["author"],
+                                                                         *(m.attachment.author for m in files)],
+                                        resume_state=task.state, ref=key, files=materials.screen_files(files))
             if clearance is None:
                 return
         else:
             clearance = trusted(text)  # a bare `/continue`: only the runner's words
+        self.publish_files(task, files)
         reply = self.engine.send(task_id=task.task_id, message_id=f"yt-continue-{data['comment']}",
                                  source=self.tracker.engine_source, author=data["author"], repo=Path(task.repo_path),
                                  text=text, clearance=clearance, extra_dirs=self._extra_dirs_file(task))

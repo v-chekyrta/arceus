@@ -1217,6 +1217,25 @@ def test_a_crash_after_the_uploads_does_not_upload_again(w):
     assert len(w.yt.attachments[note["id"]]) == 2
 
 
+def test_media_uploads_the_bytes_it_checked_not_what_the_path_holds_later(tmp_path):
+    from arceus_runner import media
+    folder = tmp_path / "media"
+    folder.mkdir()
+    secret = tmp_path / "secrets.env"
+    secret.write_text("GITLAB_TOKEN=glpat-secret")
+    (folder / "a.png").write_bytes(PNG)
+    (folder / "media.json").write_text(json.dumps({"items": [{"file": "a.png", "caption": "A"}]}))
+    [item], problems = media.load(folder)
+    assert problems == []
+    # The agent (or a process it left running) swaps the checked file for a link before the upload.
+    (folder / "a.png").unlink()
+    (folder / "a.png").symlink_to(secret)
+    assert item.data() == PNG
+    # And a link in its place at the moment of reading is never followed.
+    with pytest.raises(OSError):
+        media._read_plain(folder / "a.png", 1024)
+
+
 # -- the shared workspace: no follow-up switches it under another task ---------------------------
 
 def occupy(w: World, n: int = 2) -> str:

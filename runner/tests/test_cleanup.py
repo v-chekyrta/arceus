@@ -505,6 +505,25 @@ def test_notes_stay_90_days_after_the_task_is_over(world):
     assert sorted(p.name for p in base.iterdir()) == ["ACME-2", "ACME-3"]
 
 
+def test_the_files_from_the_ticket_and_the_review_replies_stay_as_long_as_the_notes(world):
+    world.task("ACME-1", "done", updated=T0 - timedelta(days=91))
+    world.task("ACME-2", "done", updated=T0 - timedelta(days=20))
+    world.task("ACME-3", "code_review", updated=T0 - timedelta(days=120))  # still waiting: everything stays
+    base = world.ws / ".arceus"
+    for kind in ("ticket", "replies"):
+        for key in ("ACME-1", "ACME-2", "ACME-3"):
+            (base / kind / key).mkdir(parents=True)
+            (base / kind / key / "x").write_text("x")
+
+    result = world.cleanup.run("full", "manual")
+
+    assert world.items(result) == {".arceus/ticket/ACME-1": ("delete", "done"),
+                                   ".arceus/replies/ACME-1": ("delete", "done")}
+    assert world.unknown(result) == set()
+    for kind in ("ticket", "replies"):
+        assert sorted(p.name for p in (base / kind).iterdir()) == ["ACME-2", "ACME-3"]
+
+
 def test_the_report_says_what_removing_by_hand_would_free_and_whose_the_name_says(world, capsys):
     """Sizes from `docker system df -v`: an image frees only the layers no other image shares. A name that spells
     a task is a hint for the person, never a reason to remove anything."""

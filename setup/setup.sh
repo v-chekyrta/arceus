@@ -82,7 +82,8 @@ OBS_SERVICES=(grafana prometheus loki alloy node-exporter)
 OBS_FILE_MOUNTS=(prometheus:/etc/prometheus/prometheus.yml:prometheus.yml loki:/etc/loki/loki.yaml:loki.yaml
                  alloy:/etc/alloy/config.alloy:config.alloy)
 DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
-APT_PKGS=(git tmux jq curl ca-certificates gnupg rsync unzip sqlite3 python3-venv python3-pip nodejs npm ffmpeg)
+# poppler-utils: Claude Code renders the pages of a PDF read in parts (Read's `pages`) with its pdftoppm.
+APT_PKGS=(git tmux jq curl ca-certificates gnupg rsync unzip sqlite3 python3-venv python3-pip nodejs npm ffmpeg poppler-utils)
 
 preflight() {
   [ "$(id -u)" = 0 ] || die "run it with sudo"

@@ -1033,3 +1033,102 @@ def test_contradicting_verdicts_with_changes_first_stay_changes_and_say_so(w):
     [note] = review_notes(w)
     assert "changes are needed" in note and "Drops sessions" in note and "more than one verdict" in note
     assert approve_calls(w) == []
+
+
+def test_the_reviewer_gets_the_tickets_files_and_a_replaced_one_makes_its_verdict_stale(w):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+    publish(w)
+    fid = w.yt.attach("2-1", "a.smith", "mockup.png", png)
+    ask(w)
+    [call] = reviews(w)
+    assert "mockup.png" in call["argv"][-1]
+    folder = w.cfg.paths.workspace.resolve() / ".arceus" / "ticket" / "ACME-1"
+    assert (folder / f"{fid.replace('-', '%2D')}-mockup.png").read_bytes() == png
+    write_verdict(w)
+    w.yt.files["2-1"][-1].update(data=png + b"v2", size=len(png) + 2, created=w.yt.clock + 5)  # a new version
+    finish(w)
+    note = mr_notes(w)[-1]
+    assert "description or comments changed" in note and approve_calls(w) == []
+
+
+def test_a_request_to_the_reviewer_is_not_a_requirement_for_the_agent(tmp_path):
+    # A ticket taken (again) with a code-review request among its comments: the request is the reviewer's.
+    w = world(tmp_path)
+    db_id = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
+    w.yt.comment(db_id, "j.doe", "/review the migration only")
+    w.yt.comment(db_id, "j.doe", "Also support dark mode")
+    w.tick()
+    [d] = w.calls("dispatch")
+    text = d["argv"][-1]
+    assert "Also support dark mode" in text and "the migration only" not in text
+    w.events.close()
+    w.store.close()
+
+
+def _approved(w: World) -> str:
+    sha = publish(w)
+    ask(w)
+    write_verdict(w)
+    finish(w)
+    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
+    return sha
+
+
+def _taken(w: World) -> list[str]:
+    return [b for b in mr_notes(w) if "approval was taken back" in b]
+
+
+@pytest.mark.parametrize("change,why", [
+    (lambda w: w.yt.issues[0].update(description="Log in with SSO only, no passwords"),
+     "the ticket's description or attached files changed since the review"),
+    (lambda w: w.yt.attach("2-1", "j.doe", "mockup-v2.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 20),
+     "the ticket's description or attached files changed since the review"),
+    (lambda w: w.gl.mrs[0].update(target_branch="release"),
+     "the merge request now merges into release, not main, which the review checked"),
+])
+def test_an_approval_is_taken_back_when_what_it_approved_changes_at_the_same_commit(w, change, why):
+    sha = _approved(w)
+    change(w)
+    w.tick()
+    assert w.gl.mrs[0]["approved_by"] == [] and w.gl.mrs[0]["sha"] == sha
+    [taken] = _taken(w)
+    assert why in taken and sha[:12] in taken and "`/review`" in taken
+    [e] = w.events_named("review_approval_revoked")
+    assert e["reason"] == why
+    w.tick()
+    w.tick()                                                   # once: no second note, nothing else revoked
+    assert len(_taken(w)) == 1 and len(w.events_named("review_approval_revoked")) == 1
+
+
+def test_a_removed_attachment_takes_the_approval_back(w):
+    w.yt.attach("2-1", "j.doe", "mockup.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 20)
+    _approved(w)
+    w.yt.files["2-1"][0]["removed"] = True
+    w.tick()
+    assert w.gl.mrs[0]["approved_by"] == []
+    [taken] = _taken(w)
+    assert "description or attached files changed" in taken
+
+
+def test_a_comment_after_the_approval_leaves_it(w):
+    _approved(w)
+    w.yt.comment("2-1", "j.doe", "Thanks, merging after lunch")
+    w.tick()
+    w.tick()
+    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"] and _taken(w) == []
+
+
+def test_taking_an_approval_back_survives_a_failure_halfway(w, monkeypatch):
+    _approved(w)
+    w.yt.issues[0]["description"] = "Something else entirely"
+    host = w.runner.reviewer.host
+    monkeypatch.setattr(host, "note_review", lambda *a: (_ for _ in ()).throw(TransientError("gitlab", "HTTP 502")))
+    w.tick()                                                   # revoked, the note failed: the reason is kept
+    assert w.gl.mrs[0]["approved_by"] == [] and _taken(w) == []
+    monkeypatch.undo()
+    w.yt.issues[0]["description"] = "Task description"         # back as it was: the reason recorded still stands
+    w.tick()
+    [taken] = _taken(w)
+    assert "description or attached files changed" in taken
+    w.tick()
+    assert len(_taken(w)) == 1

@@ -32,12 +32,12 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-from arceus_runner import replies
+from arceus_runner import materials, replies
 from arceus_runner.db import ReviewStore, Signal, Task
 from arceus_runner.engine import EngineError
 from arceus_runner.gitops import GitError
 from arceus_runner.http import BadRequest, NotFound, ServiceError
-from arceus_runner.integrations import CodeHost, MRStatus, Note, key_part
+from arceus_runner.integrations import CodeHost, Comment, MRStatus, Note, key_part
 from arceus_runner.screening import is_decision
 
 KIND_TITLES = {
@@ -184,7 +184,7 @@ class ReviewLoop:
             if st.state != "opened":
                 continue
             if self.d.reviewer:
-                self.d.reviewer.approval_outlived(task, mr.project_id, mr.iid, st.sha)
+                self.d.reviewer.approval_outlived(task, mr.project_id, mr.iid, st)
             self._notes(task, mr, now)
             self._pipeline(task, mr, st, now)
             self._conflict(task, mr, st, now)
@@ -332,14 +332,19 @@ class ReviewLoop:
         c = self.cfg.tracker
         since = task.published_at_ms or 0
         reviewer = self.d.reviewer
-        for x in self.d.tracker.comments(task.issue_db_id):
-            if x.created > since and x.author != c.bot_user and x.author in c.allowed_users and x.text.strip():
+        comments = [x for x in self.d.tracker.comments(task.issue_db_id)
+                    if x.created > since and x.author != c.bot_user and x.author in c.allowed_users]
+        # A comment with a file and no text (a screenshot) asks something too: its files go with the round.
+        with_files = self.d.commented_files(task) if any(not x.text.strip() for x in comments) else set()
+        for x in comments:
+            if x.text.strip() or str(x.id) in with_files:
                 if reviewer and reviewer.claims(task.task_id, x):
                     continue  # a request to the reviewer (code_review.py), not to the agent that wrote the code
                 if is_decision(x.text):
                     continue  # a security reviewer's decision on a held text: the runner's, not a review comment
+                said = x.text.strip() or "(no text, only the files listed below)"
                 if self.store.add_signal(f"yt-{x.id}", task.task_id, "ticket", x.author,
-                                         f"{x.author} on the ticket: {x.text.strip()}", now):
+                                         f"{x.author} on the ticket: {said}", now):
                     self.events.emit("review_signal", task_id=task.task_id, kind="ticket", author=x.author)
 
     def _ticket_moved_on(self, task: Task) -> bool:
@@ -446,14 +451,24 @@ class ReviewLoop:
             self.events.emit("review_batch_updated", task_id=task.task_id, batch=batch.id)
             batch = self.store.batch(batch.id)
         # The batch is stored, so a held round is screened once and waits as it is; others go on meanwhile.
-        authors = [*json.loads(batch.authors or "[]"),
-                   *(s.author for s in self.store.signals(task.task_id, batch.id) if s.kind in ("review", "ticket"))]
-        clearance = self.d.gate.clear(task, "review", batch.text, authors=authors or [batch.author],
-                                      resume_state="code_review", ref=batch.id)
+        signals = self.store.signals(task.task_id, batch.id)
+        authors = [*json.loads(batch.authors or "[]"), *(s.author for s in signals if s.kind in ("review", "ticket"))]
+        # Files people attached to the round's ticket comments go with it (the start had the ones before).
+        asked = [Comment(s.id.removeprefix("yt-"), "", s.author, 0) for s in signals if s.kind == "ticket" and s.id.startswith("yt-")]
+        files = self.d.ticket_files(task, {x.id for x in asked}, asked) if asked else []
+        if files:
+            texts = [(f"the comment by {s.author}", s.id.removeprefix("yt-"), s.body) for s in signals if s.kind == "ticket"]
+            text, files = materials.with_section(batch.text, files, self.d._files_folder(task), texts)
+        else:
+            text = batch.text
+        clearance = self.d.gate.clear(task, "review", text,
+                                      authors=[*authors, *(m.attachment.author for m in files)] or [batch.author],
+                                      resume_state="code_review", ref=batch.id, files=materials.screen_files(files))
         if clearance is None or not self.d._followup_ready(task):
             return
+        self.d.publish_files(task, files)
         reply = self.d.engine.send(task_id=task.task_id, message_id=batch.id, source=batch.source,
-                                   author=batch.author, repo=Path(task.repo_path), text=batch.text,
+                                   author=batch.author, repo=Path(task.repo_path), text=text,
                                    clearance=clearance, extra_dirs=self.d._extra_dirs_file(task))
         if reply.accepted:
             c = self.cfg.tracker

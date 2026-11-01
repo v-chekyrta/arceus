@@ -47,7 +47,8 @@ check "a commit neither has is refused" \
 
 if [ "${1:-}" = --live ]; then
   conf="$HERE/../setup.conf.example"
-  src="$(sed -n 's/^BULAVA_SOURCE=//p' "$conf")"; ref="$(sed -n 's/^BULAVA_REF=//p' "$conf")"
+  # As setup reads the file (it sources it): the value up to the first blank, a trailing comment left out.
+  src="$(sed -n 's/^BULAVA_SOURCE=\([^[:space:]#]*\).*/\1/p' "$conf")"; ref="$(sed -n 's/^BULAVA_REF=\([^[:space:]#]*\).*/\1/p' "$conf")"
   check "BULAVA_REF in setup.conf.example is a full commit" '[[ "$ref" =~ ^[0-9a-f]{40}$ ]]'
   check "that commit installs from $src, with the independent checks in its review gate" \
     'bulava_mirror_fetch "$T/live.git" "$src" "$ref" && bulava_mirror_checkout "$T/live.git" "$ref" "$T/live" \

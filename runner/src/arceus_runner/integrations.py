@@ -35,7 +35,7 @@ from __future__ import annotations
 import importlib
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import quote
@@ -100,11 +100,26 @@ class Comment:
     created: int  # ms since epoch
 
 
+@dataclass(frozen=True)
+class Attachment:
+    """A file people attached to an issue or to one of its comments: a mockup, a spec, a log."""
+    id: str
+    name: str                # as the person named it: the description may show it in place by this name
+    mime: str                # as the tracker reports it ("" when it does not)
+    size: int                # bytes, as the tracker reports it
+    author: str
+    created: int             # ms since epoch
+    comment_id: str | None   # the comment it is attached to; None: the issue itself
+    # Where the adapter downloads it from. Opaque to the flow and never shown: it may carry a signed token.
+    ref: str = field(default="", repr=False, compare=False)
+
+
 class IssueTracker(Protocol):
     """Where tasks come from and where people talk to the agent about them.
 
     Required: everything below. A tracker that cannot say who queued an issue (trigger) cannot be
-    used: that answer is the authorization of the whole run.
+    used: that answer is the authorization of the whole run. Optional: reading attachments
+    (reads_attachments False or missing: the agent works from the ticket's text and comments only).
     """
 
     name: str            # the service in health checks, metrics and events: "youtrack"
@@ -112,6 +127,7 @@ class IssueTracker(Protocol):
     engine_source: str   # the engine's --source for text from the ticket: "tracker" (or "youtrack")
     client: ServiceClient
     supports_attachments: bool  # False: screenshots go to the merge requests only
+    reads_attachments: bool     # False: the agent gets the ticket's text and comments, no files
 
     def identity(self) -> str:
         """Which tracker and project this is (type, address, project). runner.db is bound to it."""
@@ -152,6 +168,14 @@ class IssueTracker(Protocol):
 
     def add_comment(self, db_id: str, text: str) -> tuple[str, int]:
         """Post a Markdown comment as the bot; returns its (id, created ms)."""
+
+    def attachments(self, db_id: str) -> list[Attachment]:
+        """Every file on the issue and on its comments, oldest first, removed ones left out. Only called
+        when reads_attachments."""
+
+    def download(self, attachment: Attachment, limit: int) -> bytes:
+        """The file's bytes. Raises http.TooLarge past `limit` bytes, without reading the rest; NotFound
+        and AuthError when the bot may not have it. Only called when reads_attachments."""
 
     def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
         """Attach a file to the bot's comment. Only called when supports_attachments."""

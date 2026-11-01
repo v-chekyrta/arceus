@@ -25,6 +25,19 @@ class FakeYouTrack:
         self.clock = 1_792_479_600_000  # 2026-10-20 07:00 UTC in ms, the test runner's 'now'
         self.fail_once: dict[tuple[str, str], int] = {}  # (method, path) -> status, once
         self.attachments: dict[str, list[tuple[str, bytes]]] = {}  # comment id -> (file name, content)
+        self.files: dict[str, list[dict]] = {}  # issue db id -> every attachment as /attachments lists it, with "data"
+        self.prefix = ""  # the installation's path, as YouTrack puts it into an attachment's url ("/youtrack")
+
+    def attach(self, db_id: str, author: str, name: str, data: bytes, comment_id: str | None = None, *,
+               mime: str = "", size: int | None = None, **extra) -> str:
+        """A file a person attached to the issue (or to one of its comments). `extra`: removed, draft, url."""
+        self.clock += 1
+        fid = f"74-{sum(len(v) for v in self.files.values()) + 1}"
+        self.files.setdefault(db_id, []).append({
+            "id": fid, "name": name, "mimeType": mime, "size": len(data) if size is None else size,
+            "created": self.clock, "author": {"login": author}, "comment": {"id": comment_id} if comment_id else None,
+            "url": f"{self.prefix}/api/files/{fid}?sign=SECRETSIGN{fid}&updated={self.clock}", "data": data, **extra})
+        return fid
 
     def comment(self, db_id: str, author: str, text: str) -> None:
         self.clock += 1
@@ -60,7 +73,11 @@ class FakeYouTrack:
             if len(rest) == 3 and rest[0] == "comments" and rest[2] == "attachments" and method == "POST":
                 name, data = _multipart_file(request)
                 self.attachments.setdefault(rest[1], []).append((name, data))
+                self.attach(db_id, self.login, name, data, rest[1])
                 return json_response([{"id": f"a-{len(self.attachments[rest[1]])}", "name": name}])
+            if rest == ["attachments"] and method == "GET":
+                listed = [{k: v for k, v in a.items() if k != "data"} for a in self.files.get(db_id, [])]
+                return json_response(self._page(listed, request))
             if rest == ["tags"] and method == "GET":
                 return json_response(self._page([{"id": f"t-{n}", "name": n}
                                                  for n in sorted(self.issue_tags.get(db_id, set()))], request))
@@ -127,6 +144,12 @@ class FakeYouTrack:
             queued = [i for i in self.issues if "agent" in self.issue_tags.get(i["id"], set())
                       and (self.issue_fields.get(i["id"], {}).get("State") or {"name": "To Do"})["name"] == "To Do"]
             return json_response(self._page(queued, request))
+        if path.startswith("/api/files/"):
+            fid = path.removeprefix("/api/files/")
+            a = next((a for v in self.files.values() for a in v if a["id"] == fid), None)
+            if a is None or request.url.params.get("sign") != f"SECRETSIGN{fid}":
+                return json_response({"error": "not found"}, 404)
+            return httpx.Response(200, content=a["data"])
         written = None if path.endswith("/activitiesPage") else self._write(request)
         if written is not None:
             return written
@@ -288,8 +311,10 @@ class FakeScreen:
     def __call__(self, message: dict):
         from arceus_runner.screening import Verdict
         self.calls.append(message)
+        # What it reads: the text and every file that came with it, as the real classifier does.
+        read = message["payload"] + "".join(f.data.decode("utf-8", "replace") for f in message.get("files", []))
         for needle, outcome in self.rules:
-            if needle in message["payload"]:
+            if needle in read:
                 if isinstance(outcome, Exception):
                     raise outcome
                 return outcome

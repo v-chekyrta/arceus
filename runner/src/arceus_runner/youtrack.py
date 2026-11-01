@@ -12,17 +12,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import Field, field_validator
 
 from arceus_runner.checks import Check
 from arceus_runner.config import HttpConfig, IssueTrackerConfig, _url
 from arceus_runner.http import AuthError, ServiceClient, ServiceError
-from arceus_runner.integrations import Comment, Issue, IssueDetails, Trigger, TrackerType
+from arceus_runner.integrations import Attachment, Comment, Issue, IssueDetails, Trigger, TrackerType
 
 PAGE = 100
 UPLOAD_TIMEOUT = 120  # seconds: a recording is megabytes, more than the usual read timeout allows
+DOWNLOAD_SECONDS = 120  # one attachment, whole
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,18 @@ class YouTrackWriter(YouTrack):
             if not c.get("deleted")
         ]
 
+    def attachments(self, issue_id: str) -> list[Attachment]:
+        """The issue's own files and its comments' (`comment` says which), drafts and removed ones left out."""
+        fields = "id,name,mimeType,size,created,author(login),url,comment(id),removed,draft"
+        out = [
+            Attachment(a["id"], a.get("name") or "", a.get("mimeType") or "", int(a.get("size") or 0),
+                       (a.get("author") or {}).get("login") or "", int(a.get("created") or 0),
+                       (a.get("comment") or {}).get("id"), a.get("url") or "")
+            for a in self.paged(f"/api/issues/{quote(issue_id)}/attachments", {"fields": fields})
+            if not a.get("removed") and not a.get("draft")
+        ]
+        return sorted(out, key=lambda a: (a.created, a.id))
+
     def add_comment(self, issue_id: str, text: str) -> tuple[str, int]:
         resp = self.c.request("POST", f"/api/issues/{quote(issue_id)}/comments", params={"fields": "id,created"},
                               json={"text": text})
@@ -235,6 +248,7 @@ class YouTrackTracker:
     label = "YouTrack"
     engine_source = "youtrack"
     supports_attachments = True
+    reads_attachments = True
 
     def __init__(self, cfg: YouTrackConfig, client: ServiceClient):
         self.cfg = cfg
@@ -281,6 +295,28 @@ class YouTrackTracker:
 
     def add_comment(self, db_id: str, text: str) -> tuple[str, int]:
         return self.api.add_comment(db_id, text)
+
+    def attachments(self, db_id: str) -> list[Attachment]:
+        return self.api.attachments(db_id)
+
+    def download(self, attachment: Attachment, limit: int) -> bytes:
+        return self.client.download(self.file_path(attachment.ref), what=f"GET attachment {attachment.id}",
+                                    limit=limit, seconds=DOWNLOAD_SECONDS)
+
+    def file_path(self, url: str) -> str:
+        """An attachment's `url` as a path below the configured address. YouTrack gives it relative to the host
+        with the installation's own prefix (`/youtrack/api/files/…?sign=…`), and the client already has that
+        prefix. Anything that leads off the configured server is refused: the bot's token goes with the request."""
+        base = urlsplit(self.cfg.url)
+        u = urlsplit(url)
+        prefix = base.path.rstrip("/")
+        if (u.scheme or u.netloc) and (u.scheme, u.netloc) != (base.scheme, base.netloc) \
+                or not u.path.startswith("/") or ".." in u.path.split("/"):
+            raise ValueError("the attachment's address is not on the configured YouTrack")
+        path = u.path[len(prefix):] if prefix and u.path.startswith(prefix + "/") else u.path
+        if not path.startswith("/api/files/"):
+            raise ValueError("the attachment's address is not a YouTrack file")
+        return path + (f"?{u.query}" if u.query else "")
 
     def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
         self.api.attach_to_comment(db_id, comment_id, name, data, mime)

@@ -461,12 +461,14 @@ def test_events_carry_the_verdict_never_the_text(w):
 # -- the classifier itself ---------------------------------------------------------------------------
 
 def test_the_verdict_is_checked_against_the_schema():
-    assert parse_verdict({"decision": "allow", "categories": [], "reason": "ok"}).decision == "allow"
+    assert parse_verdict({"decision": "allow", "categories": [], "reason": "ok", "unseen_files": []}).decision == "allow"
     # It found something and allowed it anyway: a person looks.
-    assert parse_verdict({"decision": "allow", "categories": ["secrets"], "reason": "x"}).decision == "review"
+    assert parse_verdict({"decision": "allow", "categories": ["secrets"], "reason": "x", "unseen_files": []}).decision == "review"
     for bad in (None, "allow", {"decision": "allow"}, {"decision": "maybe", "categories": [], "reason": ""},
                 {"decision": "block", "categories": ["nope"], "reason": ""},
-                {"decision": "allow", "categories": [], "reason": "", "extra": 1}):
+                {"decision": "allow", "categories": [], "reason": "", "unseen_files": [], "extra": 1},
+                {"decision": "allow", "categories": [], "reason": ""},
+                {"decision": "allow", "categories": [], "reason": "", "unseen_files": [1]}):  # no file 1 in the call
         with pytest.raises(ValueError):
             parse_verdict(bad)
 
@@ -479,7 +481,8 @@ import json, os, sys
 json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "files": os.listdir("."), "stdin": sys.stdin.read(),
            "env": sorted(os.environ)}}, open({str(seen)!r}, "w"))
 print(json.dumps({{"is_error": False, "modelUsage": {{"claude-test": {{}}}},
-                  "structured_output": {{"decision": "block", "categories": ["secrets"], "reason": "r"}}}}))
+                  "structured_output": {{"decision": "block", "categories": ["secrets"], "reason": "r",
+                                        "unseen_files": []}}}}))
 """)
     stub.chmod(0o755)
     c = ClaudeClassifier({"CLAUDE_CODE_OAUTH_TOKEN": "t", "PATH": "/usr/bin:/bin"}, "sonnet", 30, binary=str(stub))
