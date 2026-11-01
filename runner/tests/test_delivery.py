@@ -887,6 +887,29 @@ def test_commits_pushed_on_top_of_the_reviewed_one_are_named_not_overwritten(w):
     assert w.gl.mrs == []
 
 
+def test_a_push_refused_in_one_repository_publishes_none_after_it(w):
+    take(w)
+    branch = w.store.task("ACME-1").branch
+    theme = w.cfg.paths.workspace / "acme-theme"
+    w.agent_commits()
+    (theme / "theme.txt").write_text("work\n")
+    git(theme, "add", "theme.txt")
+    git(theme, "commit", "-q", "-m", "add theme.txt")
+    w.settle("ACME-1", "waiting_review")
+    first, second = [Path(r["path"]) for r in w.engine_state()["tasks"]["ACME-1"]["receipt"]["repos"]
+                     if Path(r["path"]) != w.cfg.paths.workspace]
+    other = w.tmp / "colleague"  # a person pushed something else to the first repository's task branch
+    subprocess.run(["git", "clone", "-q", str(w.origins[first.name]), str(other)], check=True)
+    git(other, "checkout", "-q", "-b", branch)
+    git(other, "-c", "user.name=c", "-c", "user.email=c@c", "commit", "-q", "--allow-empty", "-m", "theirs")
+    git(other, "push", "-q", "origin", branch)
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and task.reason == "the branch on GitLab has diverged from the reviewed commit"
+    assert git(w.origins[second.name], "branch", "--list", branch) == ""  # never pushed after the refusal
+    assert w.gl.mrs == []
+
+
 def test_a_branch_the_agent_already_pushed_is_not_pushed_again(w):
     take(w)
     sha = w.agent_commits()

@@ -12,13 +12,14 @@ from pathlib import Path
 import pytest
 
 from arceus_runner import loop
-from arceus_runner.cleanup import (AdviceUnavailable, ClaudeAdvisor, Cleanup, DockerError, Item, Proc, Situation,
-                                   kill_process, remove_tree, scan_processes)
+from arceus_runner.cleanup import AdviceUnavailable, ClaudeAdvisor, Cleanup, Item, Situation
 from arceus_runner.config import Config
 from arceus_runner.db import ReviewStore
+from arceus_runner.dockerops import DockerError
 from arceus_runner.engine import EngineError
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git
+from arceus_runner.machine import Proc, kill_process, remove_tree, scan_processes
 from arceus_runner.metrics import Metrics
 
 from .conftest import FakeClock, example_raw, providers, read_events
@@ -243,6 +244,9 @@ def test_only_containers_of_finished_tasks_go(world):
     world.task("ACME-2", "code_review")
     world.task("ACME-3", "failed", failed_at=T0 - timedelta(days=1))   # `/continue` still works
     world.task("ACME-4", "failed", failed_at=T0 - timedelta(days=30))  # past the continue window
+    world.task("ACME-5", "stopped", failed_at=T0 - timedelta(days=1))  # people closed every MR: `/continue` works
+    world.task("ACME-6", "stopped", failed_at=T0 - timedelta(days=30))
+    world.task("ACME-7", "stopped", updated=T0 - timedelta(hours=1))   # the ticket was moved on by hand
     d = world.docker
     d.add("done-exited", created=old, finished=old, labels={"arceus.task": "ACME-1"})
     d.add("done-running", status="running", created=old, labels={"arceus.task": "ACME-1"})
@@ -250,6 +254,9 @@ def test_only_containers_of_finished_tasks_go(world):
     d.add("review-exited", created=old, finished=old, labels={"arceus.task": "ACME-2"})
     d.add("resumable-exited", created=old, finished=old, labels={"arceus.task": "ACME-3"})
     d.add("old-failure-exited", created=old, finished=old, labels={"arceus.task": "ACME-4"})
+    d.add("closed-exited", created=old, finished=old, labels={"arceus.task": "ACME-5"})
+    d.add("old-closed-exited", created=old, finished=old, labels={"arceus.task": "ACME-6"})
+    d.add("moved-on-exited", created=old, finished=old, labels={"arceus.task": "ACME-7"})
     d.add("never-ours", created=old, finished=old, labels={"arceus.task": "ACME-99"})
     d.add("grafana", status="running", created=old, labels={"com.docker.compose.project": "arceus-observability"})
     d.add("kept", created=old, finished=old, labels={"arceus.task": "ACME-1", "arceus.keep": "true"})
@@ -259,11 +266,12 @@ def test_only_containers_of_finished_tasks_go(world):
 
     assert result["status"] == "succeeded"
     assert world.items(result) == {"done-exited": ("remove", "done"), "done-running": ("stop", "done"),
-                                   "old-failure-exited": ("remove", "done")}
+                                   "old-failure-exited": ("remove", "done"), "old-closed-exited": ("remove", "done"),
+                                   "moved-on-exited": ("remove", "done")}
     # Everything nobody owns is listed for the person who cleans by hand; a waiting task's things are not.
     assert world.unknown(result) == {"never-ours", "other-project"}
-    assert set(d.cs) == {"done-just-exited", "review-exited", "resumable-exited", "never-ours", "grafana", "kept",
-                         "other-project"}
+    assert set(d.cs) == {"done-just-exited", "review-exited", "resumable-exited", "closed-exited", "never-ours",
+                         "grafana", "kept", "other-project"}
 
 
 def test_a_container_is_put_down_to_the_task_that_held_the_workspace_when_it_was_made(world):
@@ -571,7 +579,7 @@ def test_a_folder_too_big_for_the_pass_is_cut_at_its_deadline(world, monkeypatch
     def slow_unlink(name, *, dir_fd=None):
         world.mono.advance(700)  # one file takes the whole budget
         real_unlink(name, dir_fd=dir_fd)
-    monkeypatch.setattr("arceus_runner.cleanup.os.unlink", slow_unlink)
+    monkeypatch.setattr("arceus_runner.machine.os.unlink", slow_unlink)
 
     result = world.cleanup.run("full", "manual")
 
@@ -580,9 +588,9 @@ def test_a_folder_too_big_for_the_pass_is_cut_at_its_deadline(world, monkeypatch
     assert media.is_dir() and len(list(media.iterdir())) == 2  # the rest stays under its own name
 
     world.cleanup._deadline = world.mono() - 1  # a walk that runs past the deadline stops too
-    from arceus_runner.cleanup import _size
+    from arceus_runner.machine import tree_size
     with pytest.raises(TimeoutError):
-        _size(media, world.cleanup._out_of_time)
+        tree_size(media, world.cleanup._out_of_time)
 
 
 def test_what_was_made_while_the_runner_was_down_is_nobodys(world):
@@ -650,7 +658,7 @@ def test_a_holder_that_finishes_in_a_tick_holds_nothing_made_during_that_tick(wo
 
 
 def test_sizing_a_big_folder_stops_in_the_middle_of_it(tmp_path):
-    from arceus_runner.cleanup import _size
+    from arceus_runner.machine import tree_size
     big = tmp_path / "media" / "ACME-1"
     big.mkdir(parents=True)
     for n in range(600):
@@ -661,7 +669,7 @@ def test_sizing_a_big_folder_stops_in_the_middle_of_it(tmp_path):
         calls["n"] += 1
         return calls["n"] > 1  # gone after the first look, in the middle of one folder
     with pytest.raises(TimeoutError):
-        _size(big, out_of_time)
+        tree_size(big, out_of_time)
 
 
 def test_looking_through_a_huge_workspace_stops_at_the_deadline(world):
@@ -682,9 +690,9 @@ def test_a_folder_with_a_file_system_mounted_on_it_stays(tmp_path, monkeypatch):
     media = tmp_path / "media"
     (media / "ACME-1").mkdir(parents=True)
     real_stat = os.stat
-    monkeypatch.setattr("arceus_runner.cleanup.os.stat", lambda p, *a, **k: os.stat_result(
+    monkeypatch.setattr("arceus_runner.machine.os.stat", lambda p, *a, **k: os.stat_result(
         (*real_stat(p)[:2], real_stat(p).st_dev + 1, *real_stat(p)[3:])) if str(p) == str(media) else real_stat(p))
-    monkeypatch.setattr("arceus_runner.cleanup.mount_points", lambda: [])  # macOS: no mount table to read
+    monkeypatch.setattr("arceus_runner.machine.mount_points", lambda: [])  # macOS: no mount table to read
     it = Item("folder", str(media / "ACME-1"), "ACME-1", "delete", "")
     assert remove_tree(media / "ACME-1", media, it) == "kept" and it.detail["kept"] == "a file system is mounted on it"
     assert (media / "ACME-1").exists()
@@ -1072,7 +1080,7 @@ def test_an_overdue_pass_goes_before_the_next_ticket_and_lets_it_start(tmp_path,
 def test_real_docker_removes_only_what_a_finished_task_labelled(tmp_path):
     """Against the real daemon: the inspect formats are what the rules expect. Only objects this test makes are
     labelled for its tasks, and images are not pruned, so nothing else on the host is touched."""
-    from arceus_runner.cleanup import Docker
+    from arceus_runner.dockerops import Docker
     import uuid
     tag = uuid.uuid4().hex[:8].upper()
     done, waiting = f"ZZ{tag}-1", f"ZZ{tag}-2"
@@ -1164,16 +1172,16 @@ def test_a_container_holding_a_protected_volume_stays(tmp_path):
 def test_remove_tree_refuses_a_folder_with_a_mount_inside(tmp_path, monkeypatch):
     media = tmp_path / ".arceus" / "media"
     (media / "ACME-1" / "data").mkdir(parents=True)
-    monkeypatch.setattr("arceus_runner.cleanup.mount_points", lambda: ["/", str(media / "ACME-1" / "data")])
+    monkeypatch.setattr("arceus_runner.machine.mount_points", lambda: ["/", str(media / "ACME-1" / "data")])
     assert remove_tree(media / "ACME-1", media) == "kept"
     assert (media / "ACME-1" / "data").exists()
-    monkeypatch.setattr("arceus_runner.cleanup.mount_points", lambda: ["/", str(media / "ACME-2")])
+    monkeypatch.setattr("arceus_runner.machine.mount_points", lambda: ["/", str(media / "ACME-2")])
     assert remove_tree(media / "ACME-1", media) == "done"
     assert list(media.iterdir()) == []  # nothing left behind under another name
 
 
 def test_mount_points_reads_mountinfo(tmp_path):
-    from arceus_runner.cleanup import mount_points
+    from arceus_runner.machine import mount_points
     f = tmp_path / "mountinfo"
     f.write_text("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
                  "40 22 8:1 /srv/data /home/ai/arceus/workspace/.arceus/media/X\\040Y rw - ext4 /dev/sda1 rw\n")
@@ -1227,7 +1235,7 @@ def test_a_full_pass_with_errors_is_retried_even_after_an_independent_one_succee
 def test_an_unreadable_mount_table_on_linux_keeps_the_folder(tmp_path, monkeypatch):
     media = tmp_path / ".arceus" / "media"
     (media / "ACME-1").mkdir(parents=True)
-    monkeypatch.setattr("arceus_runner.cleanup.mount_points", lambda: None)
+    monkeypatch.setattr("arceus_runner.machine.mount_points", lambda: None)
     assert remove_tree(media / "ACME-1", media) == "kept"
 
 
@@ -1268,7 +1276,7 @@ def test_a_hung_docker_command_is_cut_at_the_pass_deadline(tmp_path):
     own timeout, and the pass ends partial with what was left marked skipped."""
     import time
 
-    from arceus_runner.cleanup import Docker
+    from arceus_runner.dockerops import Docker
     fake = tmp_path / "docker"
     fake.write_text("#!/bin/sh\nsleep 30\n")
     fake.chmod(0o755)
@@ -1492,7 +1500,7 @@ def test_a_folder_swapped_in_after_the_checks_is_kept_with_what_is_in_it(tmp_pat
         (media / "ACME-1").mkdir()
         (media / "ACME-1" / "precious.txt").write_text("not the planned folder")
         return ["/"]
-    monkeypatch.setattr("arceus_runner.cleanup.mount_points", swap)
+    monkeypatch.setattr("arceus_runner.machine.mount_points", swap)
     it = Item("folder", str(media / "ACME-1"), ".arceus/media/ACME-1", "delete", "")
     assert remove_tree(media / "ACME-1", media, it) == "kept"
     assert it.detail["kept"] == "another folder took its place while it was checked"
@@ -1566,7 +1574,7 @@ def test_a_hold_open_at_the_upgrade_to_schema_11_ends_where_it_began(tmp_path):
 
 
 def test_a_folder_swapped_while_it_is_emptied_loses_only_the_planned_contents(tmp_path, monkeypatch):
-    from arceus_runner import cleanup as cl
+    from arceus_runner import machine as cl
     media = tmp_path / ".arceus" / "media"
     (media / "ACME-1" / "deep").mkdir(parents=True)
     (media / "ACME-1" / "deep" / "old.png").write_text("leftover")
@@ -1601,7 +1609,7 @@ def test_a_volume_that_cannot_be_read_stays_with_its_container_gone(world):
 
 def test_a_mount_that_appears_inside_after_the_checks_stops_the_removal(tmp_path, monkeypatch):
     """A bind mount of the same file system has the same st_dev; the mount id of the open folder tells it."""
-    from arceus_runner import cleanup as cl
+    from arceus_runner import machine as cl
     media = tmp_path / ".arceus" / "media"
     (media / "ACME-1" / "mnt").mkdir(parents=True)
     (media / "ACME-1" / "mnt" / "outside.txt").write_text("another place's data")
@@ -1616,7 +1624,7 @@ def test_a_mount_that_appears_inside_after_the_checks_stops_the_removal(tmp_path
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/fdinfo is Linux's")
 def test_mount_id_reads_fdinfo(tmp_path):
-    from arceus_runner.cleanup import _mount_id
+    from arceus_runner.machine import _mount_id
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         assert isinstance(_mount_id(fd), int)

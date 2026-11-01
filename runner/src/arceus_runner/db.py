@@ -514,7 +514,8 @@ class Task:
     review_rounds: int = 0  # review rounds after the first MR that ended in published code
     ci_attempts: int = 0    # CI-only repairs in a row, reset when the pipeline passes
     published_at_ms: int | None = None  # the MR comment, or the last `/continue`: later comments are review
-    failed_at_ms: int | None = None     # when the task failed: a later `/continue` from a person resumes it
+    failed_at_ms: int | None = None     # when the task failed, or stopped as people closed every MR: a later
+                                        # `/continue` from a person resumes it
     review_answers: int = 0  # review rounds answered without a code change
     kind: str = "code"       # code: merge requests; research: an answer on the ticket, nothing published
     updated_at: str = ""     # when the record last changed: for a task that is over, when it ended
@@ -878,10 +879,15 @@ class ReviewStore(TaskStore):
         return [TaskMR(**dict(r)) for r in rows]
 
     def upsert_mr(self, task_id: str, repo: str, project_id: int | str, iid: int | str, url: str, sha: str) -> None:
+        # Another MR in the same repository (a new one next to the MR a person closed) starts afresh: the old one's
+        # state and what was handled on it are not the new one's. The same MR keeps them.
         self.conn.execute(
             "INSERT INTO task_mrs (task_id, repo, project_id, iid, url, published_sha) VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (task_id, repo) DO UPDATE SET iid = excluded.iid, url = excluded.url,"
-            " published_sha = excluded.published_sha",
+            " published_sha = excluded.published_sha,"
+            " state = CASE WHEN task_mrs.iid = excluded.iid THEN task_mrs.state ELSE 'opened' END,"
+            " handled_pipeline = CASE WHEN task_mrs.iid = excluded.iid THEN task_mrs.handled_pipeline END,"
+            " handled_conflict = CASE WHEN task_mrs.iid = excluded.iid THEN task_mrs.handled_conflict END",
             (task_id, repo, project_id, iid, url, sha))
 
     def drop_mr(self, task_id: str, repo: str) -> None:

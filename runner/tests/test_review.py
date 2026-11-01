@@ -873,6 +873,11 @@ def test_a_ticket_moved_on_by_hand_stops_watching_but_is_not_done(w):
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "stopped" and "Testing" in task.reason
+    w.yt.comment("2-1", "j.doe", "/continue please")
+    w.tick()
+    w.tick()
+    assert w.store.task("ACME-1").state == "stopped" and sends(w) == []  # the team took it: not the runner's again
+    assert w.events_named("continue_requested") == []                       # not even taken as a request
 
 
 def test_screenshots_from_a_round_without_code_changes_reach_the_mr_and_the_ticket(w):
@@ -1313,8 +1318,11 @@ def test_merged_and_closed_mrs_end_the_task(w):
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "done" and sends(w) == []
-    merged = next(t for t in w.bot_comments() if "are merged" in t)
+    [last] = [t for t in w.bot_comments() if "stopped following it" in t]
+    assert "All merge requests of this task are merged" not in last                # one of them was not
+    merged, closed = last.split("Closed without merge:")
     assert w.gl.mrs[1]["web_url"] in merged and w.gl.mrs[0]["web_url"] not in merged
+    assert w.gl.mrs[0]["web_url"] in closed and w.gl.mrs[1]["web_url"] not in closed
 
 
 def test_every_mr_closed_stops_and_a_continue_does_not_replay_old_comments(w):
@@ -1323,15 +1331,35 @@ def test_every_mr_closed_stops_and_a_continue_does_not_replay_old_comments(w):
     w.tick()
     assert [sg.kind for sg in w.store.signals("ACME-1", unbatched=True)] == ["ticket"]
     close(w, 0)
-    close(w, 1)
+    close(w, 1, by="j.doe")
     w.tick()
     task = w.store.task("ACME-1")
-    assert task.state == "failed" and "every merge request of this task was closed" in task.reason
+    # People decided against the work: the task stops, and nothing says Arceus failed.
+    assert task.state == "stopped" and task.reason == "every merge request was closed without merge"
+    assert "agent-failed" not in w.yt.issue_tags["2-1"]
+    assert not [c for c in w.bot_comments() if "could not take this ticket" in c]
+    [stop] = [c for c in w.bot_comments() if "closed without merge" in c]
+    assert "by j.doe, reviewer" in stop and "/continue" in stop
+    assert w.gl.mrs[0]["web_url"] in stop and w.gl.mrs[1]["web_url"] in stop
+    w.store.update_mr("ACME-1", "acme-theme", handled_pipeline=900, handled_conflict="feed")  # the old MR's marks
+    from prometheus_client import generate_latest
+    from arceus_runner.metrics import Metrics
+    w.runner.metrics = metrics = Metrics()
+    later(w)
+    shown = generate_latest(metrics.registry).decode()
+    assert 'runner_tasks{state="stopped"} 1.0' in shown
+    assert not re.search(r"^runner_task\{.*ACME-1", shown, re.M)              # not among the tasks in progress
+    w.restart()
+    later(w)
+    assert w.store.task("ACME-1").state == "stopped" and len(w.bot_comments()) == len(set(w.bot_comments()))
+    assert len([c for c in w.bot_comments() if "closed without merge" in c]) == 1
     w.yt.clock = task.failed_at_ms + 1000
     w.yt.comment("2-1", "j.doe", "/continue Only the theme, in a new file")
     w.tick()
     w.tick()
     assert w.store.task("ACME-1").state == "dispatched"
+    [resumed] = [s["argv"][-1] for s in sends(w)]
+    assert "people closed every merge request" in resumed and "Only the theme, in a new file" in resumed
     assert w.store.signals("ACME-1", unbatched=True) == []                    # the early comment is not review
     w.yt.comment("2-1", "j.doe", "Also keep the old class name")
     theme = w.cfg.paths.workspace / "acme-theme"
@@ -1343,11 +1371,55 @@ def test_every_mr_closed_stops_and_a_continue_does_not_replay_old_comments(w):
     task = w.store.task("ACME-1")
     assert task.state == "code_review" and [m.repo for m in w.store.task_mrs("ACME-1")] == ["acme-theme"]
     assert len(w.gl.mrs) == 3 and w.gl.mrs[2]["state"] == "opened"           # a new MR for the new change
+    assert json.loads(task.mr_urls) == [w.gl.mrs[2]["web_url"]]              # the closed ones left the task
+    [theme_mr] = w.store.task_mrs("ACME-1")                                   # the new MR starts afresh
+    assert (theme_mr.url, theme_mr.state) == (w.gl.mrs[2]["web_url"], "opened")
+    assert (theme_mr.handled_pipeline, theme_mr.handled_conflict) == (None, None)
     later(w)
     later(w)
     texts = [s["argv"][-1] for s in sends(w)]
     assert len(texts) == 2 and "Also keep the old class name" in texts[1]
     assert "start over in the theme" not in texts[1] and "Only the theme" not in texts[1]
+
+
+def test_every_mr_closed_while_youtrack_is_down_stops_now_and_says_so_once_later(w, monkeypatch):
+    two_mrs(w)
+    yt = w.runner.delivery.tracker
+    real = yt.add_comment
+
+    def refuse(db_id, text):
+        raise ServiceError("youtrack", "comment write refused for now")
+
+    monkeypatch.setattr(yt, "add_comment", refuse)
+    close(w, 0)
+    close(w, 1)
+    w.tick()
+    assert w.store.task("ACME-1").state == "stopped"                           # ours does not wait for the tracker
+    assert not [c for c in w.bot_comments() if "closed without merge" in c]
+    monkeypatch.setattr(yt, "add_comment", real)
+    later(w)
+    later(w)
+    assert len([c for c in w.bot_comments() if "closed without merge" in c]) == 1
+
+
+def test_a_new_mr_next_to_a_closed_one_starts_afresh(w):
+    two_mrs(w)
+    [platform, _] = w.store.task_mrs("ACME-1")
+    w.store.update_mr("ACME-1", platform.repo, state="closed", handled_pipeline=900, handled_conflict="feed")
+    w.store.upsert_mr("ACME-1", platform.repo, platform.project_id, 99, "https://gl/mr/99", "f" * 40)
+    [new, _] = w.store.task_mrs("ACME-1")
+    assert (new.iid, new.url, new.state, new.handled_pipeline, new.handled_conflict) == \
+        (99, "https://gl/mr/99", "opened", None, None)
+
+
+def test_the_same_mr_published_again_keeps_what_was_handled_on_it(w):
+    two_mrs(w)
+    [platform, _] = w.store.task_mrs("ACME-1")
+    w.store.update_mr("ACME-1", platform.repo, state="closed", handled_pipeline=900, handled_conflict="feed")
+    w.store.upsert_mr("ACME-1", platform.repo, platform.project_id, platform.iid, platform.url, "f" * 40)
+    [same, _] = w.store.task_mrs("ACME-1")
+    assert (same.state, same.handled_pipeline, same.handled_conflict, same.published_sha) == \
+        ("closed", 900, "feed", "f" * 40)
 
 
 def test_a_repository_with_reverted_work_gets_no_mr(w):

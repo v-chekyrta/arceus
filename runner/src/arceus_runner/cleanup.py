@@ -9,8 +9,8 @@ each thing itself, and removes only what passes three tests:
   task at a time holds the shared workspace (the `workspace_holds` table), so a container, network or process
   made for the workspace while task X held it is X's. What was made outside every hold (the dev stack, a
   person's work) has no owner and is only reported.
-- **the owner is over**: done, stopped, or failed longer ago than `/continue` still works. A task that waits for
-  an answer, a review or a security reviewer keeps everything it has.
+- **the owner is over**: done, stopped by hand, or failed (or stopped as people closed every MR) longer ago than
+  `/continue` still works. A task that waits for an answer, a review or a security reviewer keeps everything it has.
 - **nothing protects it**: the observability stack, `cleanup.protect`, the `arceus.keep=true` label.
 
 A running container goes only with an explicit task label; one put down to a task by time alone may be the dev
@@ -37,10 +37,7 @@ import json
 import os
 import re
 import shutil
-import signal
-import stat
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -51,9 +48,11 @@ from pathlib import Path
 
 from arceus_runner.config import Config
 from arceus_runner.db import ACTIVE_STATES, Task, TaskStore
+from arceus_runner.dockerops import Docker, DockerError, size_bytes
 from arceus_runner.engine import Engine, EngineError
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git, GitError
+from arceus_runner.machine import OUT_OF_TIME, Proc, inside, kill_process, remove_tree, scan_processes, tree_size
 
 OBSERVABILITY = "arceus-observability"  # observability/compose.yaml
 TASK_LABEL, KEEP_LABEL = "arceus.task", "arceus.keep"
@@ -64,13 +63,11 @@ BUILTIN_NETWORKS = ("bridge", "host", "none")
 ANONYMOUS_LABEL = "com.docker.volume.anonymous"  # Docker 23+ puts it on the volumes it names itself
 WORKSPACE_OWN = {"AGENTS.md", "CLAUDE.md"}  # delivery.home_files; dot-files are the runner's and the tools' own
 FOLDER_KINDS = {"media": "keep_media", "notes": "keep_notes", "reviews": "keep_notes"}  # .arceus/<kind>/<KEY> → how long it stays
-SESSION_COMMS = ("tmux", "claude", "codex")  # a process below one of these belongs to a live session
-WAITING_STATES = ("needs_input", "code_review", "security_hold", "failed")
+WAITING_STATES = ("needs_input", "code_review", "security_hold", "failed", "stopped")
 LIVE_ENGINE_STATES = ("queued", "running")
 ENGINE_BUSY_RECHECK = timedelta(minutes=10)
 HISTORY = timedelta(days=90)
 ORDER = ("process", "container", "network", "volume", "image", "repo", "branch", "folder")
-OUT_OF_TIME = "out of time"
 UNKNOWN_SHOWN, PLANNED_SHOWN = 200, 100  # how many of each a pass's summary lists
 
 
@@ -90,13 +87,6 @@ def _ts(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
-def _inside(path: str | None, roots: tuple[str, ...]) -> bool:
-    if not path:
-        return False
-    p = os.path.normpath(path)
-    return any(p == r or p.startswith(r + os.sep) for r in roots)
-
-
 def _human(n: float) -> str:
     """Powers of 1000, as Docker prints its sizes, so the numbers match `docker system df`."""
     for unit in ("B", "KB", "MB", "GB"):
@@ -106,256 +96,9 @@ def _human(n: float) -> str:
     return f"{n:.1f} GB"
 
 
-_UNITS = {"B": 1, "kB": 1000, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4}
-
-
-def _bytes(value: str | None) -> int:
-    """Docker's own sizes ("633.2MB", "4.496GB": powers of 1000) back to bytes; 0 when unreadable."""
-    m = re.fullmatch(r"\s*([\d.]+)\s*([kKMGT]?B)\s*", value or "")
-    return int(float(m[1]) * _UNITS[m[2]]) if m else 0
-
-
 def _day(value: str | None) -> str:
     """The date part of a Docker timestamp, for a person."""
     return (value or "?")[:10]
-
-
-def _entries(path: Path, out_of_time: Callable[[], bool] = lambda: False):
-    """Every entry below `path`, links not followed, as os.DirEntry; the pass's time is checked as it goes, not
-    only between folders, so a folder of a million files cannot hold the tick."""
-    todo, n = [str(path)], 0
-    while todo:
-        try:
-            with os.scandir(todo.pop()) as it:
-                for e in it:
-                    n += 1
-                    if n % 256 == 0 and out_of_time():
-                        raise TimeoutError(f"{path}: {OUT_OF_TIME}")
-                    if e.is_dir(follow_symlinks=False):
-                        todo.append(e.path)
-                    yield e
-        except (FileNotFoundError, PermissionError, NotADirectoryError):
-            continue
-    if out_of_time():
-        raise TimeoutError(f"{path}: {OUT_OF_TIME}")
-
-
-def _size(path: Path, out_of_time: Callable[[], bool] = lambda: False) -> int:
-    total = 0
-    for e in _entries(path, out_of_time):
-        if not e.is_dir(follow_symlinks=False):
-            try:
-                total += e.stat(follow_symlinks=False).st_size
-            except OSError:
-                pass
-    return total
-
-
-# -- what there is ------------------------------------------------------------------------------
-
-
-class DockerError(Exception):
-    pass
-
-
-class Docker:
-    """The docker CLI: reading, and removals of one named object at a time. Never `-f`, never a prune of
-    containers or volumes: Docker would decide what goes, not the rules here."""
-
-    def __init__(self, binary: str = "docker", timeout: float = 60):
-        self.binary = binary
-        self.timeout = timeout
-        self.deadline: float | None = None  # time.monotonic() by which a pass must end: no call outlives it
-
-    def available(self) -> bool:
-        return shutil.which(self.binary) is not None
-
-    def _run(self, *args: str, timeout: float | None = None, check: bool = True) -> subprocess.CompletedProcess:
-        timeout = timeout or self.timeout
-        if self.deadline is not None:
-            timeout = min(timeout, self.deadline - time.monotonic())
-            if timeout <= 0:
-                raise DockerError(f"docker {args[0]}: {OUT_OF_TIME}")
-        try:
-            r = subprocess.run([self.binary, *args], capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                               timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise DockerError(f"docker {args[0]}: no answer in {timeout:.0f}s"
-                              + (f", {OUT_OF_TIME}" if self.deadline is not None and
-                                 time.monotonic() >= self.deadline else "")) from None
-        except OSError as e:
-            raise DockerError(f"docker: {e}") from None
-        if check and r.returncode != 0:
-            raise DockerError(f"docker {' '.join(args[:2])}: {(r.stderr or r.stdout).strip()[-300:]}")
-        return r
-
-    def _inspect(self, what: str, ids: list[str]) -> list[dict]:
-        if not ids:
-            return []
-        # One that went away since the listing makes inspect fail; the others are still printed.
-        r = self._run(what, "inspect", *ids, check=False)
-        try:
-            return json.loads(r.stdout or "[]")
-        except ValueError:
-            raise DockerError(f"docker {what} inspect: {(r.stderr or r.stdout).strip()[-300:]}") from None
-
-    def containers(self) -> list[dict]:
-        return self._inspect("container", self._run("ps", "-aq", "--no-trunc").stdout.split())
-
-    def container(self, cid: str) -> dict | None:
-        found = self._inspect("container", [cid])
-        return found[0] if found else None
-
-    def volumes(self) -> list[dict]:
-        return self._inspect("volume", self._run("volume", "ls", "-q").stdout.split())
-
-    def volume(self, name: str) -> dict | None:
-        found = self._inspect("volume", [name])
-        return found[0] if found else None
-
-    def network(self, nid: str) -> dict | None:
-        found = self._inspect("network", [nid])
-        return found[0] if found else None
-
-    def networks(self) -> list[dict]:
-        return self._inspect("network", self._run("network", "ls", "-q", "--no-trunc").stdout.split())
-
-    def dangling_images(self) -> int:
-        return len(self._run("image", "ls", "-q", "--no-trunc", "--filter", "dangling=true").stdout.split())
-
-    def images(self) -> list[dict]:
-        """Every image, untagged ones included (a labelled `docker build` without `-t`), but no build layers."""
-        ids = self._run("image", "ls", "-q", "--no-trunc").stdout.split()
-        return self._inspect("image", sorted(set(ids)))
-
-    def usage(self) -> dict[str, dict]:
-        """From `docker system df -v`: each volume's size, and each image's size of its own (the layers no other
-        image shares: what removing it frees). {"volumes": {name: bytes}, "images": {id: (own, total)}}."""
-        raw = json.loads(self._run("system", "df", "-v", "--format", "{{json .}}", timeout=120).stdout or "{}")
-        return {"volumes": {v.get("Name"): _bytes(v.get("Size")) for v in raw.get("Volumes") or []},
-                "images": {i.get("ID"): (_bytes(i.get("UniqueSize")), _bytes(i.get("Size")))
-                           for i in raw.get("Images") or []}}
-
-    def disk_usage(self) -> dict[str, dict]:
-        """`docker system df`'s rows by type ("Images", "Build Cache", ...): {"Size": "11.38GB",
-        "Reclaimable": "3.179GB (27%)", ...}. Docker counts a layer that images share once."""
-        rows = {}
-        for line in self._run("system", "df", "--format", "{{json .}}").stdout.splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            rows[row.get("Type")] = row
-        return rows
-
-    def stop(self, cid: str) -> None:
-        self._run("stop", "-t", "20", cid, timeout=90)
-
-    def remove_container(self, cid: str, volumes: bool = True) -> None:
-        # With `-v` its anonymous volumes go with it (named ones stay); a running one is refused.
-        self._run("rm", *(("-v",) if volumes else ()), cid)
-
-    def remove_network(self, nid: str) -> None:
-        self._run("network", "rm", nid)
-
-    def remove_volume(self, name: str) -> None:
-        self._run("volume", "rm", name)  # refused while any container uses it
-
-    def remove_image(self, iid: str) -> None:
-        self._run("image", "rm", iid, timeout=300)  # refused while a container uses it or other tags share it
-
-
-@dataclass(frozen=True)
-class Proc:
-    pid: int
-    ticks: int           # start time in clock ticks after boot: with the pid, which process this is
-    started: datetime
-    cwd: str
-    cmd: str
-    session: bool        # below a tmux, claude or codex process (or the runner): a live session's own
-
-
-def _stat(pid: int, proc: Path) -> tuple[int, str, int] | None:
-    """(parent pid, command name, start ticks) from /proc/<pid>/stat."""
-    try:
-        text = (proc / str(pid) / "stat").read_text()
-    except OSError:
-        return None
-    comm = text[text.index("(") + 1:text.rindex(")")]
-    rest = text[text.rindex(")") + 2:].split()
-    return int(rest[1]), comm, int(rest[19])
-
-
-def scan_processes(roots: tuple[str, ...], proc: Path = Path("/proc"),
-                   out_of_time: Callable[[], bool] = lambda: False) -> list[Proc]:
-    """This user's processes whose working folder is in the workspace (Linux; elsewhere none). The pass's time
-    is checked as it goes."""
-    def check(n: int) -> None:
-        if n % 128 == 0 and out_of_time():
-            raise TimeoutError(f"processes: {OUT_OF_TIME}")
-    try:
-        btime = int(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
-                         if line.startswith("btime")))
-    except (OSError, StopIteration, ValueError):
-        return []
-    hz = os.sysconf("SC_CLK_TCK")
-    me, mine = os.getuid(), os.getpid()
-    info = {}
-    for n, d in enumerate(proc.iterdir(), 1):
-        check(n)
-        if d.name.isdigit() and (s := _stat(int(d.name), proc)):
-            info[int(d.name)] = s
-    out, steps = [], 0
-    for n, (pid, (ppid, comm, ticks)) in enumerate(info.items(), 1):
-        check(n)
-        if pid == mine:
-            continue
-        try:
-            if (proc / str(pid)).stat().st_uid != me:
-                continue
-            cwd = os.readlink(proc / str(pid) / "cwd")
-            cmd = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
-        except OSError:
-            continue
-        if not _inside(cwd, roots):
-            continue
-        session, seen, p = comm.startswith(SESSION_COMMS), set(), ppid
-        while not session and p > 1 and p in info and p not in seen:
-            steps += 1
-            check(steps)
-            seen.add(p)
-            session = p == mine or info[p][1].startswith(SESSION_COMMS)
-            p = info[p][0]
-        out.append(Proc(pid, ticks, datetime.fromtimestamp(btime + ticks / hz, UTC), cwd, cmd or comm, session))
-    return out
-
-
-def kill_process(p: Proc, wait: float = 10, proc: Path = Path("/proc")) -> str:
-    """SIGTERM, then SIGKILL, to exactly this process: a pid handle taken after checking its start time, so a
-    pid reused by another process is never signalled."""
-    def same() -> bool:
-        s = _stat(p.pid, proc)
-        return s is not None and s[2] == p.ticks
-    if not hasattr(os, "pidfd_open"):
-        return "kept"  # no race-free handle on this system: never signal by pid alone
-    try:
-        fd = os.pidfd_open(p.pid)
-    except ProcessLookupError:
-        return "gone"
-    try:
-        if not same():
-            return "gone"
-        signal.pidfd_send_signal(fd, signal.SIGTERM)
-        deadline = time.monotonic() + wait
-        while same() and time.monotonic() < deadline:
-            time.sleep(0.2)
-        if same():
-            signal.pidfd_send_signal(fd, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    finally:
-        os.close(fd)
-    return "done"
 
 
 # -- who owns it --------------------------------------------------------------------------------
@@ -379,17 +122,18 @@ class Owners:
             return "unknown"
         if t.state in ACTIVE_STATES:
             return "working"
-        if t.state in ("done", "stopped"):
-            return "over"
+        if t.state == "done" or (t.state == "stopped" and not t.failed_at_ms):
+            return "over"  # a task stops with `failed_at_ms` only when people closed every MR: `/continue` works then
         if key in self.resuming:
             return "waiting"
-        if t.state == "failed" and (not t.failed_at_ms or not t.branch or self._failed_at(t) + self.window <= self.now):
+        if t.state in ("failed", "stopped") and (not t.failed_at_ms or not t.branch
+                                                 or self._failed_at(t) + self.window <= self.now):
             return "over"  # past `/continue`, or nothing to continue
         return "waiting"
 
     def over_for(self, key: str) -> timedelta:
         t = self.tasks[key]
-        since = (self._failed_at(t) + self.window) if t.state == "failed" and t.failed_at_ms and t.branch \
+        since = (self._failed_at(t) + self.window) if t.state in ("failed", "stopped") and t.failed_at_ms and t.branch \
             else (_ts(t.updated_at) or self.now)
         return self.now - since
 
@@ -758,7 +502,7 @@ class Cleanup:
         if items and reclaimable:
             items.append(Item("image", "unused-images", f"{len(items)} images above", "report",
                               f"Docker counts {reclaimable} in images no container uses: what removing all of them "
-                              "frees, a shared layer counted once", detail={"bytes": _bytes(reclaimable)}))
+                              "frees, a shared layer counted once", detail={"bytes": size_bytes(reclaimable)}))
         return items
 
     @staticmethod
@@ -768,7 +512,7 @@ class Cleanup:
             return []
         return [Item("image", "build-cache", "build cache", "report",
                      f"{row.get('Size')}, of which {row.get('Reclaimable') or '?'} no image uses; "
-                     "`docker builder prune` by hand", detail={"bytes": _bytes((row.get("Reclaimable") or "").split(" (")[0])})]
+                     "`docker builder prune` by hand", detail={"bytes": size_bytes((row.get("Reclaimable") or "").split(" (")[0])})]
 
     def _container(self, c: dict, labels: dict, owners: Owners, projects: set[str]) -> Item | None:
         name = (c.get("Name") or "").lstrip("/")
@@ -960,7 +704,7 @@ class Cleanup:
                     days = owners.over_for(d.name).days
                     items.append(Item("folder", str(d), name, "delete", f"{d.name} is over, {days} days ago",
                                       task=d.name, independent=True,
-                                      detail={"bytes": _size(d, self._out_of_time)}))
+                                      detail={"bytes": tree_size(d, self._out_of_time)}))
         return items
 
     def _workspace_extras(self) -> list[Item]:
@@ -975,7 +719,7 @@ class Cleanup:
                 raise TimeoutError(f"{ws}: {OUT_OF_TIME}")
             if p.name in WORKSPACE_OWN or p.name in holders or p.name.startswith("."):  # dot-folders: tools' own
                 continue
-            size = _size(p, self._out_of_time) if p.is_dir() and not p.is_symlink() else p.lstat().st_size
+            size = tree_size(p, self._out_of_time) if p.is_dir() and not p.is_symlink() else p.lstat().st_size
             what = "a link" if p.is_symlink() else "a folder that is no repository" if p.is_dir() else "a file"
             items.append(Item("folder", str(p), p.name, "report", f"{what} in the workspace; {_human(size)}",
                               detail={"bytes": size}))
@@ -1319,143 +1063,14 @@ class Cleanup:
 def _in_workspace(c: dict, roots: tuple[str, ...]) -> bool:
     """A compose project of the workspace, or a bind mount from it."""
     labels = (c.get("Config") or {}).get("Labels") or {}
-    return _inside(labels.get(WORKDIR_LABEL), roots) or any(
-        m.get("Type") == "bind" and _inside(m.get("Source"), roots) for m in c.get("Mounts") or [])
+    return inside(labels.get(WORKDIR_LABEL), roots) or any(
+        m.get("Type") == "bind" and inside(m.get("Source"), roots) for m in c.get("Mounts") or [])
 
 
 def _existing(path: Path) -> Path:
     while not path.exists() and path != path.parent:
         path = path.parent
     return path
-
-
-def mount_points(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[str] | None:
-    """Every mount point (Linux). A bind mount of the same file system has the same st_dev, so only this list
-    shows it. None on Linux when it cannot be read: then nothing is deleted. Elsewhere: none, and the st_dev
-    walk below is the check."""
-    try:
-        lines = mountinfo.read_text().splitlines()
-    except OSError:
-        return None if sys.platform.startswith("linux") else []
-    def unescape(p: str) -> str:
-        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), p)
-    return [unescape(line.split()[4]) for line in lines if len(line.split()) > 4]
-
-
-def remove_tree(path: Path, parent: Path, it: Item | None = None, *,
-                out_of_time: Callable[[], bool] = lambda: False) -> str:
-    """Delete a folder that is really where it was planned: not a symbolic link, its parent the expected one,
-    no other file system mounted inside. The folder checked is the one deleted: it is opened, compared with what
-    was checked, and emptied through that descriptor, each folder below opened the same way, never by a path that
-    something could be put in place of meanwhile. Links are removed, never followed; another file system inside
-    stops it. The pass's time is checked at every entry: what is left of a cut folder stays under its own name,
-    for the next pass."""
-    def kept(why: str) -> str:
-        if it:
-            it.detail["kept"] = why
-        return "kept"
-    try:
-        st = path.lstat()
-    except FileNotFoundError:
-        return "gone"
-    if not stat.S_ISDIR(st.st_mode):
-        return kept("not a plain folder")
-    if os.path.realpath(path.parent) != os.path.normpath(parent):
-        return kept("its parent is not the workspace's .arceus folder")
-    try:
-        parent_st = os.stat(parent)
-    except FileNotFoundError:
-        return "gone"
-    if st.st_dev != parent_st.st_dev:
-        return kept("a file system is mounted on it")
-    target = os.path.realpath(path)
-    mounts = mount_points()
-    if mounts is None:
-        return kept("the mount table could not be read")
-    if any(_inside(m, (target,)) for m in mounts):
-        return kept("a file system is mounted on or inside it")
-    for e in _entries(path, out_of_time):
-        if e.is_dir(follow_symlinks=False) and e.stat(follow_symlinks=False).st_dev != st.st_dev:
-            return kept("another file system is mounted inside")
-    # The parent is held open from here: a link put in place of it, or of a folder above it, after the checks
-    # cannot send the removal elsewhere.
-    pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        held = os.fstat(pfd)
-        if (held.st_dev, held.st_ino) != (parent_st.st_dev, parent_st.st_ino):
-            return kept("its parent changed while it was checked")
-        try:
-            fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd)
-        except FileNotFoundError:
-            return "gone"
-        except NotADirectoryError:
-            return kept("another folder took its place while it was checked")
-        try:
-            if not _same(os.fstat(fd), st):
-                return kept("another folder took its place while it was checked")
-            _empty(fd, (st.st_dev, _mount_id(fd)), str(path), out_of_time)
-        finally:
-            os.close(fd)
-        # Now an empty folder; it goes only while its name still means the folder emptied above. (Between this
-        # look and rmdir only an empty folder could take its place, and rmdir takes nothing else.)
-        try:
-            if not _same(os.stat(path.name, dir_fd=pfd, follow_symlinks=False), st):
-                return kept("emptied, but another folder took its place meanwhile")
-            os.rmdir(path.name, dir_fd=pfd)
-        except FileNotFoundError:
-            pass
-    finally:
-        os.close(pfd)
-    return "done"
-
-
-def _same(a: os.stat_result, b: os.stat_result) -> bool:
-    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
-
-
-def _mount_id(fd: int) -> int | None:
-    """Which mount an open folder is on (Linux: /proc/self/fdinfo), read from the descriptor itself, so a bind
-    mount of the same file system put inside after the mount table was read still shows. None elsewhere."""
-    if not sys.platform.startswith("linux"):
-        return None
-    for line in Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines():  # unreadable: OSError, nothing goes
-        if line.startswith("mnt_id:"):
-            return int(line.split()[1])
-    raise OSError("fdinfo has no mnt_id")
-
-
-def _empty(fd: int, mount: tuple[int, int | None], where: str, out_of_time: Callable[[], bool]) -> None:
-    """Everything in the open folder `fd`, through descriptors only: each folder below is opened without following
-    a link, checked to be the entry just listed and on the same mount (`mount`: st_dev and mount id) before it is
-    emptied."""
-    with os.scandir(fd) as it:
-        entries = [(e.name, e.stat(follow_symlinks=False)) for e in it]
-    for name, est in entries:
-        if out_of_time():
-            raise TimeoutError(f"{where}: {OUT_OF_TIME}, partly removed")
-        if stat.S_ISDIR(est.st_mode):
-            if est.st_dev != mount[0]:
-                raise OSError(f"{where}/{name}: another file system is mounted here; left as it is")
-            try:
-                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            except FileNotFoundError:
-                continue
-            try:
-                if not _same(os.fstat(child), est):
-                    raise OSError(f"{where}/{name}: changed while it was removed; left as it is")
-                if _mount_id(child) != mount[1]:
-                    raise OSError(f"{where}/{name}: something is mounted here; left as it is")
-                _empty(child, mount, f"{where}/{name}", out_of_time)
-            finally:
-                os.close(child)
-            os.rmdir(name, dir_fd=fd)
-        else:
-            try:
-                os.unlink(name, dir_fd=fd)
-            except FileNotFoundError:
-                pass
-    if out_of_time():
-        raise TimeoutError(f"{where}: {OUT_OF_TIME}, partly removed")
 
 
 # -- Claude's advice on what the rules cannot place ---------------------------------------------

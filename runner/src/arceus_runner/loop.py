@@ -26,11 +26,12 @@ from datetime import UTC, datetime
 
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check
-from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Docker, Situation
+from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Situation
 from arceus_runner.code_review import ReviewAgent
 from arceus_runner.config import Config, Schedule, Secrets
 from arceus_runner.db import ACTIVE_STATES, InstanceLock, ReviewStore, TaskStore
 from arceus_runner.delivery import Delivery
+from arceus_runner.dockerops import Docker
 from arceus_runner.review import ReviewLoop
 from arceus_runner.engine import Engine
 from arceus_runner.events import EventLog

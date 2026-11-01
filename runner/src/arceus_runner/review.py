@@ -192,11 +192,11 @@ class ReviewLoop:
         states = {s.state for s in statuses.values()}
         if "opened" not in states:  # nothing left to review: people decided on every MR
             merged = [m for m in mrs if statuses[m.repo].state == "merged"]
+            closed = [m for m in mrs if statuses[m.repo].state == "closed"]
             if merged:
-                self._finished(task, merged)
-            else:
-                self.d.fail(task, "every merge request of this task was closed without merge; the runner stopped "
-                                  "following it")
+                self._finished(task, merged, closed)
+            else:  # people did not want the work: a stop, not a failure, and `/continue` still picks it up
+                self.d.stop_closed(task, [(m.url, statuses[m.repo].closed_by) for m in closed])
             return False
         for mr in mrs:
             if statuses[mr.repo].state == "closed" and not self._closed(task, mr, statuses[mr.repo], now):
@@ -352,7 +352,7 @@ class ReviewLoop:
         self.events.emit("task_stopped", task_id=task.task_id, reason="ticket moved on", state=state)
         return True
 
-    def _finished(self, task: Task, mrs) -> None:
+    def _finished(self, task: Task, mrs, closed=()) -> None:
         c = self.cfg.tracker
         if c.states.merged and self.d.tracker.issue(task.task_id).state in (c.states.code_review,
                                                                              c.states.in_progress):
@@ -365,7 +365,12 @@ class ReviewLoop:
             except (BadRequest, NotFound) as e:
                 self.events.emit("ticket_move_failed", task_id=task.task_id, state=c.states.merged, error=str(e)[:300])
         links = "\n".join(f"- {m.url}" for m in mrs)
-        self.d.comment_once(task, "merged", f"All merge requests of this task are merged; the runner has stopped following it:\n{links}")
+        if closed:
+            text = ("Every merge request of this task is merged or closed; the runner has stopped following it."
+                    f"\n\nMerged:\n{links}\n\nClosed without merge:\n" + "\n".join(f"- {m.url}" for m in closed))
+        else:
+            text = f"All merge requests of this task are merged; the runner has stopped following it:\n{links}"
+        self.d.comment_once(task, "merged", text)
         self.store.update_task(task.task_id, state="done", reason="merge requests merged")
         self.events.emit("task_merged", task_id=task.task_id, mrs=[m.url for m in mrs])
 

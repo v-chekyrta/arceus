@@ -85,7 +85,7 @@ class Metrics:
         self.task.clear()
         for t in runner.store.tasks():
             counts[t.state] = counts.get(t.state, 0) + 1
-            if t.state not in ("failed", "done"):
+            if t.state not in ("failed", "done", "stopped"):
                 self.task.labels(t.task_id, t.state, t.summary[:80]).set(1)
         self.tasks.clear()
         for state, n in counts.items():

@@ -63,7 +63,7 @@ STALLED_NUDGE = ("Your previous session stopped at its prompt without finishing 
                  "changed, and declare the outcome.")
 RESUME = "The session was interrupted (a reboot or a crash). Continue the task from where you stopped."
 PREPARED_MARK = "arceus-prepared"
-CONTINUE = "/continue"  # a comment that starts with this, from someone allowed, resumes a failed task
+CONTINUE = "/continue"  # a comment that starts with this, from someone allowed, resumes a failed task (_continuable)
 HOME_IGNORE = """\
 # Every folder here is a repository of the project's group on its code host, cloned by the Arceus runner.
 # This repository holds only the runner's notes for the agent and is never published.
@@ -934,6 +934,29 @@ class Delivery:
         except ServiceError as e:
             self.events.emit("notify_pending", task_id=task.task_id, reason=str(e))
 
+    def stop_closed(self, task: Task, closed: list[tuple[str, str]]) -> None:
+        """People closed every MR of the task without merging any: their decision, not a failure. The task stops,
+        with no failure tag; a `/continue` still picks it up, as after a failure. `closed`: (url, who closed it)."""
+        # Numbered like a failure: the task may be continued and closed again, and that is another comment.
+        kind = f"closed:n{self.store.count_actions(f'{task.task_id}:comment:closed:') + 1}"
+        who = sorted({by for _, by in closed if by})
+        by = f" by {', '.join(who)}" if who else ""
+        body = (f"Every merge request of this task was closed without merge{by}, "
+                "so Arceus has stopped working on it:\n" + "\n".join(f"- {url}" for url, _ in closed) +
+                f"\n\nTo have Arceus pick this up again, reply with a comment that starts with `{CONTINUE}`, followed "
+                "by what it should do differently. Its branches and commits are kept.")
+        with self.store.transaction():
+            task = self.store.update_task(task.task_id, state="stopped", reason="every merge request was closed "
+                                          "without merge", failed_at_ms=int(self.now().timestamp() * 1000))
+            self.store.action_intent(f"{task.task_id}:comment:{kind}", task.task_id, "comment",
+                                     json.dumps({"kind": kind, "text": body}))
+        self.events.emit("task_stopped", task_id=task.task_id, reason="merge requests closed",
+                         mrs=[url for url, _ in closed])
+        try:
+            self.comment_once(task, kind, body)
+        except ServiceError as e:
+            self.events.emit("notify_pending", task_id=task.task_id, reason=str(e))
+
     def _save_progress(self, task: Task) -> None:
         """The failed attempt's uncommitted work, committed on the task branch where it stands.
 
@@ -1190,12 +1213,13 @@ class Delivery:
     # -- picking a failed task up again ---------------------------------------------------------
 
     def check_continue(self) -> None:
-        """A `/continue` comment from an allowed person after a failure, or after the answer to a research ticket
-        (a follow-up question): recorded, sent by send_continue()."""
+        """A `/continue` comment from an allowed person after a failure, after people closed every MR of the task,
+        or after the answer to a research ticket (a follow-up question): recorded, sent by send_continue()."""
         c = self.cfg.tracker
         window = self.cfg.limits.continue_window
-        for task in [*self.store.tasks("failed"), *(t for t in self.store.tasks("done") if t.research)]:
-            since = task.failed_at_ms if task.state == "failed" else task.published_at_ms
+        for task in [*self.store.tasks("failed", "stopped"), *(t for t in self.store.tasks("done") if t.research)]:
+            # A task stopped because its ticket was moved on by hand has no `failed_at_ms`: the team took it from there.
+            since = task.published_at_ms if task.state == "done" else task.failed_at_ms
             if not since or not task.branch:
                 continue  # failed before any work existed (no repositories), or before this was possible
             if self.now() - datetime.fromtimestamp(since / 1000, UTC) > window:
@@ -1239,7 +1263,9 @@ class Delivery:
 
     @staticmethod
     def _continuable(task: Task) -> bool:
-        return task.state == "failed" or (task.research and task.state == "done")
+        # A task stops with `failed_at_ms` only when people closed every MR (stop_closed).
+        return task.state == "failed" or (task.state == "stopped" and bool(task.failed_at_ms)) \
+            or (task.research and task.state == "done")
 
     def _send_continue(self, task: Task, key: str, data: dict) -> None:
         if self._workspace_waits(task):
@@ -1257,6 +1283,10 @@ class Delivery:
         if task.state == "done":
             text = (f"{data['author']} has a follow-up to your answer on the ticket. Answer it the same way: the "
                     f"full answer in `{answer}`, then the outcome succeeded_research. Commit nothing.")
+        elif task.state == "stopped":
+            text = (f"{data['author']} asked you to continue this task. It had stopped because people closed every "
+                    "merge request of it without merging any: read on the MRs and the ticket why, then pick it up "
+                    "from where the work stands and finish it.")
         else:
             text = (f"{data['author']} asked you to continue this task after it failed ({task.reason}). "
                     f"Pick it up from where the work stands and finish it.")
@@ -1385,17 +1415,16 @@ class Delivery:
             # Whatever the agent committed, a research ticket publishes nothing: its answer is the result.
             self.answer(task, show, reviewed=False)
             return
+        attempt = len(show.get("attempts") or [])
         receipt = show.get("receipt") or {}
         if not receipt.get("review") and self._passed_without_outcome(task, show):
             # The attempt passed review but ended without a declared outcome, so Bulava wrote no receipt (staging,
             # STG-29 and STG-37). What the review accepted is in `task show` and in `repo_reviewed`.
-            self.events.emit("published_without_outcome", task_id=task.task_id,
-                             attempt=len(show.get("attempts") or []))
+            self.events.emit("published_without_outcome", task_id=task.task_id, attempt=attempt)
             receipt = {"review": "passed", "repos": show["repos"], "no_outcome": True}
             show = show | {"receipt": receipt}
         if receipt.get("review") != "passed":
-            self.fail(task, f"the review verdict is \"{receipt.get('review')}\", nothing to publish",
-                      attempt=len(show.get("attempts") or []))
+            self.fail(task, f"the review verdict is \"{receipt.get('review')}\", nothing to publish", attempt=attempt)
             return
         # Nothing half done is published, and nothing half done stays behind in the shared workspace either.
         left = [f"{name}: a {op} was left half done; it is undone, the branch is back as it was before it"
@@ -1403,11 +1432,90 @@ class Delivery:
                 if (op := self._end_unfinished(task, name, self.cfg.paths.workspace / name))]
         if left:
             self.fail(task, "the attempt left a git operation half done, nothing was pushed", "\n".join(left),
-                      attempt=len(show.get("attempts") or []))
+                      attempt=attempt)
             return
         task = self.store.update_task(task.task_id, state="publishing")
-        repos = receipt.get("repos") or []
         workspace = self.cfg.paths.workspace.resolve()
+        plan, problems = self._check_receipt(task, receipt.get("repos") or [], workspace)
+        if problems:
+            # Nothing is pushed unless every repository checks out.
+            self.fail(task, "the commit is not the reviewed one, nothing was pushed", "\n".join(problems),
+                      attempt=attempt)
+            return
+        if not plan:
+            self.fail(task, "no changes", attempt=attempt)
+            return
+
+        group = {(workspace / r.relative_path).resolve(): r for r in self.host.repos()}
+        missing = [str(path) for path, _ in plan if path not in group]
+        if missing:  # all of them are resolved before the first push
+            self.fail(task, f"a repository is not in the {self.host.label} {self.host.scope_kind}, nothing was pushed",
+                      "\n".join(missing))
+            return
+        targets = self._targets(task, plan, group)
+        unreviewed = self._below_base(plan, group, targets)
+        if unreviewed:
+            self.fail(task, "the branch has commits below the reviewed range, nothing was pushed",
+                      "\n".join(unreviewed), attempt=attempt)
+            return
+        plan, dropped, reopened = self._closed_mrs(task, plan, group, targets)
+        if reopened:
+            self.fail(task, "a merge request of this task was closed without merge, but its branch has changes "
+                            "again; nothing was pushed", "\n".join(reopened), attempt=attempt)
+            return
+        stored = {m.repo: m for m in self.store.task_mrs(task.task_id)}
+        dropped = [d for d in dropped if d[0] in stored]
+        if dropped:
+            task = self._close_dropped(task, dropped, stored)
+        if not plan:
+            self.fail(task, "the agent took all of its changes back out; its merge requests are closed" if dropped
+                      else "no changes", attempt=attempt)
+            return
+        visuals, skipped = media.load(media.media_dir(workspace, task.task_id))
+        for line in skipped:
+            self.events.emit("media_skipped", task_id=task.task_id, detail=line)
+        urls: list[str] = []
+        for path, r in plan:
+            repo = group[path]
+            sha, branch = r["reviewed_sha"], r["branch"]
+            if not self._push(task, repo, path, r, stored):
+                return  # failed, or back to the agent: nothing after it is published
+            self.events.emit("pushed", task_id=task.task_id, repo=repo.relative_path, branch=branch, sha=sha)
+            shots = self._mr_media(task, repo.id, repo.relative_path, media.for_repo(visuals, repo.relative_path))
+            description = self._mr_description(task, show, path, r, shots, targets[path])
+            existed = {m.repo: m for m in self.store.task_mrs(task.task_id)}.get(repo.relative_path)
+            mr = self._open_mr(repo, task, branch, description, after_closed=bool(r.get("after_closed")))
+            if (existed or mr.state != "opened" or self.store.task_mrs(task.task_id)) \
+                    and not (receipt.get("no_outcome") and existed):
+                # A later round: describe what is there now. A round that declared no outcome has nothing to say
+                # about the work, so the MR keeps its description rather than losing "What was done".
+                self.host.set_description(repo.id, mr.iid, description)
+            self.store.upsert_mr(task.task_id, repo.relative_path, repo.id, mr.iid, mr.url, sha)
+            urls.append(mr.url)
+            self.events.emit("mr_ready", task_id=task.task_id, repo=repo.relative_path, mr_iid=mr.iid, url=mr.url)
+
+        task = self.review.count_round(task)  # a review round counts once it ends in published code
+        follow_up = task.review_rounds or task.ci_attempts
+        self.store.update_task(task.task_id, mr_urls=self._mr_urls(task))
+        shas = "-".join(r["reviewed_sha"][:10] for _, r in plan)
+        head = ("Arceus addressed the review comments; the updated changes passed review. Same MR, updated branch:"
+                if follow_up else "Arceus finished the work; the changes passed review. Merge request:")
+        body = head + "\n" + "\n".join(f"- {u}" for u in urls)
+        if dropped:
+            body += "\n\nNo longer part of this task (its changes were taken back out, the MR is closed):\n" + \
+                "\n".join(f"- {mr.url}" for _, mr, _ in dropped)
+        posted = self.comment_with_media(task, f"mr:{shas}", body, visuals)
+        self.review.after_publish(task, {self._repo_name(p): r["reviewed_sha"] for p, r in plan})
+        self.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.code_review)
+        self.store.update_task(task.task_id, state="code_review", reason=None,
+                               published_at_ms=task.published_at_ms or (posted[1] if posted else None))
+        self.events.emit("task_published", task_id=task.task_id, mrs=urls, round=follow_up)
+        self.published.add(task.task_id)
+
+    def _check_receipt(self, task: Task, repos: list[dict], workspace: Path) \
+            -> tuple[list[tuple[Path, dict]], list[str]]:
+        """What the engine's receipt says to publish, checked against the workspace: (the repositories with
+        reviewed changes, with their receipt; what does not check out). Pushes nothing."""
         problems: list[str] = []
         plan: list[tuple[Path, dict]] = []
         mine = {(workspace / n).resolve() for n in self._names(task)}
@@ -1453,34 +1561,11 @@ class Delivery:
                                     "did not report on this repository")
             except GitError as e:
                 problems.append(f"{self._repo_name(path)}: {e}")
-        if problems:
-            # Nothing is pushed unless every repository checks out.
-            self.fail(task, "the commit is not the reviewed one, nothing was pushed", "\n".join(problems),
-                      attempt=len(show.get("attempts") or []))
-            return
-        if not plan:
-            self.fail(task, "no changes", attempt=len(show.get("attempts") or []))
-            return
+        return plan, problems
 
-        group = {(workspace / r.relative_path).resolve(): r for r in self.host.repos()}
-        missing = [str(path) for path, _ in plan if path not in group]
-        if missing:  # all of them are resolved before the first push
-            self.fail(task, f"a repository is not in the {self.host.label} {self.host.scope_kind}, nothing was pushed",
-                      "\n".join(missing))
-            return
-        targets = self._targets(task, plan, group)
-        unreviewed = self._below_base(plan, group, targets)
-        if unreviewed:
-            self.fail(task, "the branch has commits below the reviewed range, nothing was pushed",
-                      "\n".join(unreviewed), attempt=len(show.get("attempts") or []))
-            return
-        plan, dropped, reopened = self._closed_mrs(task, plan, group, targets)
-        if reopened:
-            self.fail(task, "a merge request of this task was closed without merge, but its branch has changes "
-                            "again; nothing was pushed", "\n".join(reopened), attempt=len(show.get("attempts") or []))
-            return
-        stored = {m.repo: m for m in self.store.task_mrs(task.task_id)}
-        dropped = [d for d in dropped if d[0] in stored]
+    def _close_dropped(self, task: Task, dropped: list[tuple[str, MergeRequest, str]], stored: dict) -> Task:
+        """The MRs of repositories the agent took its changes back out of leave the task: closed by the runner when
+        still open, a note once on each. The task as it is after."""
         for repo, mr, sha in dropped:
             # The agent took its changes back out: the MR is no longer part of this task.
             if mr.state == "opened":
@@ -1497,91 +1582,57 @@ class Delivery:
             self.store.drop_mr(task.task_id, repo)
             self.events.emit("mr_dropped", task_id=task.task_id, repo=repo, mr_iid=mr.iid, url=mr.url,
                              closed_by_runner=mr.state == "opened")
-        if dropped:
-            gone = {mr.url for _, mr, _ in dropped}
-            task = self.store.update_task(task.task_id, mr_urls=json.dumps(
-                sorted(set(json.loads(task.mr_urls)) - gone)))
-        if not plan:
-            self.fail(task, "the agent took all of its changes back out; its merge requests are closed" if dropped
-                      else "no changes", attempt=len(show.get("attempts") or []))
-            return
-        visuals, skipped = media.load(media.media_dir(workspace, task.task_id))
-        for line in skipped:
-            self.events.emit("media_skipped", task_id=task.task_id, detail=line)
-        urls: list[str] = []
-        for path, r in plan:
-            repo = group[path]
-            sha, branch = r["reviewed_sha"], r["branch"]
-            remote = self.git.remote_sha(path, branch)
-            if remote != sha:
-                published = stored[repo.relative_path].published_sha if repo.relative_path in stored else None
-                replaces = self._replaceable(path, branch, sha, remote, published)
-                try:
-                    self.git.push_sha(path, sha, branch, replaces)
-                except GitError as e:
-                    # The server may have taken the push before the connection broke. Ask it: the
-                    # right commit there is success; an unreachable remote stays for the next tick.
-                    remote = self.git.remote_sha(path, branch)
-                    if remote != sha:
-                        if replaces and remote == replaces:
-                            # Nobody pushed in between, yet the rewrite was refused: the host forbids force pushes
-                            # to this branch (a protected branch), so a rebased branch cannot be published.
-                            self.fail(task, f"{self.host.label} refused to replace the MR branch with its rebased "
-                                            "version", f"{repo.relative_path}: {e}\nAllow force push to the "
-                                            f"task branches ({branch}) on {self.host.label}, then /continue.")
-                            return
-                        if remote and self.store.task_mrs(task.task_id):
-                            self.git.fetch_branch(path, branch)
-                            if not self.git.is_ancestor(path, sha, remote):
-                                # A person pushed to the MR branch while the agent was fixing: their
-                                # commits stay, and the agent brings them in on the next round.
-                                rewritten = bool(published) and self.git.has_commit(path, published) \
-                                    and not self.git.is_ancestor(path, published, sha)
-                                self.review.note_moved(task, repo.relative_path, remote, sha, published, rewritten)
-                                return
-                            # The reviewed commit is already in, people added more on top: theirs to own.
-                            self.events.emit("branch_ahead_of_review", task_id=task.task_id,
-                                             repo=repo.relative_path, reviewed=sha, remote=remote)
-                        else:
-                            self.fail(task, *self._why_rejected(path, branch, sha, remote, e))
-                            return
-            remote = self.git.remote_sha(path, branch)
-            if remote != sha and not (remote and self.store.task_mrs(task.task_id)
-                                      and self.git.is_ancestor(path, sha, remote)):
-                self.fail(task, f"after the push the branch on {self.host.label} is not the reviewed commit",
-                          f"{repo.relative_path}: {remote} instead of {sha}")
-                return
-            self.events.emit("pushed", task_id=task.task_id, repo=repo.relative_path, branch=branch, sha=sha)
-            shots = self._mr_media(task, repo.id, repo.relative_path, media.for_repo(visuals, repo.relative_path))
-            description = self._mr_description(task, show, path, r, shots, targets[path])
-            existed = {m.repo: m for m in self.store.task_mrs(task.task_id)}.get(repo.relative_path)
-            mr = self._open_mr(repo, task, branch, description, after_closed=bool(r.get("after_closed")))
-            if (existed or mr.state != "opened" or self.store.task_mrs(task.task_id)) \
-                    and not (receipt.get("no_outcome") and existed):
-                # A later round: describe what is there now. A round that declared no outcome has nothing to say
-                # about the work, so the MR keeps its description rather than losing "What was done".
-                self.host.set_description(repo.id, mr.iid, description)
-            self.store.upsert_mr(task.task_id, repo.relative_path, repo.id, mr.iid, mr.url, sha)
-            urls.append(mr.url)
-            self.events.emit("mr_ready", task_id=task.task_id, repo=repo.relative_path, mr_iid=mr.iid, url=mr.url)
+        return self.store.update_task(task.task_id, mr_urls=self._mr_urls(task))
 
-        task = self.review.count_round(task)  # a review round counts once it ends in published code
-        follow_up = task.review_rounds or task.ci_attempts
-        self.store.update_task(task.task_id, mr_urls=json.dumps(sorted(set(urls) | set(json.loads(task.mr_urls)))))
-        shas = "-".join(r["reviewed_sha"][:10] for _, r in plan)
-        head = ("Arceus addressed the review comments; the updated changes passed review. Same MR, updated branch:"
-                if follow_up else "Arceus finished the work; the changes passed review. Merge request:")
-        body = head + "\n" + "\n".join(f"- {u}" for u in urls)
-        if dropped:
-            body += "\n\nNo longer part of this task (its changes were taken back out, the MR is closed):\n" + \
-                "\n".join(f"- {mr.url}" for _, mr, _ in dropped)
-        posted = self.comment_with_media(task, f"mr:{shas}", body, visuals)
-        self.review.after_publish(task, {self._repo_name(p): r["reviewed_sha"] for p, r in plan})
-        self.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.code_review)
-        self.store.update_task(task.task_id, state="code_review", reason=None,
-                               published_at_ms=task.published_at_ms or (posted[1] if posted else None))
-        self.events.emit("task_published", task_id=task.task_id, mrs=urls, round=follow_up)
-        self.published.add(task.task_id)
+    def _mr_urls(self, task: Task) -> str:
+        """The task's MRs as `mr_urls` holds them: the ones it follows (`task_mrs`), a merged one among them. An MR
+        replaced by a new one in its repository, or dropped from the task, is not there."""
+        return json.dumps(sorted(m.url for m in self.store.task_mrs(task.task_id)))
+
+    def _push(self, task: Task, repo: Repo, path: Path, r: dict, stored: dict) -> bool:
+        """The reviewed commit on the code host's branch. False when publishing stops here: the task failed, or a
+        person's push sends the work back to the agent; nothing after this repository may be pushed then."""
+        sha, branch = r["reviewed_sha"], r["branch"]
+        remote = self.git.remote_sha(path, branch)
+        if remote != sha:
+            published = stored[repo.relative_path].published_sha if repo.relative_path in stored else None
+            replaces = self._replaceable(path, branch, sha, remote, published)
+            try:
+                self.git.push_sha(path, sha, branch, replaces)
+            except GitError as e:
+                # The server may have taken the push before the connection broke. Ask it: the
+                # right commit there is success; an unreachable remote stays for the next tick.
+                remote = self.git.remote_sha(path, branch)
+                if remote != sha:
+                    if replaces and remote == replaces:
+                        # Nobody pushed in between, yet the rewrite was refused: the host forbids force pushes
+                        # to this branch (a protected branch), so a rebased branch cannot be published.
+                        self.fail(task, f"{self.host.label} refused to replace the MR branch with its rebased "
+                                        "version", f"{repo.relative_path}: {e}\nAllow force push to the "
+                                        f"task branches ({branch}) on {self.host.label}, then /continue.")
+                        return False
+                    if remote and self.store.task_mrs(task.task_id):
+                        self.git.fetch_branch(path, branch)
+                        if not self.git.is_ancestor(path, sha, remote):
+                            # A person pushed to the MR branch while the agent was fixing: their
+                            # commits stay, and the agent brings them in on the next round.
+                            rewritten = bool(published) and self.git.has_commit(path, published) \
+                                and not self.git.is_ancestor(path, published, sha)
+                            self.review.note_moved(task, repo.relative_path, remote, sha, published, rewritten)
+                            return False
+                        # The reviewed commit is already in, people added more on top: theirs to own.
+                        self.events.emit("branch_ahead_of_review", task_id=task.task_id,
+                                         repo=repo.relative_path, reviewed=sha, remote=remote)
+                    else:
+                        self.fail(task, *self._why_rejected(path, branch, sha, remote, e))
+                        return False
+        remote = self.git.remote_sha(path, branch)
+        if remote != sha and not (remote and self.store.task_mrs(task.task_id)
+                                  and self.git.is_ancestor(path, sha, remote)):
+            self.fail(task, f"after the push the branch on {self.host.label} is not the reviewed commit",
+                      f"{repo.relative_path}: {remote} instead of {sha}")
+            return False
+        return True
 
     def _replaceable(self, path: Path, branch: str, sha: str, remote: str | None, published: str | None) -> str | None:
         """The commit on the code host that the reviewed one may replace, when the agent rebased the MR branch.
