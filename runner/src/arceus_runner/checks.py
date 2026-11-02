@@ -56,7 +56,7 @@ def check_users(cfg: Config, tracker: IssueTracker) -> list[Check]:
 
 
 def check_slack(cfg: Config, slack: Slack) -> list[Check]:
-    assert cfg.slack
+    assert cfg.slack and cfg.slack.alerts_channel
     try:
         slack.auth_test()
     except SlackApiError as e:
@@ -81,12 +81,16 @@ def run_online_checks(cfg: Config, secrets: Secrets) -> list[Check]:
     try:
         results += _guard(tracker.name, lambda: check_tracker(cfg, tracker))
         results += _guard(host.name, lambda: host.check(cfg.health.token_expiry_warn_days))
-        if cfg.slack:
+        if cfg.slack and cfg.slack.alerts_channel:
             sc = slack_client(cfg, secrets)
             try:
                 results += _guard("slack", lambda: check_slack(cfg, Slack(sc)))
             finally:
                 sc.close()
+        if cfg.slack and cfg.slack.webhook_env:
+            # Posting is the only test a webhook has, and a check that runs on every start must not post.
+            results.append(Check("slack.webhook", "ok", f"{cfg.slack.webhook_env} is an incoming webhook URL; "
+                                                        "`arceus-runner slack-test` posts a test message"))
     finally:
         tracker.client.close()
         host.client.close()

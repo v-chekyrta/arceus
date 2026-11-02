@@ -10,8 +10,9 @@ same schema and the same secret redaction as everything else.
 
 The agent's own activity comes from its Claude Code transcript: when it last wrote anything, and
 which tools it used since the last look (tool names and the agent's one-line descriptions, never
-commands or their output). An `agent_activity` line at most every `activity_every`, and one
-`agent_quiet` when the agent has written nothing for `quiet_after` while the step is its own.
+commands or their output) and how many of them came back as an error. An `agent_activity` line at
+most every `activity_every`, and one `agent_quiet` when the agent has written nothing for
+`quiet_after` while the step is its own.
 
 Everything here only reads files. A missing or unreadable file is "unknown", never an error: the
 task itself is followed by delivery.py through `task show`, whatever happens here.
@@ -82,6 +83,7 @@ class TaskProgress:
     transcript_offset: int = 0
     agent_active_at: float | None = None
     tools: Counter = field(default_factory=Counter)
+    tool_errors: int = 0      # tool calls whose result came back as an error: a call is not a success
     last_tool: str = ""
     last_target: str = ""
     activity_emitted_at: float = 0.0
@@ -278,6 +280,12 @@ class ProgressWatcher:
         whole = data[:data.rfind(b"\n") + 1]
         p.transcript_offset += len(whole)
         for entry in _jsonl(whole):
+            if entry.get("type") == "user":
+                content = (entry.get("message") or {}).get("content")
+                p.tool_errors += sum(1 for part in content if isinstance(part, dict)
+                                     and part.get("type") == "tool_result" and part.get("is_error") is True) \
+                    if isinstance(content, list) else 0
+                continue
             if entry.get("type") != "assistant":
                 continue
             for part in (entry.get("message") or {}).get("content") or []:
@@ -296,11 +304,13 @@ class ProgressWatcher:
 
     def _maybe_report_activity(self, p: TaskProgress) -> None:
         now = self.now().timestamp()
-        if p.tools and now - p.activity_emitted_at >= self.activity_every:
+        if (p.tools or p.tool_errors) and now - p.activity_emitted_at >= self.activity_every:
             self.events.emit("agent_activity", task_id=p.task_id, attempt=p.attempt, tools=sum(p.tools.values()),
-                             by_tool=dict(p.tools.most_common(6)), last_tool=p.last_tool,
-                             last_target=p.last_target or None, step=p.step.stage if p.step else None)
+                             by_tool=dict(p.tools.most_common(6)), errors=p.tool_errors or None,
+                             last_tool=p.last_tool, last_target=p.last_target or None,
+                             step=p.step.stage if p.step else None)
             p.tools.clear()
+            p.tool_errors = 0
             p.activity_emitted_at = now
             p.quiet_reported = False
         quiet = self.quiet_seconds(p)

@@ -1,5 +1,5 @@
 # Runner settings for one project. No secrets here: the bot tokens are in secrets.env
-# (YOUTRACK_TOKEN, GITLAB_TOKEN, SLACK_BOT_TOKEN with the providers below). Unknown keys are errors.
+# (YOUTRACK_TOKEN, GITLAB_TOKEN, SLACK_WEBHOOK_URL with the providers below). Unknown keys are errors.
 # Check it with: arceus-runner check
 
 project: acme-shop                     # name for logs, metrics and dashboards (a-z, 0-9, -)
@@ -56,9 +56,28 @@ code_host:
   # Without it the review only comments.
   # approver: { user: acme-review-bot, token_env: GITLAB_REVIEW_TOKEN }   # approves and signs the review's notes
 
-# Optional. Remove the section if there is no Slack bot yet.
+# Optional. The project's channel: the runner reports there what the agent starts, asks, finishes and fails, and when
+# it has nothing to do (the table is in runner/src/arceus_runner/notify.py). Remove the section for no Slack.
 slack:
-  alerts_channel: "#acme-agent-alerts"
+  # An incoming webhook of the channel (Slack app → Incoming Webhooks → Add New Webhook); its URL goes into
+  # secrets.env. `arceus-runner slack-test` posts one message through it.
+  webhook_env: SLACK_WEBHOOK_URL
+  # Optional, and no bot or token: only who gets pinged. The webhook's message carries `<@U012AB3CD>`, which Slack
+  # shows as a mention of that member. Tracker login → Slack member ID (their profile → ⋮ → Copy member ID): the
+  # person who tagged the ticket on questions and failures, security.reviewers on held texts. Empty: messages name
+  # people as plain text and ping nobody.
+  people: {}
+  #   j.doe: U012AB3CD
+  # alerts_channel: "#acme-agent"     # with SLACK_BOT_TOKEN: `check` verifies the bot token and finds the channel
+  notify:
+    summary_every: 30m          # what a running task did, only when it did something
+    summaries_off_hours: false  # off hours the summary waits for the working day
+    idle_after: 15m             # nothing to take this long, in working hours: said
+    idle_repeat: 2h             # still nothing: said again this often, with what the agent can take (null: never)
+    question_reminder: 24h      # an unanswered question or held text again, in working hours
+    service_down_after: 10m     # the tracker or the code host not answering this long
+    restart_quiet: 10m          # starts and stops closer than this are counted, not told one by one
+    daily_status: true          # where everything stands, at the start of each working day
 
 schedule:
   timezone: Europe/Kyiv

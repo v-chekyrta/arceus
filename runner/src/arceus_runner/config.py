@@ -184,11 +184,50 @@ class CodeHostConfig(Strict):
         return self
 
 
+class SlackNotify(Strict):
+    """How often the runner writes to the project's channel (notify.py). Task transitions, questions and failures
+    go as soon as they are seen; these are the routine ones."""
+    summary_every: Duration = timedelta(minutes=30)     # what a running task did, only when it did something
+    summaries_off_hours: bool = False                   # off hours the summary waits for the working day
+    idle_after: Duration = timedelta(minutes=15)        # nothing to take this long, in working hours: said once
+    # Still nothing to take: said again this often (working hours), with what the agent can be given. null: never.
+    idle_repeat: Duration | None = timedelta(hours=2)
+    question_reminder: Duration = timedelta(hours=24)   # an unanswered question or held text: again, in working hours
+    service_down_after: Duration = timedelta(minutes=10)  # the tracker or code host unreachable this long
+    restart_quiet: Duration = timedelta(minutes=10)     # starts and stops closer than this are counted, not told
+    daily_status: bool = True                           # one status at the start of each working day
+    routine_expire: Duration = timedelta(hours=2)       # a summary not delivered by then is dropped as stale
+    expire: Duration = timedelta(days=7)                # any other message
+
+
+_SLACK_MEMBER = re.compile(r"^[UW][A-Z0-9]{2,}$")
+WEBHOOK_URL = re.compile(r"^https://hooks\.slack(-gov)?\.com/services/[A-Za-z0-9_/-]+$")
+
+
 class SlackConfig(Strict):
     token_env: str = "SLACK_BOT_TOKEN"  # name of the variable in secrets.env; there is rarely a reason to change it
-    alerts_channel: str = Field(min_length=2)
+    alerts_channel: str | None = Field(default=None, min_length=2)  # with the bot token: `check` finds the channel
+    # The incoming webhook of the project's channel (its URL in secrets.env): where the runner reports.
+    webhook_env: str | None = None
+    # Tracker login -> Slack member ID (U0123ABCD): who a question, a failure or a held text mentions.
+    people: dict[str, str] = {}
+    notify: SlackNotify = SlackNotify()
 
-    _check_env = field_validator("token_env")(_env_name)
+    _check_env = field_validator("token_env", "webhook_env")(_env_name)
+
+    @field_validator("people")
+    @classmethod
+    def _people(cls, v: dict[str, str]) -> dict[str, str]:
+        bad = [f"{login}: {sid!r}" for login, sid in v.items() if not _SLACK_MEMBER.match(sid)]
+        if bad:
+            raise ValueError(f"Slack member IDs look like U0123ABCD (profile, ⋮, Copy member ID): {', '.join(bad)}")
+        return v
+
+    @model_validator(mode="after")
+    def _something(self) -> SlackConfig:
+        if not self.alerts_channel and not self.webhook_env:
+            raise ValueError("needs webhook_env (where the runner reports) or alerts_channel, or remove the section")
+        return self
 
 
 class WorkingHours(Strict):
@@ -644,9 +683,11 @@ class Secrets:
     code_host: str
     slack: str | None
     approver: str | None = None  # code_host.approver's token
+    slack_webhook: str | None = None  # slack.webhook_env's URL: a secret as a whole and by its last part
 
     def values(self) -> list[str]:
-        return [v for v in (self.tracker, self.code_host, self.slack, self.approver) if v]
+        hook = [self.slack_webhook, self.slack_webhook.rstrip("/").rsplit("/", 1)[-1]] if self.slack_webhook else []
+        return [v for v in (self.tracker, self.code_host, self.slack, self.approver, *hook) if v]
 
     def __repr__(self) -> str:  # never print tokens by accident
         return "Secrets(<redacted>)"
@@ -673,7 +714,7 @@ def load_secrets(cfg: Config, environ: dict[str, str] | None = None) -> Secrets:
         return file_values.get(name) or environ.get(name) or None
 
     wanted = {"tracker": cfg.tracker.token_env, "code_host": cfg.code_host.token_env}
-    if cfg.slack:
+    if cfg.slack and cfg.slack.alerts_channel:
         wanted["slack"] = cfg.slack.token_env
     if cfg.code_host.approver:
         wanted["code_host.approver"] = cfg.code_host.approver.token_env
@@ -681,7 +722,16 @@ def load_secrets(cfg: Config, environ: dict[str, str] | None = None) -> Secrets:
     for k, v in wanted.items():
         if not found[k]:
             problems.append(f"{k}.token_env: {v} is not set in {path} or the environment")
+    webhook = None
+    if cfg.slack and cfg.slack.webhook_env:
+        webhook = get(cfg.slack.webhook_env)
+        if not webhook:
+            problems.append(f"slack.webhook_env: {cfg.slack.webhook_env} is not set in {path} or the environment")
+        elif not WEBHOOK_URL.match(webhook):
+            # Not the URL itself: it is a secret, and this goes to a terminal.
+            problems.append(f"slack.webhook_env: {cfg.slack.webhook_env} is not a Slack incoming webhook "
+                            "(https://hooks.slack.com/services/…); a Workflow Builder trigger takes other messages")
     if problems:
         raise ConfigError(problems)
     return Secrets(tracker=found["tracker"], code_host=found["code_host"], slack=found.get("slack"),
-                   approver=found.get("code_host.approver"))
+                   approver=found.get("code_host.approver"), slack_webhook=webhook)

@@ -286,7 +286,11 @@ def test_the_flow_does_not_reach_into_a_provider(name):
 def test_the_config_before_tracker_and_code_host_loads_as_the_same_settings():
     example = load_config(EXAMPLE).model_dump()
     example["paths"]["project_notes"] = None  # a setting newer than that layout
-    assert load_config(LEGACY).model_dump() == example
+    legacy = load_config(LEGACY).model_dump()
+    # Slack in that layout is the bot token and its channel; the example now reports through a webhook.
+    assert (legacy.pop("slack")["alerts_channel"], example.pop("slack")["webhook_env"]) == (
+        "#acme-agent-alerts", "SLACK_WEBHOOK_URL")
+    assert legacy == example
 
 
 def legacy_problems(tmp_path, change) -> list[str]:
@@ -326,7 +330,7 @@ def test_check_says_the_old_layout_still_works_but_is_old(tmp_path, capsys):
 
 def test_check_shows_the_project_notes_and_fails_on_a_missing_file(tmp_path, capsys):
     secrets = tmp_path / "secrets.env"
-    secrets.write_text("YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_BOT_TOKEN=c\n")
+    secrets.write_text("YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_WEBHOOK_URL=https://hooks.slack.com/services/T0/B0/c\n")
     secrets.chmod(0o600)
     notes = tmp_path / "project-notes.md"
     raw = example_raw()
@@ -403,7 +407,7 @@ def test_runner_db_refuses_another_tracker_and_rebind_takes_a_new_address(cfg, s
     raw["metrics"] = {"port": 0}
     raw["paths"] = {k: str(v) for k, v in cfg.paths.model_dump().items()}
     (tmp_path / "secrets.env").write_text(f"YOUTRACK_TOKEN={secrets.tracker}\nGITLAB_TOKEN={secrets.code_host}\n"
-                                          "SLACK_BOT_TOKEN=x\n")
+                                          "SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T0/B0/x\n")
     (tmp_path / "secrets.env").chmod(0o600)
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))

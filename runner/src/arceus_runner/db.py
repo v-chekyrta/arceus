@@ -486,11 +486,48 @@ MIGRATIONS.append(
     """
 )
 
+MIGRATIONS.append(
+    # 17: the project channel in Slack (notify.py). The outbox holds every message until the webhook takes it or it
+    # goes stale; `key` makes a message enqueued twice (a crash, a repeated tick) one row. `live_while` drops a
+    # question or reminder whose task moved on before it went out. slack_task_state is the task state already told,
+    # so a transition is told once, also when the runner died between the state change and the telling.
+    # tasks.question: the open question's words and options (JSON), written with the needs_input state itself, so
+    # the channel can quote them after any crash.
+    """
+    ALTER TABLE tasks ADD COLUMN question TEXT;
+    CREATE TABLE slack_outbox (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        key         TEXT NOT NULL UNIQUE,
+        kind        TEXT NOT NULL,
+        priority    INTEGER NOT NULL,
+        text        TEXT NOT NULL,
+        task_id     TEXT,
+        live_while  TEXT,
+        created_at  REAL NOT NULL,
+        expires_at  REAL NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'rejected', 'dropped')),
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        uncertain   INTEGER NOT NULL DEFAULT 0,
+        last_error  TEXT,
+        done_at     REAL
+    );
+    CREATE INDEX slack_outbox_pending ON slack_outbox (status, priority, id);
+    CREATE TABLE slack_task_state (
+        task_id     TEXT PRIMARY KEY,
+        sig         TEXT NOT NULL
+    );
+    CREATE TABLE slack_meta (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL
+    );
+    """
+)
+
 
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
-               "review_answers", "kind")
+               "review_answers", "kind", "question")
 TASK_COLUMNS = (*TASK_FIELDS, "updated_at")  # read: the last change is set by the store itself, never written
 
 
@@ -518,6 +555,7 @@ class Task:
                                         # `/continue` from a person resumes it
     review_answers: int = 0  # review rounds answered without a code change
     kind: str = "code"       # code: merge requests; research: an answer on the ticket, nothing published
+    question: str | None = None  # JSON {id, text, options, blocked}: the last question the agent asked
     updated_at: str = ""     # when the record last changed: for a task that is over, when it ended
 
     @property

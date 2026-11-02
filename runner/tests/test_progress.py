@@ -184,6 +184,30 @@ def test_agent_activity_names_tools_and_descriptions_never_commands(w):
     assert (last["tools"], last["last_target"]) == (1, "Run the tests")
 
 
+
+def test_agent_activity_counts_the_calls_that_came_back_with_an_error(w):
+    w.transcript(tool("Read", file_path="old"))  # seen first: history
+    w.step("deliver", "delivered", 1000)
+    p = w.watcher()
+    p.poll()
+    w.transcript(tool("Bash", command="pytest", description="Run the tests"), tool("Read", file_path="x"),
+                 {"type": "user", "message": {"content": [
+                     {"type": "tool_result", "tool_use_id": "1", "is_error": True, "content": "exit 1"},
+                     {"type": "tool_result", "tool_use_id": "2", "content": "fine"}]}})
+    p.poll()
+    [a] = w.emitted("agent_activity")
+    assert (a["tools"], a["errors"]) == (2, 1)  # a call is an attempt; its result says whether it worked
+    # A result that comes after its call was reported is still counted, with no new call to carry it.
+    w.clock.t += timedelta(minutes=1)
+    w.transcript({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "3", "is_error": True, "content": "late"}]}})
+    p.poll()
+    assert (w.emitted("agent_activity")[-1]["tools"], w.emitted("agent_activity")[-1]["errors"]) == (0, 1)
+    w.clock.t += timedelta(minutes=1)
+    w.transcript(tool("Read", file_path="y"))
+    p.poll()
+    assert "errors" not in w.emitted("agent_activity")[-1]
+
 def test_a_quiet_agent_is_reported_once_and_only_on_its_own_turn(w):
     w.transcript(tool("Read", file_path="x"), mtime=T0)
     w.step("deliver", "delivered", int(T0.timestamp() * 1000))

@@ -1247,10 +1247,13 @@ class Delivery:
         lines += ["", "Reply with a comment on this ticket: the option's number or your own words."]
         posted = self.comment_once(task, f"question:{q.get('id') or attempt}", "\n".join(lines))
         self.tracker.add_tag(task.issue_db_id, self.cfg.tracker.tags.needs_input)
+        # The words go with the state: the project's channel (notify.py) quotes them whenever it tells the question.
+        words = {"id": q.get("id"), "text": _short(text), "options": list(q.get("options") or []),
+                 "blocked": show.get("state") == "blocked"}
         self.store.update_task(task.task_id, state="needs_input", question_id=q.get("id"),
-                               question_at_ms=posted[1] if posted else None)
+                               question_at_ms=posted[1] if posted else None, question=json.dumps(words))
         self.events.emit("task_needs_input", task_id=task.task_id, question_id=q.get("id"),
-                         blocked=show.get("state") == "blocked")
+                         blocked=words["blocked"])
 
     def check_answers(self) -> None:
         """A comment from an allowed person after the question is the answer."""

@@ -12,6 +12,9 @@ from arceus_runner.health import autostart  # the real one: conftest stands in f
 
 from .conftest import EXAMPLE, example_raw
 
+HOOK = "https://hooks.slack.com/services/T0ACME/B0ACME/XXXXsecretXXXX"
+SLACK_HOOK = f"SLACK_WEBHOOK_URL={HOOK}\n"
+
 LEGACY = Path(__file__).parent / "data" / "config.legacy.yaml"  # config.example.yaml before tracker:/code_host:
 
 
@@ -91,11 +94,13 @@ def test_cross_field_rules(tmp_path):
 
 def test_secrets_from_file_not_environment(tmp_path):
     raw = example_raw()
-    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN='g1'\nSLACK_BOT_TOKEN=s1\n"))}
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN='g1'\n" + SLACK_HOOK))}
     cfg = load_config(write(tmp_path, raw))
     s = load_secrets(cfg, environ={})
-    assert (s.tracker, s.code_host, s.slack) == ("a1", "g1", "s1")
+    assert (s.tracker, s.code_host, s.slack, s.slack_webhook) == ("a1", "g1", None, HOOK)
     assert "a1" not in repr(s)
+    # The webhook URL is a secret, and so is its last part alone (error texts may quote a path).
+    assert HOOK in s.values() and "XXXXsecretXXXX" in s.values()
 
 
 def test_missing_secret_names_the_variable(tmp_path):
@@ -106,13 +111,45 @@ def test_missing_secret_names_the_variable(tmp_path):
         load_secrets(cfg, environ={})
     assert e.value.problems == [
         f"code_host.token_env: GITLAB_TOKEN is not set in {tmp_path / 'secrets.env'} or the environment",
-        f"slack.token_env: SLACK_BOT_TOKEN is not set in {tmp_path / 'secrets.env'} or the environment",
+        f"slack.webhook_env: SLACK_WEBHOOK_URL is not set in {tmp_path / 'secrets.env'} or the environment",
     ]
+
+
+def test_the_bot_token_is_needed_only_with_alerts_channel(tmp_path):
+    raw = example_raw()
+    raw["slack"] = {"alerts_channel": "#acme"}
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN=g1\n"))}
+    with pytest.raises(ConfigError, match="slack.token_env: SLACK_BOT_TOKEN is not set"):
+        load_secrets(load_config(write(tmp_path, raw)), environ={})
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN=g1\nSLACK_BOT_TOKEN=s1\n"))}
+    s = load_secrets(load_config(write(tmp_path, raw)), environ={})
+    assert (s.slack, s.slack_webhook) == ("s1", None)
+
+
+def test_slack_webhook_must_be_an_incoming_webhook(tmp_path):
+    raw = example_raw()
+    for url in ("https://hooks.slack.com/triggers/T0/1/abc", "http://hooks.slack.com/services/T0/B0/x",
+                "https://example.com/services/T0/B0/x"):
+        raw["paths"] = {"secrets": str(write_secrets(tmp_path, f"YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_WEBHOOK_URL={url}\n"))}
+        with pytest.raises(ConfigError) as e:
+            load_secrets(load_config(write(tmp_path, raw)), environ={})
+        assert "is not a Slack incoming webhook" in str(e.value)
+        assert url not in str(e.value)  # the URL is the credential: never on a terminal
+
+
+def test_slack_section_needs_a_webhook_or_a_channel_and_member_ids(tmp_path):
+    raw = example_raw()
+    raw["slack"] = {"people": {}}
+    with pytest.raises(ConfigError, match="needs webhook_env"):
+        load_config(write(tmp_path, raw))
+    raw["slack"] = {"webhook_env": "SLACK_WEBHOOK_URL", "people": {"j.doe": "jdoe"}}
+    with pytest.raises(ConfigError, match="Slack member IDs look like U0123ABCD"):
+        load_config(write(tmp_path, raw))
 
 
 def test_world_readable_secrets_rejected(tmp_path):
     raw = example_raw()
-    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_BOT_TOKEN=c\n",
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\n" + SLACK_HOOK,
                                                  mode=0o644))}
     cfg = load_config(write(tmp_path, raw))
     with pytest.raises(ConfigError, match="permissions are 644, must be 600"):
@@ -123,7 +160,7 @@ def test_live_mode_is_refused_without_the_engine_contract(tmp_path, capsys):
     raw = example_raw()
     raw["mode"] = "live"
     raw["paths"] = {"bulava": str(tmp_path / "no-engine")}
-    raw["paths"]["secrets"] = str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_BOT_TOKEN=c\n"))
+    raw["paths"]["secrets"] = str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\n" + SLACK_HOOK))
     path = write(tmp_path, raw)
 
     assert main(["--config", str(path), "check", "--offline"]) == EXIT_CHECK_FAILED
@@ -137,14 +174,14 @@ def test_live_mode_is_refused_without_the_engine_contract(tmp_path, capsys):
 
 def test_offline_check_passes_on_example(tmp_path):
     raw = example_raw()
-    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_BOT_TOKEN=c\n"))}
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\n" + SLACK_HOOK))}
     assert main(["--config", str(write(tmp_path, raw)), "check", "--offline"]) == EXIT_OK
 
 
 def test_token_variable_names_need_no_config(tmp_path):
     raw = example_raw()
     assert "token_env" not in raw["tracker"] and "token_env" not in raw["code_host"]
-    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN=g1\nSLACK_BOT_TOKEN=s1\n"))}
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YOUTRACK_TOKEN=a1\nGITLAB_TOKEN=g1\n" + SLACK_HOOK))}
     cfg = load_config(write(tmp_path, raw))
     assert (cfg.tracker.token_env, cfg.code_host.token_env, cfg.slack.token_env) == (
         "YOUTRACK_TOKEN", "GITLAB_TOKEN", "SLACK_BOT_TOKEN")
@@ -154,7 +191,7 @@ def test_token_variable_names_need_no_config(tmp_path):
 def test_an_older_config_naming_token_env_still_loads(tmp_path):
     raw = example_raw()
     raw["tracker"]["token_env"] = "YT_BOT"
-    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YT_BOT=a1\nGITLAB_TOKEN=g1\nSLACK_BOT_TOKEN=s1\n"))}
+    raw["paths"] = {"secrets": str(write_secrets(tmp_path, "YT_BOT=a1\nGITLAB_TOKEN=g1\n" + SLACK_HOOK))}
     assert load_secrets(load_config(write(tmp_path, raw)), environ={}).tracker == "a1"
 
 

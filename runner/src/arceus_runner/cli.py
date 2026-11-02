@@ -1,4 +1,4 @@
-"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind."""
+"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind | slack-test."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from arceus_runner.health import claude_checks, engine_doctor, local_checks
 from arceus_runner.events import EventLog
 from arceus_runner.integrations import build_code_host, build_tracker
 from arceus_runner.loop import IntegrationChanged, LiveModeUnavailable, make_cleanup, require_mode_ready, run
+from arceus_runner.notify import test_message, webhook_state
+from arceus_runner.slack import Webhook
 
 EXIT_OK = 0
 EXIT_CHECK_FAILED = 1
@@ -119,7 +121,29 @@ def cmd_doctor(args) -> int:
         engine = Engine(cfg)
         engine.refresh_usage()
         checks += engine_doctor(engine)
+    if cfg.slack and cfg.slack.webhook_env and cfg.paths.db.exists():
+        store = ReviewStore.read_only(cfg.paths.db)
+        try:
+            state = webhook_state(store)
+        finally:
+            store.close()
+        checks += [state] if state else []
     return EXIT_OK if _print_checks(checks, args.json) else EXIT_CHECK_FAILED
+
+
+def cmd_slack_test(args) -> int:
+    """One message to the project's channel now: the webhook works, and it is the channel meant."""
+    cfg, secrets = _load(args)
+    if not (cfg.slack and cfg.slack.webhook_env and secrets.slack_webhook):
+        print("config: no slack.webhook_env in config.yaml", file=sys.stderr)
+        return EXIT_CONFIG
+    hook = Webhook(secrets.slack_webhook, cfg.http)
+    try:
+        said = test_message(hook, cfg.project)
+    finally:
+        hook.close()
+    print(f"slack: {said}")
+    return EXIT_OK if said == "posted" else EXIT_CHECK_FAILED
 
 
 def cmd_engine_env(args) -> int:
@@ -351,6 +375,9 @@ def build_parser() -> argparse.ArgumentParser:
                                        "(the same one under a new address; stop the runner first)")
     rb.add_argument("role", choices=["tracker", "code_host"])
     rb.set_defaults(fn=cmd_rebind)
+
+    st = sub.add_parser("slack-test", help="post one test message to the project's channel through the webhook")
+    st.set_defaults(fn=cmd_slack_test)
 
     b = sub.add_parser("probe-bulava", help="which agreed contracts the installed engine advertises")
     b.add_argument("--root", help="engine directory (default: paths.bulava from config)")

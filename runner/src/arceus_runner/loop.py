@@ -38,6 +38,8 @@ from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git, write_git_credentials
 from arceus_runner.health import engine_doctor, local_checks
 from arceus_runner.metrics import Metrics
+from arceus_runner import notify
+from arceus_runner.notify import Notifier
 from arceus_runner.progress import ProgressWatcher
 from arceus_runner.screening import ClaudeClassifier, Classify, classifier_env
 from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError, TransientError
@@ -105,8 +107,10 @@ class Runner:
         metrics: Metrics | None = None,
         classify: Classify | None = None,
         cleanup: Cleanup | None = None,
+        notifier: Notifier | None = None,
     ):
         self.cfg = cfg
+        self.notifier = notifier  # the project's Slack channel (notify.py), when config.yaml has a webhook
         self.metrics = metrics
         self.bulava_commit = ""
         self.store = store
@@ -142,6 +146,8 @@ class Runner:
                 self.events.emit("health_changed", check=c.name, status_from=before, status_to=c.status,
                                  detail=c.detail)
             self.health[c.name] = c.status
+            if self.notifier:
+                self.notifier.health(c)
 
     def _service_failed(self, client: ServiceClient, err: ServiceError) -> None:
         if isinstance(err, AuthError):
@@ -166,7 +172,9 @@ class Runner:
             self._doctor = engine_doctor(self.engine)
             self.next_due["doctor"] = self.mono() + DOCTOR_EVERY
         screening = self.delivery.gate.health() if self.delivery else None
-        self._record_health(checks + getattr(self, "_doctor", []) + ([screening] if screening else []))
+        sender = self.notifier.sender if self.notifier else None
+        self._record_health(checks + getattr(self, "_doctor", []) + ([screening] if screening else [])
+                            + ([sender.check()] if sender else []))
 
     def poll_code_host(self) -> None:
         # The code host as a health signal: reachable, token accepted, and (hourly) not about to expire.
@@ -303,6 +311,12 @@ class Runner:
                 self.progress.poll()
             finally:
                 self.next_due["progress"] = self.mono() + self.cfg.schedule.poll_progress.total_seconds()
+        if self.notifier:
+            try:
+                self.notifier.tick(self.situation(),
+                                   queue_known=self.health.get(f"service.{self.tracker.client.name}") == "ok")
+            except Exception as e:  # telling must never stop the loop it tells about
+                self.events.emit("slack_notify_failed", error=f"{type(e).__name__}: {e}")
         self.last_tick = self.now().timestamp()
         if self.metrics:
             self.metrics.update(self)
@@ -334,6 +348,21 @@ class Runner:
         """New work only when nothing is failing and both the tracker and the code host answer."""
         return (all(s != "fail" for s in self.health.values())
                 and self.tracker.client.available() and self.code_host.client.available())
+
+    def situation(self) -> str:
+        """For the channel: working, waiting (on people), idle, unknown (the queue cannot be read, or health keeps
+        new work out: not idle, whatever it looks like) or observe."""
+        if not self.delivery:
+            return "observe"
+        if self._holder() or self.delivery._continues_waiting():
+            return "working"
+        if self.health.get(f"service.{self.tracker.client.name}") != "ok" or not self.can_take():
+            return "unknown"
+        if any(not self.delivery.skipped(d) for d in self.store.accepted_untaken()) or self.reviewer.waiting():
+            return "working"  # taken on this tick or the next
+        if self.store.tasks("needs_input", "security_hold"):
+            return "waiting"
+        return "idle"
 
     def seconds_to_next(self) -> float:
         due = [t for k, t in self.next_due.items() if k not in ("doctor", "token")]  # ride on other polls
@@ -382,8 +411,15 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         cleanup = make_cleanup(cfg, store, events, engine) if cfg.cleanup.enabled else None
         if cleanup:
             cleanup.recover()
+        notifier = None
+        if cfg.slack and cfg.slack.webhook_env and secrets.slack_webhook:
+            # Before runner_started is emitted: the channel hears the start. Its sender stops after
+            # runner_stopped is emitted (callbacks run last first), so the stop goes out too.
+            notifier = notify.build(cfg, store, events, secrets.slack_webhook, tracker.issue_url)
+            notifier.sender.start()
+            stack.callback(notifier.sender.close)
         runner = Runner(cfg, store, events, tracker, host, engine=engine, git=git, metrics=metrics,
-                        classify=classify, cleanup=cleanup)
+                        classify=classify, cleanup=cleanup, notifier=notifier)
 
         def _stop(signum, _frame):
             stop.set()
