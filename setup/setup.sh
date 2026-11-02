@@ -51,6 +51,7 @@ RUN_USER="${SUDO_USER:-$REPO_OWNER}"
 : "${CLAUDE_CODE_VERSION:?set CLAUDE_CODE_VERSION in setup.conf}"
 : "${CODEX_VERSION:?set CODEX_VERSION in setup.conf}"
 : "${CHROME_DEVTOOLS_MCP_VERSION:?set CHROME_DEVTOOLS_MCP_VERSION in setup.conf}"
+: "${WORKSPACE_MCP_VERSION:=}"
 : "${BULAVA_SOURCE:=}"
 : "${BULAVA_REF:=}"
 
@@ -71,6 +72,10 @@ TOOLS=/opt/agent-tools
 RUNNER_OPT=/opt/arceus-runner
 BULAVA_DIR=/opt/bulava
 MCP_CONFIG=/opt/bulava-local/mcp.json
+# Google Sheets, Docs and Drive for the agent, read-only (workspace-mcp): its own venv under TOOLS, and the
+# service account's key, put there by hand, in GOOGLE_DIR.
+GOOGLE_MCP="$TOOLS/workspace-mcp"
+GOOGLE_DIR="$DATA_DIR/google"
 CLAUDE_POLICY=/etc/claude-code/managed-settings.json
 UNIT=/etc/systemd/system/runner.service
 ENGINE_UNIT=/etc/systemd/system/bulava-engine.service
@@ -239,7 +244,11 @@ check_agent_tools() {
   local b; for b in claude codex chrome-devtools-mcp; do
     [ "$(readlink "/usr/local/bin/$b")" = "$TOOLS/bin/$b" ] || return 1
   done
+  [ -z "$WORKSPACE_MCP_VERSION" ] || [ "$(installed_workspace_mcp)" = "$WORKSPACE_MCP_VERSION" ] || return 1
   [ -z "$(find "$TOOLS" -perm -o+w -not -type l -print -quit)" ] && [ "$(stat -c %U "$TOOLS")" = root ]
+}
+installed_workspace_mcp() {
+  "$GOOGLE_MCP/bin/python" -I -c 'import importlib.metadata as m; print(m.version("workspace-mcp"))' 2>/dev/null || true
 }
 apply_agent_tools() {
   # Root-owned prefix: the workers can run these tools but not replace them by accident.
@@ -248,11 +257,30 @@ apply_agent_tools() {
   npm install --global --prefix "$TOOLS" --no-fund --no-audit "${pkgs[@]}"
   chown -R root:root "$TOOLS"; chmod -R go-w "$TOOLS"
   local b; for b in claude codex chrome-devtools-mcp; do ln -sfn "$TOOLS/bin/$b" "/usr/local/bin/$b"; done
+  if [ -n "$WORKSPACE_MCP_VERSION" ]; then
+    rm -rf "$GOOGLE_MCP"   # a clean venv: pip would otherwise keep whatever an older version pulled in
+    python3 -m venv "$GOOGLE_MCP"
+    "$GOOGLE_MCP/bin/pip" install --quiet --disable-pip-version-check "workspace-mcp==$WORKSPACE_MCP_VERSION"
+    chown -R root:root "$GOOGLE_MCP"; chmod -R go-w "$GOOGLE_MCP"
+  fi
 }
 
+# The agent gets Google once the server is installed and a service account's key is in GOOGLE_DIR. The account reads
+# what is shared with its address, the key does not expire, and the server acts as the account itself
+# (USER_GOOGLE_EMAIL is its own address; no domain-wide delegation).
 mcp_json() {
-  jq -n --arg cmd "$TOOLS/bin/chrome-devtools-mcp" \
-    '{mcpServers: {browser: {command: $cmd, args: ["--headless", "--isolated", "--no-usage-statistics", "--executablePath", "/usr/bin/google-chrome-stable"]}}}'
+  local google=null key="$GOOGLE_DIR/service-account.json" who
+  if [ -n "$WORKSPACE_MCP_VERSION" ] && [ -f "$key" ]; then
+    who="$(jq -r 'select(.type == "service_account") | .client_email // empty' "$key" 2>/dev/null)"
+    # Called inside $(...): a die here would only end the subshell, and an empty mcp.json would be written.
+    [ -n "$who" ] && google="$(jq -n --arg cmd "$GOOGLE_MCP/bin/workspace-mcp" --arg key "$key" --arg who "$who" \
+      '{command: $cmd, args: ["--read-only", "--tools", "sheets", "docs", "drive", "--disabled-tools", "start_google_auth"],
+        env: {GOOGLE_SERVICE_ACCOUNT_KEY_FILE: $key, USER_GOOGLE_EMAIL: $who}}')"
+    [ -n "$who" ] || printf '%s is not a service account key (type service_account, client_email): no Google\n' "$key" >&2
+  fi
+  jq -n --arg cmd "$TOOLS/bin/chrome-devtools-mcp" --argjson google "$google" \
+    '{mcpServers: ({browser: {command: $cmd, args: ["--headless", "--isolated", "--no-usage-statistics", "--executablePath", "/usr/bin/google-chrome-stable"]}}
+                   + (if $google then {google: $google} else {} end))}'
 }
 check_mcp_config() { same_file "$MCP_CONFIG" "$(mcp_json)" 644 root:root; }
 apply_mcp_config() { put_file "$MCP_CONFIG" 644 root:root "$(mcp_json)" || true; }
@@ -260,13 +288,15 @@ apply_mcp_config() { put_file "$MCP_CONFIG" 644 root:root "$(mcp_json)" || true;
 check_dirs() {
   [ "$(stat -c '%U' "$ARCEUS_HOME" 2>/dev/null)" = "$RUN_USER" ] \
     && [ "$(stat -c '%U' "$WORKSPACE" 2>/dev/null)" = "$RUN_USER" ] \
-    && [ "$(stat -c '%U %a' "$DATA_DIR" 2>/dev/null)" = "$RUN_USER 700" ]
+    && [ "$(stat -c '%U %a' "$DATA_DIR" 2>/dev/null)" = "$RUN_USER 700" ] \
+    && [ "$(stat -c '%U %a' "$GOOGLE_DIR" 2>/dev/null)" = "$RUN_USER 700" ]
 }
 apply_dirs() {
   [ -d "$ARCEUS_HOME" ] || install -d -m 755 -o "$RUN_USER" -g "$RUN_GROUP" "$ARCEUS_HOME"
   chown "$RUN_USER:$RUN_GROUP" "$ARCEUS_HOME"
   [ -d "$WORKSPACE" ] || install -d -m 755 -o "$RUN_USER" -g "$RUN_GROUP" "$WORKSPACE"
   install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR"
+  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$GOOGLE_DIR"
 }
 
 bulava_wanted() { [ -n "$BULAVA_SOURCE" ]; }
@@ -475,7 +505,8 @@ engine_env_lines() {
     "Environment=SUPERVISOR_CODEX_UNAVAILABLE=fail" \
     "Environment=SUPERVISOR_CODEX_UNAVAILABLE_AFTER_HOURS=3" \
     "Environment=SUPERVISOR_AUTOMATION_MCP_CONFIG=$MCP_CONFIG" \
-    "Environment=\"SUPERVISOR_SERVER_EXTRA_SECRET_PATHS=$DATA_DIR/secrets.env $DATA_DIR/bulava.env $DATA_DIR/runner.db $DATA_DIR/runner.lock\"" \
+    "Environment=SUPERVISOR_ALLOW_TOOLS=google" \
+    "Environment=\"SUPERVISOR_SERVER_EXTRA_SECRET_PATHS=$DATA_DIR/secrets.env $DATA_DIR/bulava.env $DATA_DIR/runner.db $DATA_DIR/runner.lock $GOOGLE_DIR\"" \
     "Environment=PATH=$RUN_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
   engine_check_lines
 }
@@ -662,7 +693,7 @@ write_facts() {
     --arg node "$(version_of node --version)" --arg npm "$(version_of npm --version)" \
     --arg chrome "$(version_of google-chrome-stable --version)" \
     --arg claude "$(installed_npm_version @anthropic-ai/claude-code)" --arg codex "$(installed_npm_version @openai/codex)" \
-    --arg mcp "$(installed_npm_version chrome-devtools-mcp)" \
+    --arg mcp "$(installed_npm_version chrome-devtools-mcp)" --arg google_mcp "$(installed_workspace_mcp)" \
     --arg runner "$(version_of "$RUNNER_OPT/venv/bin/arceus-runner" --version)" \
     --arg bulava_version "$(cat "$ENGINE/.engine-version" 2>/dev/null || true)" \
     --arg bulava_source "$(engine_stamp)" \
@@ -670,7 +701,7 @@ write_facts() {
     --argjson phases "$status_json" \
     '{written_at: $at, os: $os, kernel: $kernel, arch: $arch, systemd: $systemd, python: $python,
       docker: $docker, compose: $compose, node: $node, npm: $npm, chrome: $chrome,
-      claude_code: $claude, codex: $codex, chrome_devtools_mcp: $mcp, runner: $runner,
+      claude_code: $claude, codex: $codex, chrome_devtools_mcp: $mcp, workspace_mcp: $google_mcp, runner: $runner,
       bulava: {engine_version: $bulava_version, source: $bulava_source},
       run_as: {user: $user, sudo: $sudo, docker_group: true,
                trust_boundary: "vm: workers run as this user and can read the runner tokens; Bulava server-profile denies are a second line, not isolation"},

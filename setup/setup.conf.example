@@ -9,6 +9,8 @@
 CLAUDE_CODE_VERSION=2.1.316
 CODEX_VERSION=0.166.0
 CHROME_DEVTOOLS_MCP_VERSION=1.10.1   # must match Bulava's engine/supervisor/automation-mcp.json
+# Google Sheets, Docs and Drive for the agent, read-only (README, "Google documents"). Empty: no Google.
+WORKSPACE_MCP_VERSION=2.3.0
 
 # Bulava engine (engine/SERVER.md), installed to /opt/bulava. Empty BULAVA_SOURCE skips it.
 # BULAVA_REF: a full commit (Bulava rewrites its branches; setup keeps every installed commit in

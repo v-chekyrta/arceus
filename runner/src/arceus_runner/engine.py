@@ -51,6 +51,16 @@ def _require(clearance: Clearance, text: str, task_id: str) -> None:
         raise NotScreened(f"{task_id}: the text for the agent has no security clearance")
 
 
+def google_key(mcp_config: Path | None) -> Path | None:
+    """The service account key of the agent's `google` MCP server (setup.sh puts it into mcp.json), None when the
+    agent has no Google."""
+    try:
+        env = json.loads(mcp_config.read_text())["mcpServers"]["google"]["env"]
+        return Path(env["GOOGLE_SERVICE_ACCOUNT_KEY_FILE"])
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def parse_reply(rc: int, stdout: str, stderr: str) -> Reply:
     tier = None
     data: dict = {}
@@ -90,6 +100,9 @@ class Engine:
         }
         if b.mcp_config:
             env["SUPERVISOR_AUTOMATION_MCP_CONFIG"] = str(b.mcp_config)
+        if google_key(b.mcp_config):
+            # A run with nobody there is refused an MCP server not named here, at its first call.
+            env["SUPERVISOR_ALLOW_TOOLS"] = "google"
         env["SUPERVISOR_STATE_DIR"] = str(self.cfg.paths.bulava_state)
         # config.yaml is the only place the models are chosen: never ~/.config/night-shift/config.json,
         # which the engine would otherwise let outrank a choice equal to its own default.
@@ -132,7 +145,8 @@ class Engine:
 
     def secret_paths(self) -> list[Path]:
         p = self.cfg.paths
-        return [p.secrets, p.bulava_env, p.db, p.db.with_suffix(".lock")]
+        key = google_key(self.cfg.bulava.mcp_config)  # the Google MCP server reads it, the agent's tools never
+        return [p.secrets, p.bulava_env, p.db, p.db.with_suffix(".lock"), *([key.parent] if key else [])]
 
     def _run(self, args: list[str], cwd: Path | None = None, timeout: int = TIMEOUT,
              extra_dirs: Path | None = None) -> subprocess.CompletedProcess:

@@ -34,15 +34,15 @@ Setup never overwrites `data/config.yaml`, `secrets.env`, `bulava.env` or `proje
 
 | Path | Owner | What it is |
 |---|---|---|
-| `/opt/agent-tools` | root, read-only | `claude`, `codex` and `chrome-devtools-mcp` at pinned versions, linked from `/usr/local/bin` |
+| `/opt/agent-tools` | root, read-only | `claude`, `codex` and `chrome-devtools-mcp` at pinned versions, linked from `/usr/local/bin`; `workspace-mcp/`, the Google MCP server in a virtualenv of its own |
 | `/opt/arceus-runner` | root, read-only | the runner's code and virtualenv |
 | `/opt/bulava/engine` | root, read-only | the Bulava engine at `BULAVA_REF`: a full commit (the default), a tag or a branch the server follows (for example `factory`). A new commit is installed by the next `sudo ./setup.sh`, never while a task runs. The engine's `install.sh` runs as the user and writes to their `~/.claude` (worker hooks, status line) and `~/.local/bin` |
 | `/var/lib/arceus/bulava.git` | root | a mirror of the Bulava repository that keeps every commit setup installed (`refs/arceus/<commit>`), so a pinned commit stays installable after Bulava rewrites its branches |
-| `/opt/bulava-local/mcp.json` | root | the headless browser for Bulava (`SUPERVISOR_AUTOMATION_MCP_CONFIG`), without `npx` |
+| `/opt/bulava-local/mcp.json` | root | the MCP servers of the agent's sessions (`SUPERVISOR_AUTOMATION_MCP_CONFIG`): the headless browser without `npx`, and `google` once a service account's key is in place |
 | `/opt/arceus-observability` | root | the Docker Compose stack for Grafana, Prometheus, Loki, Alloy and node_exporter |
 | `/etc/systemd/system/bulava-engine.service` | root | the tmux server the workers run in (`tmux -L bulava`). Installed; the operator starts it, and setup keeps a running one enabled for reboots |
 | `/etc/systemd/system/runner.service` | root | the runner. `KillMode=process`: restarting it does not kill the engine's watchdogs. Installed; the operator starts it, and setup keeps a running one enabled for reboots |
-| `~/arceus/data/` | the user, 700 | `config.yaml`, `secrets.env` (600), `runner.db`, `events.jsonl`, `grafana-admin-password` |
+| `~/arceus/data/` | the user, 700 | `config.yaml`, `secrets.env` (600), `runner.db`, `events.jsonl`, `grafana-admin-password`; `google/` (700): the Google service account's key |
 | `~/.git-credentials` | the user, 600 | the code host bot's credentials, for that host only; written by the runner at start |
 | `/var/lib/arceus/facts.json` | root | what is actually installed: OS, versions, the user, the status of each phase |
 
@@ -150,6 +150,22 @@ The settings are under `slack.notify` in [config.example.yaml](../config/config.
 Messages go through `runner.db` and a thread of their own, so the loop never waits for Slack and a Slack outage stops no work: they wait and go out when Slack answers again, Slack's `Retry-After` respected, at most one a second. A question or reminder whose task has moved on before it went out is dropped. A transition is told from the task's state in `runner.db`, so one that happened just before a crash is told after the restart. A message whose post timed out may be posted twice; each carries a number (`#123`) to tell. Routine messages not delivered in 2 hours are dropped. A webhook Slack refuses (revoked, channel archived) shows as a `WARN` `slack.webhook` line in `doctor` and on the dashboards and never stops new tasks; replace the URL and restart.
 
 A runner that is not running cannot say so. The next start says how long it was down, and a working day without the morning status means it is not running; an alert on `runner_last_tick_seconds` in Grafana catches it sooner.
+
+## Google documents
+
+Teams often keep the requirements outside the ticket. The description may be only a link to a row of a planning sheet. That row's cells hold the definition of done and the tech notes, and a link inside a cell leads on to the client's specification in a Google Doc. The agent reads these itself through a Google MCP server, [workspace-mcp](https://pypi.org/project/workspace-mcp/) at `WORKSPACE_MCP_VERSION` from `setup.conf`. It is an agent that reads them, not the runner, because only an agent can tell which part of a free-form sheet or document the ticket means and which links to follow.
+
+- **The account:** a Google service account. Its key is `~/arceus/data/google/service-account.json`, and the server acts as the account itself (`USER_GOOGLE_EMAIL` is its own address; no domain-wide delegation). It reads only what is shared with its address (`…@….iam.gserviceaccount.com`, view is enough), so every document the agent needs has to be shared with it, the client's included. The key does not expire.
+- **What the agent can do:** the server runs with `--read-only --tools sheets docs drive`: sheet values with each cell's links and notes, a doc as Markdown, Drive search and files. It cannot start a sign-in of its own (`start_google_auth` is disabled).
+- **Permissions:** an unattended run may call the server (`SUPERVISOR_ALLOW_TOOLS=google`, set by both the runner and the engine unit). `~/arceus/data/google` is one of the server's secret paths, so the agent's own tools do not read the key. The server process reads it, running as the same user.
+- **What is not checked:** what the documents say is not screened. They are the client's words.
+
+To set it up:
+
+1. In the Google Cloud project of the service account, enable the Google Sheets API, the Google Docs API and the Google Drive API. Reading a doc as Markdown uses both Docs and Drive. A disabled API answers 403 "has not been used in project".
+2. Put the key at `~/arceus/data/google/service-account.json` (`chmod 600`) and run `sudo ./setup.sh`. It installs the server and adds `google` to `mcp.json`. Restart `bulava-engine` and `runner` between tasks.
+3. Share the project's planning sheet and specifications with the account's address.
+4. Tell the agent how the project keeps its documents in `project-notes.md`: which account to ask for sharing, and that a link set on a cell shows only when `read_sheet_values` is called with `include_hyperlinks`.
 
 ## Starting
 
