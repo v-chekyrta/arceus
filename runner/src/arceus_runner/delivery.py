@@ -245,6 +245,13 @@ def comments_section(comments: list[Comment]) -> str:
     return "\n".join(lines)
 
 
+def parent_section(parent: IssueDetails) -> str:
+    """The parent ticket's words, for a subtask that has none of its own (Delivery._parent)."""
+    return "\n".join([f"## The parent ticket {parent.key}: {parent.summary}", "",
+                      "This ticket has no description of its own. It is a subtask of the ticket below, and what it "
+                      "asks is there:", "", parent.description.strip() or "(the parent has no description either)"])
+
+
 class Delivery:
     def __init__(self, cfg: Config, store: TaskStore, events: EventLog, tracker: IssueTracker, host: CodeHost,
                  engine: Engine, git: Git, classify: Classify, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
@@ -390,8 +397,11 @@ class Delivery:
         # A held ticket is not claimed: it stays in the queue state, its workspace untouched.
         # The comments and the files people attached are part of what the ticket asks: screened with it, in one go.
         comments = self._people_comments(task)
+        parent = self._parent(details)
         files = self.ticket_files(task, None, comments)
         text = f"{task.task_id}: {details.summary}\n\n{details.description}".strip()
+        if parent:
+            text += "\n\n" + parent_section(parent)
         if comments:
             text += "\n\n" + comments_section(comments)
         brief = research_brief(self.answer_file(task, self.research_run(task))) if task.research else ""
@@ -402,7 +412,7 @@ class Delivery:
             text, files = materials.with_section(text, files, self._files_folder(task), texts, after=brief)
         elif brief:
             text += "\n\n" + brief
-        authors = [task.tag_author, *details.writers, *(x.author for x in comments),
+        authors = [task.tag_author, *details.writers, *(parent.writers if parent else ()), *(x.author for x in comments),
                    *(m.attachment.author for m in files)]
         clearance = self.gate.clear(task, "ticket", text, authors=authors, resume_state="claimed",
                                     files=materials.screen_files(files))
@@ -426,6 +436,16 @@ class Delivery:
         return [x for x in self.tracker.comments(task.issue_db_id) if x.author != bot and not is_decision(x.text)
                 and x.text.strip().lower() != CONTINUE
                 and not (self.reviewer and self.reviewer.claims(task.task_id, x))]
+
+    def _parent(self, details: IssueDetails) -> IssueDetails | None:
+        """The ticket this one is a subtask of, when this one has no description: a "Development" subtask of a
+        feature says nothing itself, and what it asks is in its parent."""
+        if details.description.strip() or not details.parent:
+            return None
+        try:
+            return self.tracker.issue(details.parent)
+        except NotFound:
+            return None
 
     def _files_folder(self, task: Task) -> Path:
         return materials.folder(self.cfg.paths.workspace.resolve(), task.task_id)

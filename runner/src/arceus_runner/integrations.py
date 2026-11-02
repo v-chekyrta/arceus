@@ -90,6 +90,7 @@ class IssueDetails:
     description: str
     state: str                      # the tracker's name of the issue's state now ("" when it has none)
     writers: tuple[str, ...] = ()   # who reported it and who changed it last: the text may be theirs
+    parent: str = ""                # the key of the ticket this one is a subtask of ("" when none)
 
 
 @dataclass(frozen=True)
