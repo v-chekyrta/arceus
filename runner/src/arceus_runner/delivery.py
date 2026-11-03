@@ -65,6 +65,7 @@ STALLED_NUDGE = ("Your previous session stopped at its prompt without finishing 
 RESUME = "The session was interrupted (a reboot or a crash). Continue the task from where you stopped."
 PREPARED_MARK = "arceus-prepared"
 CONTINUE = "/continue"  # a comment that starts with this, from someone allowed, resumes a failed task (_continuable)
+TAKEN = "eyes"  # the reaction on a command the runner took: the person sees it was seen and will be done
 HOME_IGNORE = """\
 # Every folder here is a repository of the project's group on its code host, cloned by the Arceus runner.
 # This repository holds only the runner's notes for the agent and is never published.
@@ -273,6 +274,12 @@ class Delivery:
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
         self.reviewer = None  # code_review.ReviewAgent, set by the loop: its runs hold the workspace too
 
+    def taken(self, task: Task, comment_id: str) -> None:
+        """Mark a person's command the runner has just taken with a reaction, so they see it is queued. Journaled
+        with the change that takes it (call it inside that transaction); retry_pending() puts it there."""
+        self.store.action_intent(f"{task.task_id}:react:{key_part(comment_id, keep_dash=True)}", task.task_id,
+                                 "react", json.dumps({"comment": comment_id, "reaction": TAKEN}))
+
     # -- comments: once per (task, kind), even across a crash -----------------------------------
 
     def comment_once(self, task: Task, kind: str, text: str) -> tuple[str, int] | None:
@@ -322,6 +329,14 @@ class Delivery:
                     self.store.action_done(key)
                 elif kind == "reply" and getattr(self, "review", None):
                     self.review.retry_reply(task, key, data)
+                elif kind == "react":
+                    if react := getattr(self.tracker, "react", None):
+                        try:
+                            react(task.issue_db_id, data["comment"], data["reaction"])
+                        except (NotFound, BadRequest) as e:  # the comment is gone, or the tracker refuses it
+                            self.events.emit("reaction_refused", task_id=task_id, comment=data["comment"],
+                                             reason=str(e))
+                    self.store.action_done(key)
             except ServiceError as e:
                 self.events.emit("notify_pending", task_id=task_id, action=key, reason=str(e))
                 return  # the tracker is still unwell; the next tick tries again
@@ -1366,10 +1381,13 @@ class Delivery:
                 key = f"{task.task_id}:continue:{key_part(x.id, keep_dash=True)}"
                 if self.store.action(key):
                     continue  # this one was handled (or is waiting to be)
-                self.store.action_intent(key, task.task_id, "continue", json.dumps(
-                    {"comment": x.id, "author": x.author, "created": x.created,
-                     "text": x.text.strip()[len(CONTINUE):].strip()}))
+                with self.store.transaction():
+                    self.store.action_intent(key, task.task_id, "continue", json.dumps(
+                        {"comment": x.id, "author": x.author, "created": x.created,
+                         "text": x.text.strip()[len(CONTINUE):].strip()}))
+                    self.taken(task, x.id)
                 self.events.emit("continue_requested", task_id=task.task_id, author=x.author, comment=x.id)
+                self.retry_pending()
                 break  # one request per failure: the next failure sets a new boundary
 
     def send_continue(self) -> None:

@@ -20,6 +20,7 @@ from arceus_runner.gitops import GitAuth
 from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError
 from arceus_runner.integrations import (
     Approval,
+    CIJob,
     CIStatus,
     CodeHostType,
     FailedJob,
@@ -169,6 +170,10 @@ class GitLabReview(GitLabWriter):
                 for j in self.paged(f"/api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs",
                                     {"scope[]": "failed"})]
 
+    def ci_jobs(self, project_id: int, pipeline_id: int) -> list[CIJob]:
+        return [CIJob(j.get("name") or "", j.get("status") or "", j.get("web_url") or "")
+                for j in self.paged(f"/api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs")]
+
     def job_trace_tail(self, project_id: int, job_id: int, limit: int = 3000) -> str:
         text = self.c.request("GET", f"/api/v4/projects/{project_id}/jobs/{job_id}/trace").text
         return text[-limit:]
@@ -304,6 +309,9 @@ class GitLabHost:
 
     def failed_jobs(self, repo_id: Id, ci_id: Id) -> list[FailedJob]:
         return self.api.failed_jobs(repo_id, ci_id)
+
+    def ci_jobs(self, repo_id: Id, ci_id: Id) -> list[CIJob]:
+        return self.api.ci_jobs(repo_id, ci_id)
 
     def job_log_tail(self, repo_id: Id, job_id: Id, limit: int) -> str:
         return self.api.job_trace_tail(repo_id, job_id, limit)

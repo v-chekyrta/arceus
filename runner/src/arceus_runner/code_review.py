@@ -53,6 +53,7 @@ the result nor posts it twice.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -255,6 +256,7 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             "build": e.get("build") if e.get("build") in BUILD else "not_run",
             "tests": e.get("tests") if e.get("tests") in TESTS else "not_run",
             "checked": _clean(e.get("checked"), 800),
+            "unsure_because": _clean(e.get("unsure_because"), 800),
             "findings": findings[:MAX_ITEMS],
             "attention": attention[:MAX_ITEMS],
             "deploy": deploy[:MAX_ITEMS],
@@ -533,9 +535,13 @@ class ReviewAgent:
                                                  f"{c.states.code_review}; it is in {state or 'no state'}. "
                                                  f"Move it there and write `{self.rc.command}` again.")
         if refusal is None:
-            row = self.store.add_review(task.task_id, x.id, x.author, x.created, asked)
+            with self.store.transaction():
+                row = self.store.add_review(task.task_id, x.id, x.author, x.created, asked)
+                if row:
+                    self.d.taken(task, x.id)
             if row:
                 self.events.emit("review_requested", task_id=task.task_id, review=row.id, author=x.author)
+                self.d.retry_pending()
             return
         with self.store.transaction():
             row = self.store.add_review(task.task_id, x.id, x.author, x.created, asked, state="refused",
@@ -1005,26 +1011,40 @@ class ReviewAgent:
             v = found.get(m["label"])
             risky = self._always_attention(m["files"])
             reasons: list[str] = []
+            # What the reviewer could not run here, CI ran on the reviewed commit: those jobs count instead.
+            in_ci: dict[str, list[str]] = {}
+            if v is not None and st.state == "opened":
+                for what, patterns in (("build", self.rc.ci_build_jobs), ("tests", self.rc.ci_test_jobs)):
+                    if v[what] != "not_run" or not patterns:
+                        continue
+                    jobs = self._ci_jobs(st, m, patterns)
+                    if jobs is None and can_wait:
+                        return None  # those jobs are still running on the reviewed commit: decided on a later tick
+                    if jobs:
+                        in_ci[what] = jobs
+            build = "passed" if "build" in in_ci else v and v["build"]
+            tests = "passed" if "tests" in in_ci else v and v["tests"]
             if st.state != "opened":
                 kind = "closed"
             elif v is None:
                 kind = "unverified"
                 reasons.append("the reviewer left no verdict for it")
-            elif v["verdict"] == "changes" or v["requirements_met"] is False or v["build"] == "failed" \
-                    or v["tests"] == "failed" or any(f["severity"] == "blocker" for f in v["findings"]):
+            elif v["verdict"] == "changes" or v["requirements_met"] is False or build == "failed" \
+                    or tests == "failed" or any(f["severity"] == "blocker" for f in v["findings"]):
                 kind = "changes"
                 reasons += v.get("doubts", [])
-            elif v["verdict"] == "unsure" or v["requirements_met"] is None or v["build"] != "passed" \
-                    or v["tests"] not in ("passed", "none", "failed_before"):
+            elif v["verdict"] == "unsure" or v["requirements_met"] is None or build != "passed" \
+                    or tests not in ("passed", "none", "failed_before"):
                 kind = "unverified"
                 if v["verdict"] == "unsure":
-                    reasons.append("the reviewer could not tell whether it is right")
+                    reasons.append(v["unsure_because"] or "the reviewer could not tell whether it is right, and did "
+                                                           "not say why")
                 if v["requirements_met"] is None:
                     reasons.append("the reviewer did not say whether it meets the ticket")
-                if v["build"] != "passed":
-                    reasons.append("the build was not run")
-                if v["tests"] not in ("passed", "none", "failed_before"):
-                    reasons.append("the tests were not run")
+                if build != "passed":
+                    reasons.append(self._not_run("build", self.rc.ci_build_jobs))
+                if tests not in ("passed", "none", "failed_before"):
+                    reasons.append(self._not_run("tests", self.rc.ci_test_jobs))
             elif fatal or v.get("doubts"):
                 # A verdict written before the run hung or stopped to ask, or one the runner could not read
                 # whole, is not a pass.
@@ -1050,9 +1070,37 @@ class ReviewAgent:
                     reasons.append(f"Arceus has no approver account on {self.host.label}, so it cannot approve")
             mrs.append({k: m[k] for k in ("label", "repo", "project_id", "iid", "url", "sha", "target")} | {
                 "kind": kind, "approve": kind == "ready" and not reasons and self.enabled, "reasons": reasons,
-                "risky": risky, "ci": ci, "verdict": v})
+                "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci})
         return {"off": not self.enabled, "mrs": mrs, "summary": verdict.get("summary") or "",
                 "problems": verdict.get("problems") or []}
+
+    def _ci_jobs(self, st: MRStatus, m: dict, patterns: list[str]) -> list[str] | None:
+        """The jobs of the reviewed commit's CI run that match `patterns`, when there is one and all of them
+        succeeded; [] when they do not count (no run for that commit, no match, one failed or was skipped); None
+        while one of them is still running."""
+        if st.ci_id is None or st.ci_sha != m["sha"]:
+            return []
+        jobs = [j for j in self.host.ci_jobs(m["project_id"], st.ci_id)
+                if any(fnmatch.fnmatchcase(j.name, p) for p in patterns)]
+        if any(j.status in ("created", "waiting_for_resource", "preparing", "pending", "running", "scheduled")
+               for j in jobs):
+            return None
+        return [j.name for j in jobs] if jobs and all(j.status == "success" for j in jobs) else []
+
+    def _ci_hint(self) -> str:
+        jobs = [f"{what} {', '.join(f'`{p}`' for p in patterns)}" for what, patterns in
+                (("the build", self.rc.ci_build_jobs), ("the tests", self.rc.ci_test_jobs)) if patterns]
+        if not jobs:
+            return ""
+        return (" For what you could not run, the runner counts these jobs of the reviewed commit's CI run instead: "
+                + "; ".join(jobs) + ". Still report only what you saw yourself.")
+
+    @staticmethod
+    def _not_run(what: str, patterns: list[str]) -> str:
+        said = f"the {what} {'was' if what == 'build' else 'were'} not run"
+        if not patterns:
+            return said
+        return f"{said}, and no CI job of the reviewed commit matching {', '.join(f'`{p}`' for p in patterns)} passed"
 
     @staticmethod
     def _ci(st, sha: str) -> str:
@@ -1244,9 +1292,11 @@ class ReviewAgent:
         lines = [head, "", f"Reviewed at commit `{mr['sha'][:12]}` against {task.task_id}, {why}.", ""]
         if v:
             met = {True: "met", False: "not met", None: "not judged"}[v["requirements_met"]]
+            in_ci = mr.get("in_ci") or {}
+            ran = {w: f"passed in CI ({', '.join(in_ci[w])})" for w in in_ci}
             lines += [f"- Requirements of the ticket: {met}",
-                      f"- Build: {v['build'].replace('_', ' ')}",
-                      f"- Tests: {TEST_WORDS.get(v['tests'], v['tests'].replace('_', ' '))}"]
+                      f"- Build: {ran.get('build') or v['build'].replace('_', ' ')}",
+                      f"- Tests: {ran.get('tests') or TEST_WORDS.get(v['tests'], v['tests'].replace('_', ' '))}"]
             if v["checked"]:
                 lines.append(f"- What was run: {v['checked']}")
         lines += [f"- CI: {self._ci_words(mr['ci'])}", ""]
@@ -1380,7 +1430,9 @@ class ReviewAgent:
                   "those fail there too and the change adds no failure of its own, that is \"failed_before\": not a "
                   "blocker, say in `checked` which ones and that they fail on the target branch as well. A test the "
                   "change breaks, or one it was meant to fix and did not, is \"failed\". Never report a result you "
-                  "did not see.",
+                  "did not see. A build or tests you could not run are \"not_run\" and by themselves no reason for "
+                  "\"unsure\": judge the code as you would otherwise, and the runner decides what an unrun build or "
+                  "unrun tests mean for the merge." + self._ci_hint(),
                   "3. What a person has to decide before merge, and what whoever deploys it has to know. `attention` "
                   "stops the merge until a person looks, so it holds only a decision you cannot settle yourself by "
                   "reading and running the code:",
@@ -1423,9 +1475,12 @@ class ReviewAgent:
                   "## Your verdict", "",
                   f"Write it to {self._verdict_file(row)} as JSON, one entry per merge request:", "", "```json",
                   SCHEMA_EXAMPLE, "```", "",
-                  "- `verdict`: \"ready\" (meets the ticket, builds, tests pass or fail only as they did before, no "
-                  "blocker), \"changes\" (at least one "
-                  "blocker), or \"unsure\" (you could not tell).",
+                  "- `verdict`: \"ready\" (meets the ticket, no blocker, and the build and tests you could run "
+                  "passed or fail only as they did before), \"changes\" (at least one "
+                  "blocker), or \"unsure\" (reading the code, you could not tell whether it is right).",
+                  "- `unsure_because`: with \"unsure\", what you could not tell and why, in a sentence a person can "
+                  "check (\"whether the retry is safe: it depends on the payment provider's idempotency, which is "
+                  "not in the repository\"); it is the reason the note gives.",
                   "- `requirements_met`: true or false. `build` (passed, failed, not_run) and `tests` (passed, failed, "
                   "failed_before, not_run, none): what you saw yourself.",
                   "- `checked`: the commands you ran and what they showed, in a line or two.",

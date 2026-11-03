@@ -63,6 +63,9 @@ def test_continue_resumes_the_same_task_once(w):
     for _ in range(3):
         w.tick()
     assert len(sends(w)) == 1  # never twice, across restarts and polls
+    # The person sees it was taken: one reaction of the bot on their comment, not one per poll.
+    [asked] = [c for c in w.yt.comments["2-1"] if c["text"].startswith("/continue")]
+    assert w.yt.reactions[asked["id"]] == [{"reaction": "eyes", "author": {"login": w.yt.login}}]
 
 
 def test_only_a_new_continue_from_someone_allowed_counts(w):
@@ -76,6 +79,7 @@ def test_only_a_new_continue_from_someone_allowed_counts(w):
     for _ in range(3):
         w.tick()
     assert sends(w) == [] and w.store.task("ACME-1").state == "failed"
+    assert w.yt.reactions == {}                                                 # none of them was taken
     w.yt.comment("2-1", "a.smith", "/CONTINUE")
     w.tick()
     w.tick()

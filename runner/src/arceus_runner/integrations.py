@@ -121,7 +121,8 @@ class IssueTracker(Protocol):
     Required: everything below. A tracker that cannot say who queued an issue (trigger) cannot be
     used: that answer is the authorization of the whole run. Optional: reading attachments
     (reads_attachments False or missing: the agent works from the ticket's text and comments only);
-    in_state (missing: the code review answers only on tickets whose merge requests the runner opened).
+    in_state (missing: the code review answers only on tickets whose merge requests the runner opened);
+    react (missing: a command the runner took gets no reaction, only what follows from it).
     """
 
     name: str            # the service in health checks, metrics and events: "youtrack"
@@ -153,6 +154,9 @@ class IssueTracker(Protocol):
     def in_state(self, state: str) -> list[Issue]:
         """Every issue of the project in this state, with when it last changed. Optional: the code review uses it
         to find requests on tickets people worked on, so it reads comments only where something changed."""
+
+    def react(self, db_id: str, comment_id: str, reaction: str) -> None:
+        """Put the bot's reaction on a comment, once: a second call for the same one changes nothing. Optional."""
 
     def tags(self, db_id: str) -> set[str]: ...
 
@@ -277,6 +281,14 @@ class FailedJob:
     url: str
 
 
+@dataclass(frozen=True)
+class CIJob:
+    """One job of a CI run, its latest attempt."""
+    name: str
+    status: str  # as the host says it: success, failed, running, manual, skipped, …
+    url: str
+
+
 class CodeHost(Protocol):
     """Where the repositories live: merge requests, their discussions and CI.
 
@@ -284,6 +296,8 @@ class CodeHost(Protocol):
     without them:
     - CI: mr_status without ci_* fields; failed CI is then never a signal to the agent.
     - Logs of failed jobs: failed_jobs() returning [] (the agent gets the run's link only).
+    - Jobs of a CI run: ci_jobs() returning []; the review agent's `ci_build_jobs`/`ci_test_jobs` then count for
+      nothing and only what the reviewer ran itself counts.
     - Conflict detection: conflict=None; the agent learns of a conflict from people instead.
     - Threads: reply() posting a plain comment on the merge request; it carries the same marker.
     - Uploads: supports_uploads False; screenshots go to the ticket only.
@@ -325,6 +339,8 @@ class CodeHost(Protocol):
         """The text addresses the bot the way the host writes a mention: only such a note asks the agent."""
 
     def failed_jobs(self, repo_id: Id, ci_id: Id) -> list[FailedJob]: ...
+
+    def ci_jobs(self, repo_id: Id, ci_id: Id) -> list[CIJob]: ...
 
     def job_log_tail(self, repo_id: Id, job_id: Id, limit: int) -> str: ...
 

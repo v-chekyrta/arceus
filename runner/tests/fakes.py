@@ -28,6 +28,7 @@ class FakeYouTrack:
         self.attachments: dict[str, list[tuple[str, bytes]]] = {}  # comment id -> (file name, content)
         self.files: dict[str, list[dict]] = {}  # issue db id -> every attachment as /attachments lists it, with "data"
         self.prefix = ""  # the installation's path, as YouTrack puts it into an attachment's url ("/youtrack")
+        self.reactions: dict[str, list[dict]] = {}  # comment id -> reactions as YouTrack lists them
 
     def attach(self, db_id: str, author: str, name: str, data: bytes, comment_id: str | None = None, *,
                mime: str = "", size: int | None = None, **extra) -> str:
@@ -74,6 +75,14 @@ class FakeYouTrack:
                 self.comment(db_id, self.login, json.loads(request.content)["text"])
                 c = self.comments[db_id][-1]
                 return json_response({"id": c["id"], "created": c["created"]})
+            if len(rest) == 3 and rest[0] == "comments" and rest[2] == "reactions":
+                if not any(c["id"] == rest[1] for c in self.comments.get(db_id, [])):
+                    return json_response({"error": "Not Found"}, 404)
+                if method == "GET":
+                    return json_response(self._page(self.reactions.get(rest[1], []), request))
+                self.reactions.setdefault(rest[1], []).append(
+                    {"reaction": json.loads(request.content)["reaction"], "author": {"login": self.login}})
+                return json_response({"id": f"r-{len(self.reactions[rest[1]])}"})
             if len(rest) == 3 and rest[0] == "comments" and rest[2] == "attachments" and method == "POST":
                 name, data = _multipart_file(request)
                 self.attachments.setdefault(rest[1], []).append((name, data))
@@ -275,7 +284,10 @@ class FakeGitLab:
                 return json_response({"id": self._note}, 201)
         if "pipelines" in parts and parts[-1] == "jobs":
             page = int(request.url.params.get("page", 1))
-            return json_response(self.jobs.get(int(parts[-2]), []) if page == 1 else [], headers={"x-next-page": ""})
+            jobs = self.jobs.get(int(parts[-2]), [])
+            if scope := request.url.params.get_list("scope[]"):
+                jobs = [j for j in jobs if j.get("status", "failed") in scope]
+            return json_response(jobs if page == 1 else [], headers={"x-next-page": ""})
         if "jobs" in parts and parts[-1] == "trace":
             return httpx.Response(200, text=self.traces.get(int(parts[-2]), ""))
         if path.endswith("/uploads") and request.method == "POST":

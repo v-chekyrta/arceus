@@ -19,6 +19,7 @@ from arceus_runner.config import CodeHostConfig, HttpConfig, IssueTrackerConfig
 from arceus_runner.gitops import GitAuth
 from arceus_runner.http import ServiceClient, TransientError
 from arceus_runner.integrations import (
+    CIJob,
     CodeHostType,
     Comment,
     FailedJob,
@@ -284,6 +285,9 @@ class MemoryHost:
 
     def failed_jobs(self, repo_id, ci_id) -> list[FailedJob]:
         return []  # no job logs on this host: the agent gets the run's link
+
+    def ci_jobs(self, repo_id, ci_id) -> list[CIJob]:
+        return []  # no jobs on this host: only what the reviewer ran counts
 
     def job_log_tail(self, repo_id, job_id, limit: int) -> str:
         raise AssertionError("no jobs were listed")

@@ -151,6 +151,9 @@ def test_a_request_starts_one_review_task_and_never_reaches_the_author(w):
     later(w)
     assert sends(w) == [] and len(reviews(w)) == 1          # nothing to the author, one review only
     assert w.store.task("ACME-1").state == "code_review"
+    # The person sees the request was taken: one reaction of the bot on it, however many polls follow.
+    [asked] = [c for c in w.yt.comments["2-1"] if c["text"].startswith("/review")]
+    assert w.yt.reactions == {asked["id"]: [{"reaction": "eyes", "author": {"login": w.yt.login}}]}
 
 
 def test_a_review_cut_off_by_a_reboot_goes_on_and_is_not_taken_for_a_verdict(w):
@@ -517,6 +520,89 @@ def test_an_unproven_build_is_not_a_pass(w):
     assert w.gl.mrs[0].get("approved_by", []) == [] and w.store.review(RID).outcome == "unverified"
 
 
+def ci_world(tmp_path, *jobs: tuple[str, str]) -> World:
+    """Build and tests counted from CI: a run on the reviewed commit with these (name, status) jobs."""
+    w = world(tmp_path, ci_build_jobs=["build-test"], ci_test_jobs=["pytest", "pytest-*"])
+    publish(w)
+    w.gl.jobs[90] = [{"id": 900 + i, "name": name, "stage": "test", "status": status, "web_url": f"https://gl/j/{i}"}
+                     for i, (name, status) in enumerate(jobs)]
+    return w
+
+
+def test_ci_jobs_stand_for_a_build_and_tests_the_reviewer_could_not_run(tmp_path):
+    w = ci_world(tmp_path, ("build-test", "success"), ("pytest", "success"), ("pytest-cms", "success"),
+                 ("quality", "failed"))
+    ask(w)
+    prompt = reviews(w)[0]["argv"][-1]
+    assert "the build `build-test`; the tests `pytest`, `pytest-*`" in prompt
+    assert 'by themselves no reason for "unsure"' in prompt
+    write_verdict(w, build="not_run", tests="not_run", checked="pytest not run: the test image is private")
+    finish(w)
+    [note] = review_notes(w)
+    assert "- Build: passed in CI (build-test)" in note and "- Tests: passed in CI (pytest, pytest-cms)" in note
+    assert "pytest not run: the test image is private" in note       # what the reviewer itself ran, as it said
+    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"] and w.store.review(RID).outcome == "approved"
+
+
+@pytest.mark.parametrize("jobs", [
+    [("build-test", "success"), ("pytest", "success"), ("pytest-cms", "failed")],
+    [("build-test", "success"), ("pytest", "manual")],
+    [("build-test", "success"), ("lint", "success")],
+], ids=["one-failed", "not-run-in-ci", "no-such-job"])
+def test_ci_jobs_count_only_when_every_one_of_them_passed(tmp_path, jobs):
+    w = ci_world(tmp_path, *jobs)
+    ask(w)
+    write_verdict(w, build="not_run", tests="not_run")
+    finish(w)
+    [note] = review_notes(w)
+    assert "- Build: passed in CI (build-test)" in note and "- Tests: not run" in note
+    assert "the tests were not run, and no CI job of the reviewed commit matching `pytest`, `pytest-*` passed" in note
+    assert approve_calls(w) == [] and w.store.review(RID).outcome == "unverified"
+
+
+def test_ci_jobs_still_running_are_waited_for(tmp_path):
+    w = ci_world(tmp_path, ("build-test", "success"), ("pytest", "running"))
+    ask(w)
+    write_verdict(w, build="not_run", tests="not_run")
+    finish(w)
+    assert review_notes(w) == [] and w.store.review(RID).state == "publishing"
+    w.gl.jobs[90][1]["status"] = "success"
+    w.tick()
+    [note] = review_notes(w)
+    assert "- Tests: passed in CI (pytest)" in note and w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
+
+
+def test_ci_jobs_of_another_commit_and_what_the_reviewer_saw_fail_do_not_count(tmp_path):
+    w = ci_world(tmp_path, ("build-test", "success"), ("pytest", "success"))
+    w.gl.mrs[0]["head_pipeline"]["sha"] = "0" * 40
+    ask(w)
+    write_verdict(w, build="not_run", tests="not_run")
+    finish(w)
+    [note] = review_notes(w)
+    assert "- Build: not run" in note and approve_calls(w) == []
+    w2 = ci_world(tmp_path / "2", ("build-test", "success"), ("pytest", "success"))
+    ask(w2)
+    write_verdict(w2, tests="failed")
+    finish(w2)
+    [note] = review_notes(w2)
+    assert "changes are needed" in note and "- Tests: failed" in note and approve_calls(w2) == []
+
+
+def test_an_unsure_reviewer_gives_its_own_reason(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, verdict="unsure", unsure_because="whether the retry is safe: it depends on the provider")
+    finish(w)
+    [note] = review_notes(w)
+    assert "- whether the retry is safe: it depends on the provider" in note
+    assert "could not tell whether it is right" not in note and approve_calls(w) == []
+    w.yt.comment("2-1", "j.doe", "/review")
+    w.tick()
+    write_verdict(w, "ACME-1.review-2", verdict="unsure")
+    finish(w, "ACME-1.review-2")
+    assert "the reviewer could not tell whether it is right, and did not say why" in review_notes(w)[-1]
+
+
 def test_a_push_during_the_review_makes_its_approval_stale(w):
     publish(w)
     branch = w.store.task("ACME-1").branch
@@ -638,6 +724,26 @@ def test_the_mention_form_asks_the_reviewer_and_other_mentions_ask_the_author(w)
     assert "please rename the function" in send["argv"][-1] and "mostly the migration" not in send["argv"][-1]
 
 
+def test_a_reaction_the_tracker_refuses_does_not_hold_up_the_review(w):
+    publish(w)
+    w.yt.fail_once[("POST", "/api/issues/2-1/comments/c-{}/reactions".format(w.yt.clock + 1))] = 400
+    ask(w)
+    assert len(reviews(w)) == 1 and w.events_named("reaction_refused")
+    later(w)
+    assert all(kind != "react" for _, _, kind, _ in w.store.pending_actions()) and w.yt.reactions == {}
+
+
+def test_a_reaction_lost_to_a_tracker_outage_is_put_there_once_it_is_back(w):
+    publish(w)
+    w.yt.fail_once[("POST", "/api/issues/2-1/comments/c-{}/reactions".format(w.yt.clock + 1))] = 503
+    ask(w)
+    assert w.yt.reactions == {} and w.events_named("notify_pending")
+    later(w, timedelta(minutes=5))                           # the tracker answers again
+    [asked] = [c for c in w.yt.comments["2-1"] if c["text"] == "/review"]
+    assert w.yt.reactions == {asked["id"]: [{"reaction": "eyes", "author": {"login": w.yt.login}}]}
+    assert len(reviews(w)) == 1
+
+
 def test_who_may_ask_and_when(w):
     publish(w)
     ask(w, "/review", author="mallory")
@@ -645,7 +751,7 @@ def test_who_may_ask_and_when(w):
     w.yt.issue_fields["2-1"]["State"] = {"name": "In Progress"}
     ask(w)
     assert reviews(w) == [] and any("only while the ticket is in Code Review" in t for t in w.bot_comments())
-    assert sends(w) == []
+    assert sends(w) == [] and w.yt.reactions == {}            # refused: the answer says why, no reaction
 
 
 def test_a_request_while_the_author_fixes_the_mr_is_answered_at_once_and_never_run_later(w):

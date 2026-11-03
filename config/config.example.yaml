@@ -172,6 +172,11 @@ review_agent:
   max_suggestions: 5                   # non-blocking ideas per MR
   max_per_ticket: 10
   fix_rounds: 3                        # review -> author fixes -> review again, unasked; 0: people pass findings on
+  # CI jobs that stand for the build and the tests when the reviewer cannot run them itself (they need a private
+  # image or a service): names in the CI run of the reviewed commit, * and ? allowed. They count when one matches
+  # and every match succeeded. Empty: only what the reviewer ran counts.
+  # ci_build_jobs: ["build-test"]
+  # ci_test_jobs: ["pytest", "pytest-*"]
   # attention_paths: changed files a person is always asked to look at, whatever the reviewer says. The default
   # (config.py, ATTENTION_PATHS) is the security boundary and secrets: auth, permission, crypt, secret, .env;
   # ordinary test files and docs are left out of it. A list set here replaces it and applies to tests too.

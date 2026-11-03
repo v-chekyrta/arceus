@@ -202,6 +202,13 @@ class YouTrackWriter(YouTrack):
         self.c.request("POST", f"/api/issues/{quote(issue_id)}/comments/{quote(comment_id)}/attachments",
                        params={"fields": "id,name"}, files={"file": (name, data, mime)}, timeout=UPLOAD_TIMEOUT)
 
+    def react(self, issue_id: str, comment_id: str, reaction: str, bot: str) -> None:
+        path = f"/api/issues/{quote(issue_id)}/comments/{quote(comment_id)}/reactions"
+        if any(r.get("reaction") == reaction and (r.get("author") or {}).get("login") == bot
+               for r in self.paged(path, {"fields": "reaction,author(login)"})):
+            return  # put there before a crash or a failure: one is enough
+        self.c.request("POST", path, params={"fields": "id"}, json={"reaction": reaction})
+
     def set_state(self, issue_id: str, field: str, state: str) -> None:
         self.c.request("POST", f"/api/issues/{quote(issue_id)}", params={"fields": "id"}, json={
             "customFields": [{"name": field, "$type": "StateIssueCustomField", "value": {"name": state}}]})
@@ -307,6 +314,9 @@ class YouTrackTracker:
 
     def attachments(self, db_id: str) -> list[Attachment]:
         return self.api.attachments(db_id)
+
+    def react(self, db_id: str, comment_id: str, reaction: str) -> None:
+        self.api.react(db_id, comment_id, reaction, self.cfg.bot_user)
 
     def download(self, attachment: Attachment, limit: int) -> bytes:
         return self.client.download(self.file_path(attachment.ref), what=f"GET attachment {attachment.id}",

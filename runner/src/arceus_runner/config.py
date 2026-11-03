@@ -475,12 +475,25 @@ class ReviewAgentConfig(Strict):
     # pushed new commits the runner reviews them again, without anyone asking. This many times per ticket;
     # after that a person takes over. 0: findings only go back when a person passes them on.
     fix_rounds: int = Field(default=3, ge=0, le=10)
+    # Jobs of the reviewed commit's CI run that stand for the build and the tests when the reviewer cannot run them
+    # itself (a private image, a service it cannot reach): job names, `*` and `?` allowed. They count when at least one
+    # job of the run matches and every matching job succeeded; the note names them. Empty: only what the reviewer
+    # ran counts.
+    ci_build_jobs: list[str] = []
+    ci_test_jobs: list[str] = []
 
     @field_validator("command")
     @classmethod
     def _command(cls, v: str) -> str:
         if v in ("/continue", "/security-allow", "/security-reject"):
             raise ValueError(f"{v} is already a command of the runner")
+        return v
+
+    @field_validator("ci_build_jobs", "ci_test_jobs")
+    @classmethod
+    def _jobs(cls, v: list[str]) -> list[str]:
+        if any(not p.strip() for p in v):
+            raise ValueError("job names: no empty ones")
         return v
 
     @field_validator("attention_paths", "review_hint_paths")
