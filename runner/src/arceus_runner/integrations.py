@@ -296,8 +296,8 @@ class CodeHost(Protocol):
     without them:
     - CI: mr_status without ci_* fields; failed CI is then never a signal to the agent.
     - Logs of failed jobs: failed_jobs() returning [] (the agent gets the run's link only).
-    - Jobs of a CI run: ci_jobs() returning []; the review agent's `ci_build_jobs`/`ci_test_jobs` then count for
-      nothing and only what the reviewer ran itself counts.
+    - Jobs of a CI run: ci_jobs() returning []; the CI jobs of `review_agent.repos` then count for nothing and only
+      what the reviewer ran itself counts.
     - Conflict detection: conflict=None; the agent learns of a conflict from people instead.
     - Threads: reply() posting a plain comment on the merge request; it carries the same marker.
     - Uploads: supports_uploads False; screenshots go to the ticket only.

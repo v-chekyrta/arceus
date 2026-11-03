@@ -61,7 +61,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from arceus_runner import materials
-from arceus_runner.config import DOC_PATHS, TEST_PATHS
+from arceus_runner.config import DOC_PATHS, TEST_PATHS, RepoChecks
 from arceus_runner.db import ACTIVE_STATES, REVIEW_UNDER_WAY, ReviewRequest, ReviewStore, Task
 from arceus_runner.delivery import ProjectNotesError
 from arceus_runner.engine import EngineError
@@ -93,8 +93,9 @@ BUILD = ("passed", "failed", "not_run")
 # failed_before: tests fail, and the same ones fail on the target branch without the change: not the MR's doing.
 TESTS = ("passed", "failed", "failed_before", "not_run", "none")
 # How the runner judges a verdict. A final review stands for its commits only under the rules it was judged by: after
-# a change of them (2: tests that failed before the change no longer stop it), the same commits may be reviewed again.
-RULES = 2
+# a change of them (2: tests that failed before the change no longer stop it; 3: each repository's build and tests are
+# judged by its own review_agent.repos), the same commits may be reviewed again.
+RULES = 3
 _MARKER = re.compile(r"<!--\s*arceus", re.IGNORECASE)
 _TRACKER_MARK = re.compile(r"\s*\[arceus:[^\]]*\]\s*$")
 _WORD = re.compile(r"[\w-]")
@@ -1011,10 +1012,11 @@ class ReviewAgent:
             v = found.get(m["label"])
             risky = self._always_attention(m["files"])
             reasons: list[str] = []
+            checks = self.rc.checks(m["repo"])
             # What the reviewer could not run here, CI ran on the reviewed commit: those jobs count instead.
             in_ci: dict[str, list[str]] = {}
             if v is not None and st.state == "opened":
-                for what, patterns in (("build", self.rc.ci_build_jobs), ("tests", self.rc.ci_test_jobs)):
+                for what, patterns in (("build", checks.ci_build_jobs), ("tests", checks.ci_test_jobs)):
                     if v[what] != "not_run" or not patterns:
                         continue
                     jobs = self._ci_jobs(st, m, patterns)
@@ -1024,6 +1026,11 @@ class ReviewAgent:
                         in_ci[what] = jobs
             build = "passed" if "build" in in_ci else v and v["build"]
             tests = "passed" if "tests" in in_ci else v and v["tests"]
+            # What the repository's rules do not ask for stops nothing when it was not run; seen failing, it still does.
+            not_needed = [w for w, need, got in (("build", checks.build, build), ("tests", checks.tests, tests))
+                          if need == "none" and got == "not_run"]
+            build_ok = build == "passed" or "build" in not_needed
+            tests_ok = tests in ("passed", "none", "failed_before") or "tests" in not_needed
             if st.state != "opened":
                 kind = "closed"
             elif v is None:
@@ -1033,18 +1040,17 @@ class ReviewAgent:
                     or tests == "failed" or any(f["severity"] == "blocker" for f in v["findings"]):
                 kind = "changes"
                 reasons += v.get("doubts", [])
-            elif v["verdict"] == "unsure" or v["requirements_met"] is None or build != "passed" \
-                    or tests not in ("passed", "none", "failed_before"):
+            elif v["verdict"] == "unsure" or v["requirements_met"] is None or not build_ok or not tests_ok:
                 kind = "unverified"
                 if v["verdict"] == "unsure":
                     reasons.append(v["unsure_because"] or "the reviewer could not tell whether it is right, and did "
                                                            "not say why")
                 if v["requirements_met"] is None:
                     reasons.append("the reviewer did not say whether it meets the ticket")
-                if build != "passed":
-                    reasons.append(self._not_run("build", self.rc.ci_build_jobs))
-                if tests not in ("passed", "none", "failed_before"):
-                    reasons.append(self._not_run("tests", self.rc.ci_test_jobs))
+                if not build_ok:
+                    reasons.append(self._not_run("build", checks.ci_build_jobs))
+                if not tests_ok:
+                    reasons.append(self._not_run("tests", checks.ci_test_jobs))
             elif fatal or v.get("doubts"):
                 # A verdict written before the run hung or stopped to ask, or one the runner could not read
                 # whole, is not a pass.
@@ -1070,7 +1076,7 @@ class ReviewAgent:
                     reasons.append(f"Arceus has no approver account on {self.host.label}, so it cannot approve")
             mrs.append({k: m[k] for k in ("label", "repo", "project_id", "iid", "url", "sha", "target")} | {
                 "kind": kind, "approve": kind == "ready" and not reasons and self.enabled, "reasons": reasons,
-                "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci})
+                "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci, "not_needed": not_needed})
         return {"off": not self.enabled, "mrs": mrs, "summary": verdict.get("summary") or "",
                 "problems": verdict.get("problems") or []}
 
@@ -1087,13 +1093,21 @@ class ReviewAgent:
             return None
         return [j.name for j in jobs] if jobs and all(j.status == "success" for j in jobs) else []
 
-    def _ci_hint(self) -> str:
+    @staticmethod
+    def _checks_hint(checks: RepoChecks) -> str:
+        """What this repository's rules (review_agent.repos) mean for the reviewer, or "" when they are the default."""
+        said = []
+        none = [w for w, need in (("no build", checks.build), ("none of its own tests", checks.tests))
+                if need == "none"]
+        if none:
+            said.append(f"For this repository the runner needs {' and '.join(none)}: what of them you do not run is "
+                        "\"not_run\" and stops nothing, what you run and see fail still does.")
         jobs = [f"{what} {', '.join(f'`{p}`' for p in patterns)}" for what, patterns in
-                (("the build", self.rc.ci_build_jobs), ("the tests", self.rc.ci_test_jobs)) if patterns]
-        if not jobs:
-            return ""
-        return (" For what you could not run, the runner counts these jobs of the reviewed commit's CI run instead: "
-                + "; ".join(jobs) + ". Still report only what you saw yourself.")
+                (("the build", checks.ci_build_jobs), ("the tests", checks.ci_test_jobs)) if patterns]
+        if jobs:
+            said.append("For what you could not run, the runner counts these jobs of the reviewed commit's CI run "
+                        "instead: " + "; ".join(jobs) + ".")
+        return " ".join(said) + " Still report only what you saw yourself." if said else ""
 
     @staticmethod
     def _not_run(what: str, patterns: list[str]) -> str:
@@ -1294,6 +1308,7 @@ class ReviewAgent:
             met = {True: "met", False: "not met", None: "not judged"}[v["requirements_met"]]
             in_ci = mr.get("in_ci") or {}
             ran = {w: f"passed in CI ({', '.join(in_ci[w])})" for w in in_ci}
+            ran |= {w: "not run, not needed for this repository" for w in mr.get("not_needed") or []}
             lines += [f"- Requirements of the ticket: {met}",
                       f"- Build: {ran.get('build') or v['build'].replace('_', ' ')}",
                       f"- Tests: {ran.get('tests') or TEST_WORDS.get(v['tests'], v['tests'].replace('_', ' '))}"]
@@ -1408,6 +1423,9 @@ class ReviewAgent:
                       f"Branch {m['source']} into {m['target']}, at commit {m['sha']}. In the workspace, "
                       f"`{ws / m['repo']}` is checked out at that commit; the change is "
                       f"`git diff origin/{m['target']}...HEAD` there ({len(m['files'])} files).", ""]
+            checks = self._checks_hint(self.rc.checks(m["repo"]))
+            if checks:
+                lines += [checks, ""]
             always = self._always_attention(m["files"])
             hints = [f for f in attention_matches(m["files"], self.rc.review_hint_paths) if f not in always]
             if always:
@@ -1432,7 +1450,7 @@ class ReviewAgent:
                   "change breaks, or one it was meant to fix and did not, is \"failed\". Never report a result you "
                   "did not see. A build or tests you could not run are \"not_run\" and by themselves no reason for "
                   "\"unsure\": judge the code as you would otherwise, and the runner decides what an unrun build or "
-                  "unrun tests mean for the merge." + self._ci_hint(),
+                  "unrun tests mean for the merge.",
                   "3. What a person has to decide before merge, and what whoever deploys it has to know. `attention` "
                   "stops the merge until a person looks, so it holds only a decision you cannot settle yourself by "
                   "reading and running the code:",

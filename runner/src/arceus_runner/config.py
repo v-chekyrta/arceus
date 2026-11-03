@@ -6,6 +6,7 @@ field name is caught at start instead of silently falling back to a default.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 from dataclasses import dataclass
@@ -55,6 +56,8 @@ _GONE = {
     "multi_repo_tasks": "every task can change any repository of the group now; remove this line",
     "default_repo": "a session no longer starts in one repository: it starts in the workspace folder, "
                     "and the agent picks the repositories the ticket needs; remove this line",
+    "ci_build_jobs": "CI jobs are set per repository now: move the list to review_agent.repos.<path>.ci_build_jobs",
+    "ci_test_jobs": "CI jobs are set per repository now: move the list to review_agent.repos.<path>.ci_test_jobs",
 }
 
 
@@ -456,6 +459,30 @@ TEST_PATHS = ["**/tests/**", "**/test/**", "**/__tests__/**", "**/e2e/**", "e2e/
 DOC_PATHS = ["*.md", "*.rst", "docs/**", "**/docs/**"]
 
 
+class RepoChecks(Strict):
+    """What a review needs to see of one repository's build and tests (review_agent.repos). The runner decides by
+    these, whatever the reviewer writes, so a repository's rules hold for every review of it."""
+    # none: nothing is built from the repository in a review (its image is built at deploy, it is configuration):
+    # a build the reviewer did not run then stops nothing. A build the reviewer saw fail still does.
+    build: Literal["required", "none"] = "required"
+    # none: the repository's own tests are not part of a review here (it has none, or another repository's tests
+    # exercise it): tests the reviewer did not run then stop nothing. Tests it saw fail still do.
+    tests: Literal["required", "none"] = "required"
+    # Jobs of the reviewed commit's CI run that stand for the build and the tests when the reviewer cannot run them
+    # itself (a private image, a service it cannot reach): job names, `*` and `?` allowed. They count when at least one
+    # job of the run matches and every matching job succeeded; the note names them. Empty: only what the reviewer
+    # ran counts.
+    ci_build_jobs: list[str] = []
+    ci_test_jobs: list[str] = []
+
+    @field_validator("ci_build_jobs", "ci_test_jobs")
+    @classmethod
+    def _jobs(cls, v: list[str]) -> list[str]:
+        if any(not p.strip() for p in v):
+            raise ValueError("job names: no empty ones")
+        return v
+
+
 class ReviewAgentConfig(Strict):
     """The review agent (code_review.py): a person writes `command` (or mentions the tracker bot and says
     `review`) on a ticket in Code Review, and a separate Bulava task reviews the task's open MRs against
@@ -475,12 +502,12 @@ class ReviewAgentConfig(Strict):
     # pushed new commits the runner reviews them again, without anyone asking. This many times per ticket;
     # after that a person takes over. 0: findings only go back when a person passes them on.
     fix_rounds: int = Field(default=3, ge=0, le=10)
-    # Jobs of the reviewed commit's CI run that stand for the build and the tests when the reviewer cannot run them
-    # itself (a private image, a service it cannot reach): job names, `*` and `?` allowed. They count when at least one
-    # job of the run matches and every matching job succeeded; the note names them. Empty: only what the reviewer
-    # ran counts.
-    ci_build_jobs: list[str] = []
-    ci_test_jobs: list[str] = []
+    # The build and tests each repository needs, by its path in the code host's group (`services/api`; `*` and `?`
+    # allowed, `services/*`). The exact path wins, then the first pattern in the order written; a repository none
+    # matches needs both, from the reviewer.
+    repos: dict[str, RepoChecks] = {}
+
+    _gone = _refuse_gone("review_agent")
 
     @field_validator("command")
     @classmethod
@@ -489,12 +516,18 @@ class ReviewAgentConfig(Strict):
             raise ValueError(f"{v} is already a command of the runner")
         return v
 
-    @field_validator("ci_build_jobs", "ci_test_jobs")
+    @field_validator("repos")
     @classmethod
-    def _jobs(cls, v: list[str]) -> list[str]:
-        if any(not p.strip() for p in v):
-            raise ValueError("job names: no empty ones")
+    def _repos(cls, v: dict[str, RepoChecks]) -> dict[str, RepoChecks]:
+        if any(not p.strip() or p != p.strip("/ ") for p in v):
+            raise ValueError("repositories: paths in the group, no empty ones, none starting or ending with /")
         return v
+
+    def checks(self, repo: str) -> RepoChecks:
+        """The rules for the repository at this path in the group."""
+        if repo in self.repos:
+            return self.repos[repo]
+        return next((c for p, c in self.repos.items() if fnmatch.fnmatchcase(repo, p)), RepoChecks())
 
     @field_validator("attention_paths", "review_hint_paths")
     @classmethod

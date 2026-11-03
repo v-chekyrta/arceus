@@ -522,7 +522,7 @@ def test_an_unproven_build_is_not_a_pass(w):
 
 def ci_world(tmp_path, *jobs: tuple[str, str]) -> World:
     """Build and tests counted from CI: a run on the reviewed commit with these (name, status) jobs."""
-    w = world(tmp_path, ci_build_jobs=["build-test"], ci_test_jobs=["pytest", "pytest-*"])
+    w = world(tmp_path, repos={"acme-*": {"ci_build_jobs": ["build"], "ci_test_jobs": ["pytest", "pytest-*"]}})
     publish(w)
     w.gl.jobs[90] = [{"id": 900 + i, "name": name, "stage": "test", "status": status, "web_url": f"https://gl/j/{i}"}
                      for i, (name, status) in enumerate(jobs)]
@@ -530,24 +530,24 @@ def ci_world(tmp_path, *jobs: tuple[str, str]) -> World:
 
 
 def test_ci_jobs_stand_for_a_build_and_tests_the_reviewer_could_not_run(tmp_path):
-    w = ci_world(tmp_path, ("build-test", "success"), ("pytest", "success"), ("pytest-cms", "success"),
+    w = ci_world(tmp_path, ("build", "success"), ("pytest", "success"), ("pytest-api", "success"),
                  ("quality", "failed"))
     ask(w)
     prompt = reviews(w)[0]["argv"][-1]
-    assert "the build `build-test`; the tests `pytest`, `pytest-*`" in prompt
+    assert "the build `build`; the tests `pytest`, `pytest-*`" in prompt
     assert 'by themselves no reason for "unsure"' in prompt
     write_verdict(w, build="not_run", tests="not_run", checked="pytest not run: the test image is private")
     finish(w)
     [note] = review_notes(w)
-    assert "- Build: passed in CI (build-test)" in note and "- Tests: passed in CI (pytest, pytest-cms)" in note
+    assert "- Build: passed in CI (build)" in note and "- Tests: passed in CI (pytest, pytest-api)" in note
     assert "pytest not run: the test image is private" in note       # what the reviewer itself ran, as it said
     assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"] and w.store.review(RID).outcome == "approved"
 
 
 @pytest.mark.parametrize("jobs", [
-    [("build-test", "success"), ("pytest", "success"), ("pytest-cms", "failed")],
-    [("build-test", "success"), ("pytest", "manual")],
-    [("build-test", "success"), ("lint", "success")],
+    [("build", "success"), ("pytest", "success"), ("pytest-api", "failed")],
+    [("build", "success"), ("pytest", "manual")],
+    [("build", "success"), ("lint", "success")],
 ], ids=["one-failed", "not-run-in-ci", "no-such-job"])
 def test_ci_jobs_count_only_when_every_one_of_them_passed(tmp_path, jobs):
     w = ci_world(tmp_path, *jobs)
@@ -555,13 +555,13 @@ def test_ci_jobs_count_only_when_every_one_of_them_passed(tmp_path, jobs):
     write_verdict(w, build="not_run", tests="not_run")
     finish(w)
     [note] = review_notes(w)
-    assert "- Build: passed in CI (build-test)" in note and "- Tests: not run" in note
+    assert "- Build: passed in CI (build)" in note and "- Tests: not run" in note
     assert "the tests were not run, and no CI job of the reviewed commit matching `pytest`, `pytest-*` passed" in note
     assert approve_calls(w) == [] and w.store.review(RID).outcome == "unverified"
 
 
 def test_ci_jobs_still_running_are_waited_for(tmp_path):
-    w = ci_world(tmp_path, ("build-test", "success"), ("pytest", "running"))
+    w = ci_world(tmp_path, ("build", "success"), ("pytest", "running"))
     ask(w)
     write_verdict(w, build="not_run", tests="not_run")
     finish(w)
@@ -573,19 +573,69 @@ def test_ci_jobs_still_running_are_waited_for(tmp_path):
 
 
 def test_ci_jobs_of_another_commit_and_what_the_reviewer_saw_fail_do_not_count(tmp_path):
-    w = ci_world(tmp_path, ("build-test", "success"), ("pytest", "success"))
+    w = ci_world(tmp_path, ("build", "success"), ("pytest", "success"))
     w.gl.mrs[0]["head_pipeline"]["sha"] = "0" * 40
     ask(w)
     write_verdict(w, build="not_run", tests="not_run")
     finish(w)
     [note] = review_notes(w)
     assert "- Build: not run" in note and approve_calls(w) == []
-    w2 = ci_world(tmp_path / "2", ("build-test", "success"), ("pytest", "success"))
+    w2 = ci_world(tmp_path / "2", ("build", "success"), ("pytest", "success"))
     ask(w2)
     write_verdict(w2, tests="failed")
     finish(w2)
     [note] = review_notes(w2)
     assert "changes are needed" in note and "- Tests: failed" in note and approve_calls(w2) == []
+
+
+def test_a_repository_with_no_rules_never_hears_of_another_ones_jobs(tmp_path):
+    w = world(tmp_path, repos={"acme-theme": {"ci_build_jobs": ["build"], "ci_test_jobs": ["pytest"]}})
+    publish(w)
+    ask(w)
+    assert "jobs of the reviewed commit's CI run" not in reviews(w)[0]["argv"][-1]
+    write_verdict(w, build="not_run", tests="not_run")
+    finish(w)
+    [note] = review_notes(w)
+    assert "- the build was not run\n" in note and "- the tests were not run\n" in note
+    assert "CI job" not in note and approve_calls(w) == []
+
+
+def test_a_build_the_repository_does_not_need_stops_nothing_unless_it_failed(tmp_path):
+    w = world(tmp_path, repos={"acme-platform": {"build": "none"}})
+    publish(w)
+    ask(w)
+    assert "For this repository the runner needs no build:" in reviews(w)[0]["argv"][-1]
+    write_verdict(w, build="not_run", checked="read the image recipe; it is built at deploy")
+    finish(w)
+    [note] = review_notes(w)
+    assert "- Build: not run, not needed for this repository" in note
+    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"] and w.store.review(RID).outcome == "approved"
+    w2 = world(tmp_path / "2", repos={"acme-platform": {"build": "none", "tests": "none"}})
+    publish(w2)
+    ask(w2)
+    assert "needs no build and none of its own tests:" in reviews(w2)[0]["argv"][-1]
+    write_verdict(w2, build="failed", tests="not_run")
+    finish(w2)
+    [note] = review_notes(w2)
+    assert "changes are needed" in note and "- Build: failed" in note and approve_calls(w2) == []
+    assert "- Tests: not run, not needed for this repository" in note
+
+
+def test_repository_rules_pick_the_exact_path_then_the_first_pattern():
+    raw = example_raw()
+    raw["review_agent"] = {"repos": {"services/*": {"build": "none"}, "*": {"tests": "none"},
+                                     "services/api": {"ci_test_jobs": ["pytest"]}}}
+    rc = Config.model_validate(raw).review_agent
+    plugin = rc.checks("services/api")
+    assert plugin.ci_test_jobs == ["pytest"] and plugin.build == "required"
+    assert rc.checks("services/worker").build == "none" and rc.checks("services/worker").tests == "required"
+    assert rc.checks("addons/billing").tests == "none"
+    assert Config.model_validate(example_raw()).review_agent.checks("x").build == "required"
+    for bad in ({"ci_build_jobs": ["build"]}, {"repos": {"/services": {}}}, {"repos": {"x": {"build": "maybe"}}},
+                {"repos": {"x": {"ci_test_jobs": [" "]}}}):
+        raw["review_agent"] = bad
+        with pytest.raises(ValueError, match="per repository|paths in the group|build|job names"):
+            Config.model_validate(raw)
 
 
 def test_an_unsure_reviewer_gives_its_own_reason(w):
