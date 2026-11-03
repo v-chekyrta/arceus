@@ -120,7 +120,8 @@ class IssueTracker(Protocol):
 
     Required: everything below. A tracker that cannot say who queued an issue (trigger) cannot be
     used: that answer is the authorization of the whole run. Optional: reading attachments
-    (reads_attachments False or missing: the agent works from the ticket's text and comments only).
+    (reads_attachments False or missing: the agent works from the ticket's text and comments only);
+    in_state (missing: the code review answers only on tickets whose merge requests the runner opened).
     """
 
     name: str            # the service in health checks, metrics and events: "youtrack"
@@ -148,6 +149,10 @@ class IssueTracker(Protocol):
         """
 
     def issue(self, key: str) -> IssueDetails: ...
+
+    def in_state(self, state: str) -> list[Issue]:
+        """Every issue of the project in this state, with when it last changed. Optional: the code review uses it
+        to find requests on tickets people worked on, so it reads comments only where something changed."""
 
     def tags(self, db_id: str) -> set[str]: ...
 
@@ -238,6 +243,7 @@ class MRStatus:
     ci_url: str | None = None
     closed_by: str = ""         # who closed it, when it is closed
     target: str = ""            # the branch it merges into ("" when the host does not say)
+    source: str = ""            # the branch it merges from, as the host names it (in a fork: the fork's)
 
 
 @dataclass(frozen=True)
@@ -283,6 +289,8 @@ class CodeHost(Protocol):
     - Uploads: supports_uploads False; screenshots go to the ticket only.
     - Approval: supports_approval False (no approver account, or a host without approvals); the review
       agent then says what it found in a note and approves nothing.
+    - Merge requests people opened: mr_link and mr_head_ref; without them the review agent reviews only the
+      merge requests the runner opened itself.
     """
 
     name: str          # the service in health checks, metrics and events: "gitlab"
@@ -348,6 +356,13 @@ class CodeHost(Protocol):
 
     def revoke(self, repo_id: Id, iid: Id) -> bool:
         """Take the approver's approval back, if it is there. True when one was taken back."""
+
+    def mr_link(self, url: str, repos: list[Repo]) -> tuple[Repo, Id] | None:
+        """The repository (one of `repos`) and the number of the merge request a link points at, or None when it
+        is not a merge request of this host's scope. Optional (see above)."""
+
+    def mr_head_ref(self, iid: Id) -> str:
+        """The ref in the target repository that holds a merge request's head, also one from a fork. Optional."""
 
     def upload(self, repo_id: Id, name: str, data: bytes, mime: str) -> str:
         """Store a file for the merge request's description; returns the URL Markdown links to."""

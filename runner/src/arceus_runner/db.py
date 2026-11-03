@@ -524,6 +524,52 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 18: a ticket people worked on, whose merge requests a person asked the review agent to review (code_review.py):
+    # kind `review`. The runner wrote none of its code; it only reviews it. SQLite cannot change a CHECK, so the
+    # table is rebuilt as it is.
+    """
+    CREATE TABLE tasks_v18 (
+        task_id          TEXT PRIMARY KEY,
+        issue_db_id      TEXT NOT NULL,
+        state            TEXT NOT NULL,
+        summary          TEXT NOT NULL DEFAULT '',
+        tag_author       TEXT NOT NULL,
+        repo             TEXT NOT NULL,
+        repo_path        TEXT NOT NULL,
+        branch           TEXT NOT NULL,
+        base_branch      TEXT NOT NULL,
+        question_id      TEXT,
+        question_at_ms   INTEGER,
+        reason           TEXT,
+        mr_urls          TEXT NOT NULL DEFAULT '[]',
+        attempt_started  TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        extra_repos      TEXT NOT NULL DEFAULT '[]',
+        review_rounds    INTEGER NOT NULL DEFAULT 0,
+        ci_attempts      INTEGER NOT NULL DEFAULT 0,
+        published_at_ms  INTEGER,
+        failed_at_ms     INTEGER,
+        review_answers   INTEGER NOT NULL DEFAULT 0,
+        kind             TEXT NOT NULL DEFAULT 'code' CHECK (kind IN ('code', 'research', 'review')),
+        question         TEXT
+    );
+    INSERT INTO tasks_v18 (task_id, issue_db_id, state, summary, tag_author, repo, repo_path, branch, base_branch,
+                           question_id, question_at_ms, reason, mr_urls, attempt_started, created_at, updated_at,
+                           extra_repos, review_rounds, ci_attempts, published_at_ms, failed_at_ms, review_answers,
+                           kind, question)
+        SELECT task_id, issue_db_id, state, summary, tag_author, repo, repo_path, branch, base_branch,
+               question_id, question_at_ms, reason, mr_urls, attempt_started, created_at, updated_at,
+               extra_repos, review_rounds, ci_attempts, published_at_ms, failed_at_ms, review_answers,
+               kind, question FROM tasks;
+    DROP TABLE tasks;
+    ALTER TABLE tasks_v18 RENAME TO tasks;
+    CREATE INDEX tasks_state ON tasks (state);
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -554,7 +600,8 @@ class Task:
     failed_at_ms: int | None = None     # when the task failed, or stopped as people closed every MR: a later
                                         # `/continue` from a person resumes it
     review_answers: int = 0  # review rounds answered without a code change
-    kind: str = "code"       # code: merge requests; research: an answer on the ticket, nothing published
+    kind: str = "code"       # code: merge requests; research: an answer on the ticket, nothing published;
+                             # review: people's merge requests, which the runner only reviews (code_review.py)
     question: str | None = None  # JSON {id, text, options, blocked}: the last question the agent asked
     updated_at: str = ""     # when the record last changed: for a task that is over, when it ended
 
@@ -565,6 +612,11 @@ class Task:
     @property
     def research(self) -> bool:
         return self.kind == "research"
+
+    @property
+    def people_work(self) -> bool:
+        """People wrote the code and the runner only reviews it: no agent session, nothing for an author."""
+        return self.kind == "review"
 
 
 class TaskStore(Store):
@@ -619,10 +671,12 @@ class TaskStore(Store):
 
     def accepted_untaken(self) -> list[TriggerDecision]:
         """Accepted triggers whose issue the runner has not taken yet, oldest tag first. Only an issue's newest
-        decision counts: a later tag by someone not on the list overrides an earlier approval."""
+        decision counts: a later tag by someone not on the list overrides an earlier approval. A ticket whose
+        merge requests the runner only reviewed has not been taken: the agent may still be given it."""
         rows = self.conn.execute(
             "SELECT d.* FROM trigger_decisions d LEFT JOIN tasks t ON t.task_id = d.issue_key"
-            " WHERE d.accepted = 1 AND t.task_id IS NULL AND NOT EXISTS (SELECT 1 FROM trigger_decisions n"
+            " WHERE d.accepted = 1 AND (t.task_id IS NULL OR t.kind = 'review')"
+            " AND NOT EXISTS (SELECT 1 FROM trigger_decisions n"
             " WHERE n.issue_key = d.issue_key AND n.tagged_at_ms > d.tagged_at_ms) ORDER BY d.tagged_at_ms"
         ).fetchall()
         return [TriggerDecision(r["issue_key"], r["tag_activity_id"], r["author"], True, bool(r["announced"]))
@@ -836,6 +890,7 @@ class Batch:
 
 # A review in these states has the shared workspace switched to what it reviews (code_review.py).
 REVIEW_HOLDS = ("preparing", "running", "restoring")
+REVIEW_UNDER_WAY = ("pending", *REVIEW_HOLDS, "publishing")  # asked for and not settled yet
 REVIEW_FIELDS = ("state", "snapshot", "verdict", "result", "outcome", "reason", "started_at")
 
 
@@ -915,6 +970,19 @@ class ReviewStore(TaskStore):
     def task_mrs(self, task_id: str) -> list[TaskMR]:
         rows = self.conn.execute("SELECT * FROM task_mrs WHERE task_id = ? ORDER BY repo", (task_id,)).fetchall()
         return [TaskMR(**dict(r)) for r in rows]
+
+    def drop_mrs(self, task_id: str, keep: set[str] = frozenset()) -> None:
+        """Forget the task's merge requests, except those in the repositories in `keep`."""
+        repos = [m.repo for m in self.task_mrs(task_id) if m.repo not in keep]
+        self.conn.executemany("DELETE FROM task_mrs WHERE task_id = ? AND repo = ?", [(task_id, r) for r in repos])
+
+    def forget_task(self, task_id: str) -> None:
+        """A ticket the runner only reviewed, now given to the agent: it starts as a task of its own. The reviews and
+        the journal of what they did stay, so a request is never answered twice."""
+        self.conn.execute("DELETE FROM task_mrs WHERE task_id = ?", (task_id,))
+        self.conn.execute("DELETE FROM tasks WHERE task_id = ? AND kind = 'review'", (task_id,))
+        # The channel was told nothing of it (notify.py): the new task's start is news, not a step after review.
+        self.conn.execute("DELETE FROM slack_task_state WHERE task_id = ?", (task_id,))
 
     def upsert_mr(self, task_id: str, repo: str, project_id: int | str, iid: int | str, url: str, sha: str) -> None:
         # Another MR in the same repository (a new one next to the MR a person closed) starts afresh: the old one's

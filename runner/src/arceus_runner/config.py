@@ -458,8 +458,9 @@ DOC_PATHS = ["*.md", "*.rst", "docs/**", "**/docs/**"]
 class ReviewAgentConfig(Strict):
     """The review agent (code_review.py): a person writes `command` (or mentions the tracker bot and says
     `review`) on a ticket in Code Review, and a separate Bulava task reviews the task's open MRs against
-    the ticket. The runner approves only what the review passed and the rules below allow; anything else
-    gets a note saying why. Off by default: with it off, such a comment is an ordinary comment."""
+    the ticket, or the merge requests a ticket people worked on links to. The runner approves only what the review
+    passed and the rules below allow; anything else gets a note saying why. Off by default: with it off, such a
+    comment is an ordinary comment."""
     enabled: bool = False
     command: str = Field(default="/review", pattern=r"^/[a-z][a-z0-9-]*$")
     attention_paths: list[str] = ATTENTION_PATHS

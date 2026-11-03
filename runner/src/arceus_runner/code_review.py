@@ -1,7 +1,8 @@
 """The review agent: a person asks for a code review on the ticket, and a separate Bulava task does it.
 
 Off unless `review_agent.enabled`; with it off, nothing here runs and every comment goes where it went
-before. With it on, for a ticket whose task has merge requests:
+before. With it on, for a ticket whose task has merge requests, or a ticket in Code Review whose merge requests
+people wrote:
 
 - **Who it is for.** A comment that starts with `review_agent.command` (`/review`), or that mentions the
   tracker bot first and then says `review` (`@agent-runner review`), is a request to the reviewer. The
@@ -16,12 +17,21 @@ before. With it on, for a ticket whose task has merge requests:
   local branch `arceus-review/<KEY>-<n>` that is never pushed. Its repositories are not writable for it:
   it may build and run tests, not change the code. It asks nobody anything, and writes its verdict to
   `.arceus/reviews/<KEY>/<id>.json`.
+- **Merge requests people wrote.** A request on a ticket in Code Review that the runner never worked on makes it
+  a task of kind `review` (Task.people_work): the runner reviews the merge requests the ticket links to (its
+  description and people's comments) that are in the code host's scope, each at the head the host has for it
+  (also one from a fork), and says which links it did not review and why. Nothing goes to an author: there is
+  no agent session behind the code, so there is no fix loop, and the ticket is not in the runner's other
+  work (answers, `/continue`, the channel). The runner lets go of it once the ticket leaves Code Review or none
+  of its merge requests is open; a later request takes it up again. Given to the agent later (the queue tag,
+  To Do), it becomes an ordinary task, its reviews kept.
 - **The workspace.** From the switch to the end of the run it holds the shared workspace like a task does
   (db.REVIEW_HOLDS): nothing else changes a branch there, cleanup counts it as the ticket's work. Then the
   runner stashes what the run left, checks every repository out where it was and frees the workspace. A
   crash at any point resumes from the stored state.
 - **The runner decides, the model advises.** An MR is approved only when the reviewer found it ready
-  (requirements met, build and tests passed, no blocker), the code host's CI passed on the reviewed
+  (requirements met, build passed, tests passed or fail only as they did on the target branch without the
+  change, no blocker), the code host's CI passed on the reviewed
   commit (`require_green_ci`), the MR still points at that commit and the same target, the ticket is
   still in Code Review with the text the review read, and the feature is still on. The approver account
   then approves exactly that commit, and the MR gets a note that it is ready to merge and needs no
@@ -51,12 +61,12 @@ from pathlib import Path
 
 from arceus_runner import materials
 from arceus_runner.config import DOC_PATHS, TEST_PATHS
-from arceus_runner.db import ACTIVE_STATES, ReviewRequest, ReviewStore, Task
+from arceus_runner.db import ACTIVE_STATES, REVIEW_UNDER_WAY, ReviewRequest, ReviewStore, Task
 from arceus_runner.delivery import ProjectNotesError
 from arceus_runner.engine import EngineError
 from arceus_runner.gitops import HOME_BRANCH, GitError
-from arceus_runner.http import ServiceError
-from arceus_runner.integrations import Approval, Comment, IssueDetails, MRStatus, key_part
+from arceus_runner.http import AuthError, NotFound, ServiceError
+from arceus_runner.integrations import Approval, Comment, Issue, IssueDetails, MRStatus, key_part
 from arceus_runner.replies import decisions_file, unattributed
 from arceus_runner.screening import is_decision, trusted
 
@@ -75,12 +85,21 @@ MAX_FILE_BYTES = 512 * 1024
 MAX_TEXT = 3000
 MAX_ITEMS = 30
 VERDICTS = ("ready", "changes", "unsure")
+TEST_WORDS = {"none": "none in the repository",
+              "failed_before": "some fail, the same ones as on the target branch without this change, so not because "
+                               "of it (see what was run)"}
 BUILD = ("passed", "failed", "not_run")
-TESTS = ("passed", "failed", "not_run", "none")
+# failed_before: tests fail, and the same ones fail on the target branch without the change: not the MR's doing.
+TESTS = ("passed", "failed", "failed_before", "not_run", "none")
+# How the runner judges a verdict. A final review stands for its commits only under the rules it was judged by: after
+# a change of them (2: tests that failed before the change no longer stop it), the same commits may be reviewed again.
+RULES = 2
 _MARKER = re.compile(r"<!--\s*arceus", re.IGNORECASE)
 _TRACKER_MARK = re.compile(r"\s*\[arceus:[^\]]*\]\s*$")
 _WORD = re.compile(r"[\w-]")
 _REVIEW_WORD = re.compile(r"(?:code[ -]?)?review\b", re.IGNORECASE)
+# A link to a merge request (GitLab), a pull request (GitHub, Gitea) or a Bitbucket one, wherever it points.
+_MR_LINK = re.compile(r"https?://[^\s<>()\[\]{}\"'`|]+?/(?:merge_requests|pull|pull-requests)/\d+", re.IGNORECASE)
 
 SCHEMA_EXAMPLE = """\
 {"summary": "Two or three sentences for the ticket.",
@@ -263,6 +282,7 @@ class ReviewAgent:
         self.tracker = delivery.tracker
         self._waiting: dict[str, tuple] = {}
         self._held_back: dict[str, str] = {}  # review id: why its findings did not go to the author
+        self._read: dict[str, int] = {}  # ticket people worked on: when it had changed as its comments were read
 
     @property
     def enabled(self) -> bool:
@@ -364,6 +384,8 @@ class ReviewAgent:
         # A task the author is fixing is read too: a request written meanwhile is answered now (the ticket is
         # not in Code Review), not left lying until the task comes back and then run on other commits.
         for task in self.store.tasks(*REVIEWABLE, *ACTIVE_STATES):
+            if task.people_work:
+                continue  # read below, with the other tickets in Code Review
             if not self.store.task_mrs(task.task_id):
                 continue  # the runner opened no merge request for this ticket: nothing of its own to review
             if task.state == "failed" and not (task.failed_at_ms and self.d.now() - datetime.fromtimestamp(
@@ -384,6 +406,110 @@ class ReviewAgent:
             except ServiceError as e:
                 self.events.emit("reconcile_failed", task_id=task.task_id, reason=str(e))
                 return
+        self._people_requests()
+
+    def _people_requests(self) -> None:
+        """Requests on tickets in Code Review the runner did not work on: people wrote their merge requests. A
+        ticket's comments are read only when it changed since they were last read (and once after a start). A
+        request older than `limits.continue_window` is left alone: a person has answered it by now."""
+        find = getattr(self.tracker, "in_state", None)
+        if find is None or getattr(self.host, "mr_link", None) is None:
+            return  # the tracker cannot list a state, or the host cannot read a link: only the runner's own MRs
+        c = self.cfg.tracker
+        oldest = int((self.d.now() - self.cfg.limits.continue_window).timestamp() * 1000)
+        try:
+            for issue in find(c.states.code_review):
+                task = self.store.task(issue.key)
+                if task is not None and not task.people_work:
+                    continue  # the runner's own ticket: read above, with its task
+                if self._read.get(issue.key) == issue.updated:
+                    continue
+                for x in self.tracker.comments(issue.db_id):
+                    if x.author == c.bot_user or x.created < oldest:
+                        continue
+                    asked = self.request(x.text)
+                    if asked is None or (task and self.store.review_of_comment(task.task_id, x.id)):
+                        continue
+                    task = self._people_task(issue, task, x)
+                    self._record(task, x, asked)
+                self._read[issue.key] = issue.updated
+        except ServiceError as e:
+            self.events.emit("reconcile_failed", task_id=None, reason=str(e))
+
+    def _people_task(self, issue: Issue, task: Task | None, x: Comment) -> Task:
+        """The `review` task of a ticket people worked on: made at its first request, taken up again by a later one."""
+        if task is None:
+            task = self.store.create_task(
+                task_id=issue.key, issue_db_id=issue.db_id, state="code_review", summary=issue.summary[:300],
+                tag_author=x.author, repo="", repo_path=str(self.cfg.paths.workspace), branch="", base_branch="",
+                question_id=None, question_at_ms=None, reason=None, mr_urls="[]", attempt_started=None,
+                extra_repos="[]", kind="review")
+            self.events.emit("review_ticket_watched", task_id=task.task_id, author=x.author)
+        elif task.state == "done":
+            task = self.store.update_task(task.task_id, state="code_review", reason=None)
+            self.events.emit("review_ticket_watched", task_id=task.task_id, author=x.author, again=True)
+        return task
+
+    def watch(self, task: Task) -> None:
+        """A ticket whose merge requests people wrote, on the code host's poll: an approval that no longer holds is
+        taken back, and the runner lets go of the ticket once no review of it is under way and it has left Code
+        Review or none of its merge requests is open."""
+        opened = False
+        for m in self.store.task_mrs(task.task_id):
+            st = self.host.mr_status(m.project_id, m.iid)
+            if st.state != m.state:
+                self.store.update_mr(task.task_id, m.repo, state=st.state)
+            if st.state == "opened":
+                opened = True
+                self.approval_outlived(task, m.project_id, m.iid, st)
+        if self.store.reviews(*REVIEW_UNDER_WAY, task_id=task.task_id):
+            return
+        state = self.tracker.issue(task.task_id).state
+        if opened and state == self.cfg.tracker.states.code_review:
+            return
+        why = "no merge request of it is open" if state == self.cfg.tracker.states.code_review \
+            else f"the ticket is in {state or 'no state'}"
+        self.store.update_task(task.task_id, state="done", reason=why)
+        self.events.emit("review_ticket_released", task_id=task.task_id, reason=why)
+
+    def _people_mrs(self, task: Task, issue: IssueDetails, comments: list[Comment]) -> list[dict]:
+        """The merge requests a ticket people worked on links to, kept as its task's; the links that are not
+        reviewed come back with why. The description and people's comments count, the runner's own do not."""
+        bot = self.cfg.tracker.bot_user
+        group = self.d._group()
+        found: dict[str, tuple] = {}  # repository: (its Repo, the MR's number, the link, the MR's state)
+        skipped: list[dict] = []
+        texts = [issue.description, *(x.text for x in comments if x.author != bot)]
+        for url in dict.fromkeys(_MR_LINK.findall("\n".join(texts))):
+            hit = self.host.mr_link(url, group)
+            if hit is None:
+                skipped.append({"url": url, "why": f"it is not a merge request of the {self.host.label} "
+                                                   f"{self.host.scope_kind} {self.host.scope}"})
+                continue
+            repo, iid = hit
+            try:
+                st = self.host.mr_status(repo.id, iid)
+            except (NotFound, AuthError):
+                skipped.append({"url": url, "why": f"{self.host.label} does not show it to the bot (deleted, or no "
+                                                   "access)"})
+                continue
+            mr = (repo, iid, url, st.state)
+            other = found.get(repo.relative_path)
+            if other and str(other[1]) != str(iid):
+                # One head per repository can be checked out at a time: the first open one is reviewed.
+                keep, drop = (mr, other) if other[3] != "opened" and st.state == "opened" else (other, mr)
+                found[repo.relative_path] = keep
+                if drop[3] == "opened":
+                    skipped.append({"url": drop[2], "why": f"{keep[2]} in the same repository is reviewed this "
+                                                           "time; ask again once that one is merged or closed"})
+                continue
+            found[repo.relative_path] = mr
+        with self.store.transaction():
+            self.store.drop_mrs(task.task_id, keep=set(found))
+            for path, (repo, iid, url, _) in found.items():
+                # Nothing of it was pushed by the runner: no published commit.
+                self.store.upsert_mr(task.task_id, path, repo.id, iid, url, "")
+        return skipped
 
     def _record(self, task: Task, x: Comment, asked: str) -> None:
         c = self.cfg.tracker
@@ -470,14 +596,17 @@ class ReviewAgent:
             self._refuse(row, task, "not_in_code_review", f"the ticket left {self.cfg.tracker.states.code_review} "
                                                           "before the review could start; none was run.")
             return
+        skipped = self._people_mrs(task, issue, self._ticket_comments(task)) if task.people_work else []
         open_mrs = []
         for m in self.store.task_mrs(task.task_id):
             st = self.host.mr_status(m.project_id, m.iid)
             if st.state == "opened":
                 open_mrs.append((m, st))
         if not open_mrs:
-            self._refuse(row, task, "nothing", "this ticket has no open merge request, so there is nothing to "
-                                               "review.", outcome="nothing")
+            where = (f"no open merge request of the {self.host.label} {self.host.scope_kind} {self.host.scope} is "
+                     "linked on the ticket" if task.people_work else "this ticket has no open merge request")
+            self._refuse(row, task, "nothing", f"{where}, so there is nothing to review."
+                         + "".join(f"\n- Not reviewed: {x['url']}: {x['why']}." for x in skipped), outcome="nothing")
             return
         group = {r.relative_path: r for r in self.d._group()}
         try:
@@ -502,15 +631,21 @@ class ReviewAgent:
                 dirty.append(m.repo)
                 continue
             target = st.target or repo.default_branch or "main"
-            self.git.fetch_branch(path, task.branch)
-            sha = st.sha or self.git.remote_sha(path, task.branch) or ""
+            if task.people_work:
+                # The head the host has for the MR, from the target repository: also a fork's, which origin has no
+                # branch of. Nothing else stands in for it.
+                self.git.fetch_ref(path, self.host.mr_head_ref(m.iid))
+                sha, source = st.sha, st.source or f"merge request {m.iid}"
+            else:
+                self.git.fetch_branch(path, task.branch)
+                sha, source = st.sha or self.git.remote_sha(path, task.branch) or "", task.branch
             if not sha or not self.git.has_commit(path, sha):
                 self._refuse(row, task, "no_commit", f"the head of {m.url} could not be fetched; no review was run.",
                              outcome="unverified")
                 return
             current = self.git.current_branch(path)
             mrs.append({"label": f"M{i}", "repo": m.repo, "project_id": m.project_id, "iid": m.iid, "url": m.url,
-                        "sha": sha, "target": target, "source": task.branch,
+                        "sha": sha, "target": target, "source": source,
                         "files": self.git.changed_files(path, f"origin/{target}", sha),
                         "prev": current if current != branch else None, "prev_head": self.git.head(path)})
         home = ws
@@ -524,8 +659,9 @@ class ReviewAgent:
         reviewed = ({(m["repo"], m["sha"], m["target"]) for m in mrs}, context)
         for earlier in self.store.reviews("done", task_id=task.task_id):
             then = json.loads(earlier.snapshot)
-            if earlier.outcome in FINAL and ({(m["repo"], m["sha"], m["target"]) for m in then.get("mrs", [])},
-                                             then.get("ticket", {}).get("context")) == reviewed:
+            if earlier.outcome in FINAL and then.get("rules", 1) == RULES and (
+                    {(m["repo"], m["sha"], m["target"]) for m in then.get("mrs", [])},
+                    then.get("ticket", {}).get("context")) == reviewed:
                 self._refuse(row, task, "already_reviewed", f"these commits were already reviewed (see the review "
                                                             f"{earlier.id} above); nothing changed since, so it "
                                                             "stands.", outcome="refused")
@@ -542,9 +678,10 @@ class ReviewAgent:
                                       ref=row.id, files=materials.screen_files(files))
         if clearance is None:
             return  # held for a security reviewer, refused, or the screen is down: nothing switched
-        snapshot = {"branch": branch, "text": text, "authors": authors,
+        snapshot = {"branch": branch, "text": text, "authors": authors, "skipped": skipped,
                     "home_prev": self.git.current_branch(home) if (home / ".git").exists() else None,
-                    "ticket": {"context": context, "requirements": self._requirements(task, issue)}, "mrs": mrs}
+                    "ticket": {"context": context, "requirements": self._requirements(task, issue)}, "mrs": mrs,
+                    "rules": RULES}
         row = self.store.update_review(row.id, state="preparing", snapshot=json.dumps(snapshot),
                                        started_at=self.d.now().isoformat())
         self._waiting.pop(row.id, None)
@@ -749,8 +886,8 @@ class ReviewAgent:
         """The review's findings as a round for the agent that wrote the code, while the ticket has fix rounds
         left and the findings still describe the code and the ticket. Recorded once per review: a retry of the
         publication sends nothing twice."""
-        if self.store.signal(_fix_signal(row)) is not None:
-            return
+        if task.people_work or self.store.signal(_fix_signal(row)) is not None:
+            return  # people wrote the code: no agent to send it to
         used = len(self.store.signals_of_kind(task.task_id, FIX_KIND))
         if not self.rc.fix_rounds or used >= self.rc.fix_rounds:
             return
@@ -798,6 +935,9 @@ class ReviewAgent:
         return ids.index(_fix_signal(row)) + 1 if _fix_signal(row) in ids else None
 
     def _sent_back_words(self, row: ReviewRequest, task: Task) -> str:
+        if task.people_work:
+            return (f"People wrote this code, so nothing goes to an agent: its author makes these changes and writes "
+                    f"`{self.rc.command}` on the ticket for another review.")
         n = self._fix_round(row, task)
         if n is not None:
             return (f"Sent to the agent to fix (round {n} of {self.rc.fix_rounds}). Its new commits are reviewed "
@@ -814,7 +954,7 @@ class ReviewAgent:
     def _review_again(self, task: Task) -> None:
         """The agent pushed commits after a review's findings went to it: the same request again, on them.
         Once per fix round; a re-review the runner refused (the commits were not there yet) may go again."""
-        if not self.rc.fix_rounds or task.state != "code_review":
+        if not self.rc.fix_rounds or task.state != "code_review" or task.people_work:
             return
         rows = self.store.reviews(task_id=task.task_id)
         if any(r.state not in ("done", "refused") for r in rows):
@@ -875,7 +1015,7 @@ class ReviewAgent:
                 kind = "changes"
                 reasons += v.get("doubts", [])
             elif v["verdict"] == "unsure" or v["requirements_met"] is None or v["build"] != "passed" \
-                    or v["tests"] not in ("passed", "none"):
+                    or v["tests"] not in ("passed", "none", "failed_before"):
                 kind = "unverified"
                 if v["verdict"] == "unsure":
                     reasons.append("the reviewer could not tell whether it is right")
@@ -883,7 +1023,7 @@ class ReviewAgent:
                     reasons.append("the reviewer did not say whether it meets the ticket")
                 if v["build"] != "passed":
                     reasons.append("the build was not run")
-                if v["tests"] not in ("passed", "none"):
+                if v["tests"] not in ("passed", "none", "failed_before"):
                     reasons.append("the tests were not run")
             elif fatal or v.get("doubts"):
                 # A verdict written before the run hung or stopped to ask, or one the runner could not read
@@ -1106,7 +1246,7 @@ class ReviewAgent:
             met = {True: "met", False: "not met", None: "not judged"}[v["requirements_met"]]
             lines += [f"- Requirements of the ticket: {met}",
                       f"- Build: {v['build'].replace('_', ' ')}",
-                      f"- Tests: {'none in the repository' if v['tests'] == 'none' else v['tests'].replace('_', ' ')}"]
+                      f"- Tests: {TEST_WORDS.get(v['tests'], v['tests'].replace('_', ' '))}"]
             if v["checked"]:
                 lines.append(f"- What was run: {v['checked']}")
         lines += [f"- CI: {self._ci_words(mr['ci'])}", ""]
@@ -1172,6 +1312,9 @@ class ReviewAgent:
         for mr in result["mrs"]:
             lines.append(f"- {mr['repo']}: {words[self._mr_outcome(row, task, mr) if mr['kind'] != 'closed' else 'closed']}"
                          f". {mr['url']}")
+        skipped = json.loads(row.snapshot or "{}").get("skipped") or []
+        if skipped:
+            lines += ["", "Not reviewed:", *(f"- {x['url']}: {x['why']}." for x in skipped)]
         if result["summary"]:
             lines += ["", result["summary"]]
         if result["problems"] and overall in ("unverified", "nothing"):
@@ -1191,7 +1334,9 @@ class ReviewAgent:
         lines = [f"Code review of the merge requests of ticket {task.task_id}, asked for by {row.author}"
                  + (f" (again, on the fixes the author pushed for {_auto_of(row)})"
                     if row.comment_id.startswith(AUTO_PREFIX) else "") + ".", "",
-                 "You are the reviewer. Another agent wrote this code; you check it and report what you find. You do "
+                 "You are the reviewer. " + ("People on the team wrote this code" if task.people_work else
+                                              "Another agent wrote this code")
+                 + "; you check it and report what you find. You do "
                  "not fix anything: do not edit files, do not commit, do not push. Do not ask anyone a question: "
                  "nobody answers during this run. When something is unclear, decide what you can, say what you "
                  "assumed, and mark that merge request \"unsure\" instead of stopping.", ""]
@@ -1222,14 +1367,20 @@ class ReviewAgent:
             if hints:
                 lines += ["Read these with extra care (build, CI, dependencies, configuration, migrations); they go to `attention` "
                           "or `deploy` only by the rules of point 3: " + ", ".join(f"`{f}`" for f in hints) + ".", ""]
-        lines += [f"Why the author chose what it did, if it wrote it down: {decisions_file(ws, task.task_id)}.", "",
-                  "## What to check in each merge request", "",
+        if not task.people_work:
+            lines += [f"Why the author chose what it did, if it wrote it down: {decisions_file(ws, task.task_id)}.", ""]
+        lines += ["## What to check in each merge request", "",
                   "1. Requirements. Does the change do what the ticket asks, all of it, and nothing it did not ask "
                   "for? Missing or wrong behaviour is a blocker.",
                   "2. Build and tests. Build the project and run its tests the way the repository does it (README, "
                   "Makefile, verify.sh, CI config). Say what you ran. A repository without tests is \"none\", not "
                   "\"passed\". If something cannot run here (a service, a secret, the network), say so and use "
-                  "\"not_run\". Never report a result you did not see.",
+                  "\"not_run\". When tests fail, run the same ones on the target branch without the change "
+                  "(`git stash`, then `git checkout origin/<target>`; back to the reviewed commit after). If exactly "
+                  "those fail there too and the change adds no failure of its own, that is \"failed_before\": not a "
+                  "blocker, say in `checked` which ones and that they fail on the target branch as well. A test the "
+                  "change breaks, or one it was meant to fix and did not, is \"failed\". Never report a result you "
+                  "did not see.",
                   "3. What a person has to decide before merge, and what whoever deploys it has to know. `attention` "
                   "stops the merge until a person looks, so it holds only a decision you cannot settle yourself by "
                   "reading and running the code:",
@@ -1272,10 +1423,11 @@ class ReviewAgent:
                   "## Your verdict", "",
                   f"Write it to {self._verdict_file(row)} as JSON, one entry per merge request:", "", "```json",
                   SCHEMA_EXAMPLE, "```", "",
-                  "- `verdict`: \"ready\" (meets the ticket, builds, tests pass, no blocker), \"changes\" (at least one "
+                  "- `verdict`: \"ready\" (meets the ticket, builds, tests pass or fail only as they did before, no "
+                  "blocker), \"changes\" (at least one "
                   "blocker), or \"unsure\" (you could not tell).",
                   "- `requirements_met`: true or false. `build` (passed, failed, not_run) and `tests` (passed, failed, "
-                  "not_run, none): what you saw yourself.",
+                  "failed_before, not_run, none): what you saw yourself.",
                   "- `checked`: the commands you ran and what they showed, in a line or two.",
                   "- `findings`: `severity` is \"blocker\" or \"suggestion\"; `file` and `line` when it is about a "
                   "place in the code.",

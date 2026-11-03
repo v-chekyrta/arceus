@@ -161,6 +161,10 @@ class ReviewLoop:
             if only is not None and task.task_id not in only:
                 continue
             try:
+                if task.people_work:  # people wrote its code: only the code review follows it
+                    if self.d.reviewer:
+                        self.d.reviewer.watch(task)
+                    continue
                 if self._watch(task):
                     self._maybe_send(self.store.task(task.task_id))
             except (ServiceError, EngineError, GitError) as e:

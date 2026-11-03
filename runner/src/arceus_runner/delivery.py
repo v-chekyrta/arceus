@@ -25,7 +25,7 @@ from pathlib import Path
 from arceus_runner import materials, media
 from arceus_runner.replies import unattributed
 from arceus_runner.config import Config
-from arceus_runner.db import ACTIVE_STATES, TaskStore, Task, TriggerDecision
+from arceus_runner.db import ACTIVE_STATES, REVIEW_UNDER_WAY, TaskStore, Task, TriggerDecision
 from arceus_runner.engine import Engine, EngineError, Reply
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import HOME_BRANCH, Git, GitError
@@ -358,6 +358,14 @@ class Delivery:
                                              f"{f'by {now.author}' if now and now.author else 'by someone unknown'}")
         if now.author not in c.allowed_users:
             return self._not_taken(decision, f"{now.author} is no longer in allowed_users")
+        known = self.store.task(details.key)
+        if known is not None and known.people_work:
+            # Only its merge requests were reviewed so far (people wrote them). It becomes the agent's task once no
+            # review of it runs or waits; the reviews and what they posted stay on record.
+            if known.state == "security_hold" or self.store.reviews(*REVIEW_UNDER_WAY, task_id=known.task_id):
+                return False
+            self.store.forget_task(known.task_id)
+            self.events.emit("review_ticket_taken_over", task_id=known.task_id)
 
         # A question instead of a change: decided once, here, and kept for every follow-up and restart.
         kind = "research" if c.tags.research in tags else "code"

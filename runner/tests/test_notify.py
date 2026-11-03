@@ -379,6 +379,35 @@ def test_mrs_done_and_stopped(b):
     assert out[2].startswith("✅") and "every merge request is merged" in out[2]
 
 
+def test_a_code_review_is_told_when_it_starts_and_with_its_result_per_merge_request(b):
+    b.task(state="code_review")
+    b.notifier.tick("waiting")
+    b.flush()
+    row = b.store.add_review("ACME-1", "c-1", "j.doe", 1, "")
+    mrs = [{"label": "M1", "repo": "acme-platform", "url": "https://gl.example/acme/acme-platform/mr/4"},
+           {"label": "M2", "repo": "acme-theme", "url": "https://gl.example/acme/acme-theme/mr/64"}]
+    b.store.update_review(row.id, state="running", snapshot=json.dumps({"mrs": mrs}))
+    b.events.emit("review_dispatched", task_id="ACME-1", review=row.id)
+    [started] = b.flush()
+    assert started.startswith("🔍 Code review of *<https://yt.example/issue/ACME-1|ACME-1>*")
+    assert "started, asked by j.doe: 2 merge requests." in started
+    b.store.update_review(row.id, state="done", outcome="unverified", result=json.dumps({"mrs": mrs}))
+    b.events.emit("review_published", task_id="ACME-1", review=row.id, outcome="unverified",
+                  mrs={"https://gl.example/acme/acme-platform/mr/4": "approved", "https://gl.example/acme/acme-theme/mr/64": "unverified"})
+    [result] = b.flush()
+    assert result.startswith("⚠️ Code review could not confirm: *<https://yt.example/issue/ACME-1|ACME-1>*")
+    assert "• <https://gl.example/acme/acme-platform/mr/4|acme-platform>: approved, ready to merge" in result
+    assert "• <https://gl.example/acme/acme-theme/mr/64|acme-theme>: could not be confirmed" in result
+    b.events.emit("review_published", task_id="ACME-1", review=row.id, outcome="unverified", mrs={})
+    assert b.flush() == []  # told once
+    again = b.store.add_review("ACME-1", "c-2", "j.doe", 2, "")
+    b.store.update_review(again.id, state="done", outcome="ready", result=json.dumps({"mrs": mrs}))
+    b.events.emit("review_published", task_id="ACME-1", review=again.id, outcome="ready",
+                  mrs={"https://gl.example/acme/acme-platform/mr/4": "ready", "https://gl.example/acme/acme-theme/mr/64": "approved"})
+    [mixed] = b.flush()  # one approved, one not (no CI): the head does not say none was approved
+    assert mixed.startswith("☑️ Code review found no problems, not everything is approved")
+
+
 # -- routine: summaries, idle, the daily status ------------------------------------------------------------------
 
 

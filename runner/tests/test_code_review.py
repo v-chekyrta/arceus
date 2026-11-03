@@ -1132,3 +1132,282 @@ def test_taking_an_approval_back_survives_a_failure_halfway(w, monkeypatch):
     assert "description or attached files changed" in taken
     w.tick()
     assert len(_taken(w)) == 1
+
+
+# -- merge requests people wrote ----------------------------------------------------------------------
+
+PEOPLE = "ACME-5"
+PEOPLE_RID = f"{PEOPLE}.review-1"
+GITHUB_PR = "https://github.com/acme/acme-translations/pull/7"
+ELSEWHERE = "https://gitlab.example.com/other-team/tools/-/merge_requests/9"
+
+
+def people_mr(w: World, iid: int = 5, repo: str = "acme-platform", name: str = "people.txt",
+              fork: bool = False) -> tuple[str, str]:
+    """A merge request a person opened (on GitLab and in git), CI green on it: (its link, its head commit).
+    From a fork, the target repository has no branch of it, only GitLab's ref of the merge request."""
+    seed = w.tmp / "seed" / repo
+    branch = f"feature/{name.split('.')[0]}"
+    git(seed, "checkout", "-q", "-B", branch, "main")
+    (seed / name).write_text("people's work\n")
+    git(seed, "add", name)
+    git(seed, "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-q", "-m", f"add {name}")
+    sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "push", "-q", str(w.origins[repo]), f"HEAD:refs/merge-requests/{iid}/head",
+        *(() if fork else (f"HEAD:refs/heads/{branch}",)))
+    git(seed, "checkout", "-q", "main")
+    pid = w.gl.repos.index(repo)
+    url = f"https://gitlab.example.com/clients/acme/{repo}/-/merge_requests/{iid}"
+    w.gl.mrs.append({"iid": iid, "project_id": pid, "state": "opened", "sha": sha, "source_branch": branch,
+                     "target_branch": "main", "web_url": url,
+                     "head_pipeline": {"id": 900 + iid, "status": "success", "sha": sha, "web_url": "https://gl/p"}})
+    return url, sha
+
+
+def people_ticket(w: World, description: str, n: int = 5) -> str:
+    """A ticket people worked on: in Code Review, never queued for the agent."""
+    db_id = w.yt.add_issue(n)
+    w.yt.issue_tags[db_id] = set()
+    w.yt.issues[-1].update(summary="Translations of the upload form", description=description)
+    w.yt.issue_fields[db_id] = {"State": {"name": "Code Review"}}
+    return db_id
+
+
+def people_verdict(w: World, rid: str = PEOPLE_RID, **fields) -> None:
+    entry = {"mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed",
+             "checked": "make test: 40 passed", "findings": [], "attention": []} | fields
+    path = w.cfg.paths.workspace / ".arceus" / "reviews" / PEOPLE / f"{rid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"summary": "The translations are complete.", "mrs": [entry]}))
+
+
+def ticket_comments(w: World, db_id: str) -> list[str]:
+    return [c["text"] for c in w.yt.comments.get(db_id, []) if c["author"]["login"] == w.yt.login]
+
+
+def test_a_merge_request_people_wrote_is_reviewed_and_approved(w):
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, f"Missing strings.\n\n**DONE**\n{GITHUB_PR}\n{url}\n{ELSEWHERE}")
+    w.yt.comment(db_id, "j.doe", "@agent-runner review")
+    w.tick()
+    task = w.store.task(PEOPLE)
+    assert (task.kind, task.state, task.branch) == ("review", "code_review", "")
+    [call] = [c for c in w.calls("dispatch") if c["argv"][1] == PEOPLE_RID]
+    text = call["argv"][-1]
+    assert "People on the team wrote this code" in text and "Another agent" not in text
+    assert sha in text and "feature/people into main" in text and "decisions" not in text
+    assert git(w.cfg.paths.workspace / "acme-platform", "rev-parse", "HEAD") == sha
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    assert w.gl.mr(5)["approved_by"] == ["acme-review-bot"]
+    assert review_notes(w, 5)[0].startswith("**Code review: ready to merge.**")
+    [result] = ticket_comments(w, db_id)
+    assert f"acme-platform: ready to merge, approved" in result and url in result
+    assert f"Not reviewed:\n- {GITHUB_PR}: it is not a merge request of the GitLab group clients/acme." in result
+    assert f"- {ELSEWHERE}: it is not a merge request" in result
+    # Nothing goes to an author, and the workspace is back where it was.
+    assert sends(w) == [] and git(w.cfg.paths.workspace / "acme-platform", "symbolic-ref", "--short", "HEAD") == "main"
+    assert w.store.task(PEOPLE).state == "code_review"
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done" and w.store.task(PEOPLE).reason == "no merge request of it is open"
+
+
+def test_a_merge_request_from_a_fork_is_reviewed_at_the_head_gitlab_has(w):
+    url, sha = people_mr(w, fork=True)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "a.smith", "/review")
+    w.tick()
+    assert git(w.cfg.paths.workspace / "acme-platform", "rev-parse", "HEAD") == sha
+    assert w.store.review(PEOPLE_RID).state == "running"
+
+
+def test_findings_on_people_code_go_to_the_ticket_and_never_to_an_agent(w):
+    url, _ = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    people_verdict(w, verdict="changes", findings=[{"severity": "blocker", "file": "uk.po", "line": 3,
+                                                    "text": "The plural forms are missing"}])
+    finish(w, PEOPLE_RID)
+    assert w.store.review(PEOPLE_RID).outcome == "changes"
+    assert w.store.signals_of_kind(PEOPLE, "code_review") == []
+    [note] = review_notes(w, 5)
+    assert "The plural forms are missing" in note and "its author makes these changes and writes `/review`" in note
+    later(w)
+    later(w)
+    assert sends(w) == [] and len([c for c in w.calls("dispatch") if c["argv"][1].startswith(PEOPLE)]) == 1
+
+
+def test_a_request_on_a_ticket_people_worked_on_is_refused_for_someone_off_the_list_then_taken(w):
+    url, _ = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "mallory", "@agent-runner review")
+    w.tick()
+    [refusal] = ticket_comments(w, db_id)
+    assert refusal.startswith("@mallory, only people on the project's list can ask for a code review")
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done"           # nothing to follow: let go
+    w.yt.comment(db_id, "j.doe", "@agent-runner review")
+    w.tick()
+    assert w.store.task(PEOPLE).state == "code_review"
+    assert w.store.review(f"{PEOPLE}.review-2").state == "running"
+    assert len(ticket_comments(w, db_id)) == 1             # the earlier request is not answered again
+
+
+def test_a_ticket_without_a_reviewable_link_says_why(w):
+    db_id = people_ticket(w, f"Done: {GITHUB_PR}")
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    [said] = ticket_comments(w, db_id)
+    assert "no open merge request of the GitLab group clients/acme is linked on the ticket" in said
+    assert f"Not reviewed: {GITHUB_PR}" in said
+    assert [c for c in w.calls("dispatch") if c["argv"][1].startswith(PEOPLE)] == []
+
+
+def test_a_link_to_a_merge_request_gitlab_does_not_show_is_named_and_the_rest_reviewed(w):
+    gone = "https://gitlab.example.com/clients/acme/acme-theme/-/merge_requests/77"
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, f"{gone}\n{url}")
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    assert git(w.cfg.paths.workspace / "acme-platform", "rev-parse", "HEAD") == sha
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    [result] = ticket_comments(w, db_id)
+    assert f"- {gone}: GitLab does not show it to the bot (deleted, or no access)." in result
+    assert w.store.review(PEOPLE_RID).outcome == "approved"
+
+
+def test_two_open_merge_requests_of_one_repository_review_the_first_and_name_the_second(w):
+    first, sha = people_mr(w, 5, name="one.txt")
+    second, _ = people_mr(w, 6, name="two.txt")
+    db_id = people_ticket(w, f"{first}\n{second}")
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    assert git(w.cfg.paths.workspace / "acme-platform", "rev-parse", "HEAD") == sha
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    [result] = ticket_comments(w, db_id)
+    assert f"- {second}: {first} in the same repository is reviewed this time" in result
+
+
+def test_old_requests_and_tickets_out_of_code_review_are_left_alone(w):
+    url, _ = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comments[db_id] = [{"id": "c-old", "text": "/review", "author": {"login": "j.doe"},
+                             "created": int((w.now - timedelta(days=30)).timestamp() * 1000)}]
+    other = people_ticket(w, url, n=6)
+    w.yt.issue_fields[other] = {"State": {"name": "In Progress"}}
+    w.yt.comment(other, "j.doe", "/review")
+    w.tick()
+    assert w.store.task(PEOPLE) is None and w.store.task("ACME-6") is None and w.store.reviews() == []
+
+
+def test_comments_are_read_again_only_when_the_ticket_changed(w):
+    url, _ = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "Looks fine to me")
+    w.tick()
+    reads = lambda: [r for r in w.yt.requests if r.url.path == f"/api/issues/{db_id}/comments"]  # noqa: E731
+    before = len(reads())
+    w.tick()
+    w.tick()
+    assert len(reads()) == before == 1
+
+
+def test_a_reviewed_ticket_given_to_the_agent_becomes_its_task(w):
+    url, _ = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    w.yt.issue_fields[db_id] = {"State": {"name": "To Do"}}
+    w.yt.issue_tags[db_id] = {"agent"}
+    w.yt.activities[db_id] = [{"id": "a5", "timestamp": 1, "author": {"login": "j.doe"},
+                               "added": [{"name": "agent"}], "removed": []}]
+    w.tick()
+    w.tick()
+    task = w.store.task(PEOPLE)
+    assert task.kind == "code" and task.state == "dispatched" and task.branch.startswith("agent/ACME-5-")
+    assert w.store.task_mrs(PEOPLE) == []
+    assert w.store.review(PEOPLE_RID).outcome == "approved"   # the review stays on record
+
+
+def test_gitlab_reads_a_merge_request_link_of_its_group(w):
+    host = w.runner.reviewer.host
+    repos = {r.relative_path: r for r in w.runner.delivery._group()}
+    group = list(repos.values())
+    base = "https://gitlab.example.com/clients/acme"
+    assert host.mr_link(f"{base}/acme-theme/-/merge_requests/64/diffs", group) == (repos["acme-theme"], 64)
+    assert host.mr_link("https://GITLAB.example.com/clients/acme/acme-platform/merge_requests/4", group) \
+        == (repos["acme-platform"], 4)
+    for other in (GITHUB_PR, ELSEWHERE, f"{base}/acme-infra/-/merge_requests/1", f"{base}/acme-platform/-/issues/4",
+                  "https://gitlab.example.com/acme-platform/-/merge_requests/4"):  # same name, outside the group
+        assert host.mr_link(other, group) is None, other
+    assert host.mr_head_ref(64) == "refs/merge-requests/64/head"
+
+
+def test_the_upgrade_to_schema_18_keeps_every_task_as_it_was(tmp_path):
+    import sqlite3
+
+    from arceus_runner.db import MIGRATIONS, ReviewStore, _split
+    path = tmp_path / "runner.db"
+    conn = sqlite3.connect(path)
+    for n in range(17):
+        for stmt in _split(MIGRATIONS[n]):
+            conn.execute(stmt)
+        conn.execute(f"PRAGMA user_version = {n + 1}")
+    conn.execute("INSERT INTO tasks (task_id, issue_db_id, state, tag_author, repo, repo_path, branch, base_branch,"
+                 " kind, question, published_at_ms, review_rounds, created_at) VALUES ('ACME-1', '2-1', 'code_review',"
+                 " 'j.doe', '', '/ws', 'agent/ACME-1-x', 'main', 'research', '{\"id\": \"q1\"}', 123, 2,"
+                 " '2026-01-01T00:00:00Z')")
+    conn.commit()
+    conn.close()
+    store = ReviewStore(path)
+    try:
+        assert store.version == len(MIGRATIONS) == 18
+        t = store.task("ACME-1")
+        assert (t.kind, t.state, t.branch, t.question, t.published_at_ms, t.review_rounds) == \
+            ("research", "code_review", "agent/ACME-1-x", '{"id": "q1"}', 123, 2)
+        assert store.conn.execute("SELECT created_at FROM tasks").fetchone()[0] == "2026-01-01T00:00:00Z"
+        assert {r[0] for r in store.conn.execute("SELECT name FROM sqlite_master WHERE tbl_name = 'tasks'")} \
+            >= {"tasks", "tasks_state"}
+        fields = dict(issue_db_id="2-5", state="code_review", tag_author="j.doe", repo="", repo_path="", branch="",
+                      base_branch="")
+        assert store.create_task(task_id="ACME-5", kind="review", **fields).people_work
+        with pytest.raises(AssertionError):  # an unknown kind is not stored
+            store.create_task(task_id="ACME-6", kind="other", **fields)
+    finally:
+        store.close()
+
+
+def test_tests_that_failed_before_the_change_are_a_note_not_a_reason_to_change_it(w):
+    publish(w)
+    ask(w)
+    text = reviews(w)[0]["argv"][-1]
+    assert '"failed_before"' in text and "on the target branch" in text
+    write_verdict(w, tests="failed_before", checked="pytest: 1722 passed, 5 failed; the same 5 fail on main")
+    finish(w)
+    assert w.store.review(RID).outcome == "approved" and w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
+    [note] = review_notes(w)
+    assert "- Tests: some fail, the same ones as on the target branch without this change, so not because of it" in note
+    assert "the same 5 fail on main" in note and "The tests failed" not in note
+    assert w.store.signals_of_kind("ACME-1", "code_review") == []
+
+
+def test_a_verdict_judged_by_older_rules_does_not_stand_for_the_same_commits(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, tests="failed")
+    finish(w)
+    assert w.store.review(RID).outcome == "changes"
+    with w.store.transaction():  # as a review before RULES 2 kept it: no rules in its snapshot
+        snap = json.loads(w.store.review(RID).snapshot)
+        snap.pop("rules")
+        w.store.update_review(RID, snapshot=json.dumps(snap))
+    w.yt.comment("2-1", "j.doe", "/review")
+    w.tick()
+    again = w.store.review("ACME-1.review-2")
+    assert again.state != "refused" and again.reason != "already_reviewed"

@@ -7,6 +7,8 @@ questions in noise within the hour, and Slack takes about one message a second p
     when                                 what                                       how often
     a task changes state                 started, back at work, question, MRs out,  once per transition, at once
                                          done, failed, stopped, held by security
+    a code review starts, and its result who asked, how many MRs; per MR approved,     once each, at once
+                                         needs changes, could not be confirmed
     a running task did something         tool calls (and how many came back with    at most every summary_every,
                                          an error), the engine's step, the latest   only when there was any,
                                                                                     in working hours by default
@@ -61,6 +63,14 @@ from arceus_runner.slack import Webhook
 
 # Who goes first when several wait: a person is needed > a task moved > the runner's own news > routine.
 URGENT, TRANSITION, RUNNER, ROUTINE = 0, 1, 2, 3
+# A finished code review (code_review.py): the overall outcome, then each merge request's.
+REVIEW_HEADS = {"approved": "✅ Code review approved", "attention": "👀 Code review approved, a person has to look first",
+                "ready": "☑️ Code review found no problems, not everything is approved", "changes": "🛠 Code review: changes needed",
+                "unverified": "⚠️ Code review could not confirm", "nothing": "⚪️ Code review: nothing left to review",
+                "switched_off": "⚪️ Code review switched off while it ran"}
+REVIEW_WORDS = {"approved": "approved, ready to merge", "attention": "approved, a person has to look at some changes",
+                "ready": "no problems found, not approved", "changes": "changes needed",
+                "unverified": "could not be confirmed", "closed": "merged or closed meanwhile"}
 MIN_GAP = 1.1          # seconds between two posts: Slack takes about one a second per channel
 BROKEN_RETRY = 3600    # a webhook Slack refused is tried again this often, in case a person fixed it
 DRAIN_SECONDS = 5      # on stop: what is left (the stop itself) gets this long to go out
@@ -448,6 +458,29 @@ class Notifier:
         self.put(f"stopped:{r['ts']}", "runner_stopped", TRANSITION,
                  f"⚪️ Arceus runner stopped: {why}. Nothing is taken or followed until it starts again.")
 
+    def _on_review_dispatched(self, r: dict) -> None:
+        row = self.store.review(r["review"]) if hasattr(self.store, "review") else None
+        if row is None:
+            return
+        n = len(json.loads(row.snapshot or "{}").get("mrs") or [])
+        by = "again on the agent's fixes" if row.comment_id.startswith("auto-") else f"asked by {esc(row.author)}"
+        self.put(f"review:{row.id}:started", "review_started", TRANSITION,
+                 f"🔍 Code review of {self.line(row.task_id)} started, {by}: {n} merge request{'s' if n != 1 else ''}.",
+                 task_id=row.task_id)
+
+    def _on_review_published(self, r: dict) -> None:
+        row = self.store.review(r["review"]) if hasattr(self.store, "review") else None
+        if row is None:
+            return
+        outcome = str(r.get("outcome") or "")
+        head = REVIEW_HEADS.get(outcome, "🔍 Code review finished")
+        words = {u: REVIEW_WORDS.get(o, esc(o)) for u, o in (r.get("mrs") or {}).items()}
+        repos = {m["url"]: m["repo"] for m in json.loads(row.result or "{}").get("mrs", [])}
+        lines = [f"{head}: {self.line(row.task_id)}"]
+        lines += [f"• <{u}|{esc(repos.get(u, u))}>: {w}" for u, w in words.items()]
+        lines.append(f"Details on the ticket: {self.issue_url(row.task_id)}")
+        self.put(f"review:{row.id}:published", "review_published", TRANSITION, "\n".join(lines), task_id=row.task_id)
+
     def _on_agent_activity(self, r: dict) -> None:
         a = self.activity.setdefault(r["task_id"], Activity())
         a.calls += int(r.get("tools") or 0)
@@ -568,6 +601,8 @@ class Notifier:
             self.outbox.set_told_state(t.task_id, sig)
 
     def transition(self, t: Task, prev: str | None) -> tuple[int, str, dict | None] | None:
+        if t.people_work and t.state != "security_hold":
+            return None  # people's merge requests the runner only reviews: their ticket tells the rest
         line = self.line(t.task_id, t)
         who = self.mention(t.tag_author)
         if t.state in ACTIVE_STATES:
@@ -700,7 +735,7 @@ class Notifier:
         if not self.working():
             return
         told = float(self.outbox.meta("idle_told") or 0)
-        review = self.store.tasks("code_review")
+        review = [t for t in self.store.tasks("code_review") if not t.people_work]
         waiting = f" {len(review)} task(s) wait in code review with people." if review else ""
         if review and told and self.cfg.review_agent.enabled:
             waiting += f" `{esc(self.cfg.review_agent.command)}` on their ticket hands the review to the agent."
@@ -768,7 +803,7 @@ class Notifier:
         section("Waiting for an answer", self.store.tasks("needs_input"),
                 lambda t: f" — asked {ago(now - (t.question_at_ms or 0) / 1000)} ago" if t.question_at_ms else "")
         section("Waiting for a security reviewer", self.store.tasks("security_hold"))
-        section("In code review with people", self.store.tasks("code_review"),
+        section("In code review with people", [t for t in self.store.tasks("code_review") if not t.people_work],
                 lambda t: f" — {len(json.loads(t.mr_urls or '[]'))} MR(s)")
         section("Failed in the last day", [t for t in self.store.tasks("failed")
                                            if t.failed_at_ms and now - t.failed_at_ms / 1000 < 86400],

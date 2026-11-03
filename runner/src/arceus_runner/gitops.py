@@ -168,6 +168,12 @@ class Git:
         self._run(["fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], repo,
                   network=True)
 
+    def fetch_ref(self, repo: Path, ref: str) -> None:
+        """A ref outside the branches (a merge request's head: refs/merge-requests/4/head), kept under
+        refs/remotes/origin/ so its commits stay until the next fetch of it."""
+        self._run(["fetch", "--quiet", "origin", f"+{ref}:refs/remotes/origin/{ref.removeprefix('refs/')}"], repo,
+                  network=True)
+
     def commit_all(self, repo: Path, message: str) -> str:
         """Commit everything in the tree (tracked, untracked, not ignored) as the repository's author."""
         self._run(["add", "-A"], repo)

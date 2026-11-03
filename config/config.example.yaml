@@ -162,6 +162,8 @@ security:
 # person before merge. What only whoever deploys it needs to know (an environment variable, a requested upgrade)
 # is listed under its own heading and keeps the MR approved. What has to change goes back to the author, and its
 # new commits are reviewed again without anyone asking, fix_rounds times per ticket; then a person takes over.
+# The ticket need not be the agent's: on one people worked on, the MRs of the group it links to are reviewed, and
+# what has to change is for their author (no fix loop).
 review_agent:
   enabled: false
   command: /review

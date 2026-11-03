@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 
@@ -43,6 +44,9 @@ class FakeYouTrack:
         self.clock += 1
         self.comments.setdefault(db_id, []).append({"id": f"c-{self.clock}", "text": text, "created": self.clock,
                                                     "author": {"login": author}})
+        for i in self.issues:  # as YouTrack does: a new comment is a change of the issue
+            if i["id"] == db_id:
+                i["updated"] = self.clock
 
     def _write(self, request: httpx.Request) -> httpx.Response | None:
         path, method = request.url.path, request.method
@@ -141,9 +145,13 @@ class FakeYouTrack:
             q = request.url.params.get("query")
             return json_response(self._page([{"login": u} for u in sorted(self.users) if u == q], request))
         if path == "/api/issues":
-            queued = [i for i in self.issues if "agent" in self.issue_tags.get(i["id"], set())
-                      and (self.issue_fields.get(i["id"], {}).get("State") or {"name": "To Do"})["name"] == "To Do"]
-            return json_response(self._page(queued, request))
+            # The two searches the runner makes: the queue (the tag and To Do), and every issue in one state.
+            q = request.url.params.get("query", "")
+            state = re.search(r"State: \{([^}]*)\}", q)
+            want = state.group(1) if state else "To Do"
+            found = [i for i in self.issues if ("tag:" not in q or "agent" in self.issue_tags.get(i["id"], set()))
+                     and (self.issue_fields.get(i["id"], {}).get("State") or {"name": "To Do"})["name"] == want]
+            return json_response(self._page(found, request))
         if path.startswith("/api/files/"):
             fid = path.removeprefix("/api/files/")
             a = next((a for v in self.files.values() for a in v if a["id"] == fid), None)
@@ -225,7 +233,9 @@ class FakeGitLab:
         parts = path.split("/")
         if "merge_requests" in parts and parts[-1] != "merge_requests":
             iid = int(parts[parts.index("merge_requests") + 1])
-            mr = self.mr(iid)
+            mr = next((m for m in self.mrs if m["iid"] == iid), None)
+            if mr is None:
+                return json_response({"message": "404 Not found"}, 404)
             tail = parts[parts.index("merge_requests") + 2:]
             if not tail and request.method == "GET":
                 return json_response({**mr, "detailed_merge_status": mr.get("detailed_merge_status", "mergeable"),

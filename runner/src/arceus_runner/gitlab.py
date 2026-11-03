@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import Field, field_validator
 
@@ -121,6 +121,8 @@ class GitLabWriter(GitLab):
 # GitLab works mergeability out asynchronously: until it has, it cannot say whether there is a conflict.
 _MERGEABILITY_PENDING = {"checking", "unchecked", "preparing", "approvals_syncing"}
 _CI_RUNNING = {"created", "waiting_for_resource", "preparing", "pending", "running", "scheduled"}
+# A merge request's page below the host's address: /<project>/-/merge_requests/<iid>, and the older form without `-`.
+_MR_PATH = re.compile(r"/(?P<project>[^?#]+?)/(?:-/)?merge_requests/(?P<iid>\d+)(?:[/?#].*)?\Z")
 
 
 def _ci_status(status: str | None) -> CIStatus | None:
@@ -145,7 +147,8 @@ class GitLabReview(GitLabWriter):
             state=_state(d.get("state")), sha=d.get("sha") or "",
             conflict=_conflict(d.get("detailed_merge_status") or d.get("merge_status") or ""),
             ci_id=p.get("id"), ci_status=_ci_status(p.get("status")), ci_sha=p.get("sha"), ci_url=p.get("web_url"),
-            closed_by=(d.get("closed_by") or {}).get("username") or "", target=d.get("target_branch") or "")
+            closed_by=(d.get("closed_by") or {}).get("username") or "", target=d.get("target_branch") or "",
+            source=d.get("source_branch") or "")
 
     def notes(self, project_id: int, iid: int, mr_url: str) -> list[Note]:
         """Every note of every discussion, so a late reply in an old thread is seen too."""
@@ -356,6 +359,23 @@ class GitLabHost:
         except (AuthError, NotFound, BadRequest):
             return False
         return True
+
+    def mr_link(self, url: str, repos: list[Repo]) -> tuple[Repo, Id] | None:
+        link, base = urlsplit(url.strip()), urlsplit(self.cfg.url)
+        if link.netloc.lower() != base.netloc.lower():
+            return None
+        m = _MR_PATH.match(link.path[len(base.path.rstrip("/")):] if link.path.startswith(base.path) else "")
+        if m is None:
+            return None
+        group = self.cfg.group.strip("/").lower()
+        project = m["project"].lower()
+        for r in repos:  # the group's own projects only: a same-named project elsewhere is not one of them
+            if project == f"{group}/{r.relative_path.lower()}":
+                return r, int(m["iid"])
+        return None
+
+    def mr_head_ref(self, iid: Id) -> str:
+        return f"refs/merge-requests/{iid}/head"
 
     def git_auth(self) -> GitAuth:
         return GitAuth(self.cfg.url, self.cfg.bot_user, self._token)

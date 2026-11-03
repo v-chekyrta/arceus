@@ -93,6 +93,10 @@ class YouTrack:
         )
         return list(self.search(q))
 
+    def issues_in_state(self, project: str, state_field: str, state: str) -> list[Issue]:
+        q = f"project: {query_value(project)} {state_field}: {query_value(state)} sort by: updated desc"
+        return list(self.search(q))
+
     def tag_activities(self, issue_id: str) -> Iterator[dict]:
         """All tag changes of an issue, oldest first, following the cursor to the end."""
         fields = "afterCursor,hasAfter,activities(id,timestamp,author(login),added(name),removed(name))"
@@ -266,6 +270,9 @@ class YouTrackTracker:
     def queued(self) -> list[Issue]:
         c = self.cfg
         return self.api.queued_issues(c.project, c.tags.queue, c.state_field, c.states.queued)
+
+    def in_state(self, state: str) -> list[Issue]:
+        return self.api.issues_in_state(self.cfg.project, self.cfg.state_field, state)
 
     def trigger(self, issue: Issue) -> Trigger | None:
         event = self.api.tag_setter(issue.db_id, self.cfg.tags.queue)
