@@ -113,8 +113,8 @@ class Bench:
 @pytest.fixture
 def b(tmp_path):
     bench = Bench(tmp_path)
-    bench.notifier.tick("idle")  # the first run records where things are and tells none of the past
-    bench.flush()
+    bench.notifier.tick("working")  # the first run records where things are and tells none of the past
+    bench.flush()  # and the day's status: an idle spell untold by then would be told in it
     yield bench
     bench.events.close()
     bench.store.close()
@@ -456,44 +456,155 @@ def test_idle_is_told_once_after_a_quarter_hour_and_never_while_people_owe_an_an
     b.clock.advance(minutes=6)
     b.notifier.tick("idle")
     [idle] = [x for x in b.flush() if "💤" in x]
-    assert "the queue is empty" in idle and "`agent`" in idle
-    b.clock.advance(minutes=119)
+    assert idle.startswith("💤 Nothing to take: the queue is empty. Add the `agent` tag")
+    # At once, with what it can take.
+    assert "What the agent can take:\n• `agent` tag on a ticket" in idle
+    assert "`agent-research`" in idle and "`/continue`" in idle
+    assert "• Code review on request (`/review` on a ticket in Code Review) is off for this project" in idle
+    for _ in range(4):  # and never again while the spell lasts
+        b.clock.advance(hours=1)
+        b.notifier.tick("idle")
+    assert [x for x in b.flush() if "💤" in x] == []
+    b.notifier.tick("unknown")  # the queue could not be read: not the end of the spell
+    b.clock.advance(minutes=30)
+    b.notifier.tick("idle")
+    b.clock.advance(minutes=30)
     b.notifier.tick("idle")
     assert [x for x in b.flush() if "💤" in x] == []
-    b.clock.advance(minutes=1)  # two hours after the first notice: said again, with what it can take
+    b.notifier.tick("working")  # work, then idle again: a new spell, told once
     b.notifier.tick("idle")
-    [again] = [x for x in b.flush() if "💤" in x]
-    assert again.startswith("💤 Still idle, 2 h 16 min now: nothing in the queue.")
-    assert "• `agent` tag on a ticket" in again and "`agent-research`" in again and "`/continue`" in again
-    assert "• Code review on request (`/review` on a ticket in Code Review) is off for this project" in again
-    b.clock.advance(hours=2)
+    b.clock.advance(minutes=16)
     b.notifier.tick("idle")
-    assert len([x for x in b.flush() if "Still idle" in x]) == 1  # and every two hours after
-    b.notifier.tick("unknown")  # the queue could not be read: the idle spell is over, and not a new one
-    b.clock.advance(hours=1)
-    b.notifier.tick("unknown")
+    assert len([x for x in b.flush() if "💤" in x]) == 1
+
+
+def test_an_idle_spell_is_told_once_across_a_restart_and_with_an_old_idle_repeat(tmp_path):
+    bench = Bench(tmp_path, idle_repeat="2h")  # a config.yaml from before still loads; the setting does nothing
+    bench.notifier.tick("working")
+    bench.notifier.tick("idle")
+    bench.clock.advance(minutes=16)
+    bench.notifier.tick("idle")
+    assert len([x for x in bench.flush() if "💤" in x]) == 1
+    bench.notifier = bench.new_notifier()
+    for _ in range(3):
+        bench.clock.advance(hours=2)
+        bench.notifier.tick("idle")
+    assert [x for x in bench.flush() if "💤" in x] == []
+
+
+def test_an_idle_spell_from_off_hours_is_told_in_the_morning_once(b):
+    b.clock.t = datetime(2026, 10, 20, 17, 0, tzinfo=UTC)  # 20:00 in Kyiv: the work is over, off hours
+    b.notifier.tick("idle")
+    b.clock.t = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+    b.notifier.tick("idle")
+    assert b.flush() == []
+    b.clock.t = datetime(2026, 10, 21, 6, 0, tzinfo=UTC)  # 09:00 next day: the plain status, then the 💤
+    b.notifier.tick("idle")
+    daily, idle = b.flush()
+    assert daily.startswith("☀️") and "Nothing in work and nothing queued" in daily
+    assert "What the agent can take" not in daily
+    assert idle.startswith("💤 Nothing to take") and "What the agent can take:\n• `agent` tag on a ticket" in idle
+    b.clock.t = datetime(2026, 10, 21, 10, 0, tzinfo=UTC)
+    b.notifier.tick("idle")
+    b.clock.t = datetime(2026, 10, 22, 6, 0, tzinfo=UTC)  # the next morning, the same spell: the status alone
+    b.notifier.tick("idle")
+    [daily] = b.flush()
+    assert daily.startswith("☀️")
+
+
+def test_an_idle_spell_starting_with_the_day_waits_its_quarter_hour(tmp_path):
+    bench = Bench(tmp_path)
+    bench.notifier.tick("idle")  # the first start, in working hours, nothing to do: the status, no 💤 yet
+    [daily] = bench.flush()
+    assert daily.startswith("☀️") and "What the agent can take" not in daily
+    bench.clock.advance(minutes=10)
+    bench.notifier.tick("idle")
+    assert bench.flush() == []
+    bench.clock.advance(minutes=6)
+    bench.notifier.tick("idle")
+    [idle] = bench.flush()
+    assert idle.startswith("💤 Nothing to take") and "What the agent can take" in idle
+
+
+def test_the_morning_status_held_by_slack_offers_no_work(b):
+    b.clock.t = datetime(2026, 10, 20, 17, 0, tzinfo=UTC)  # idle since 20:00
+    b.notifier.tick("idle")
+    b.slack.answers += [(503, "", {})] * 20
+    b.clock.t = datetime(2026, 10, 21, 6, 0, tzinfo=UTC)  # 09:00: the status and the 💤 are queued, Slack is down
+    b.notifier.tick("idle")
+    assert b.flush() == []
+    b.notifier.tick("working")  # a ticket is taken before Slack is back
+    b.slack.answers.clear()
+    b.clock.advance(minutes=10)
+    out = b.flush()
+    assert [x[:2] for x in out] == ["☀️"]  # the status still goes: it says what was so at 09:00, no offer in it
+
+
+def test_an_idle_notice_slack_never_took_is_told_once_slack_is_back(b):
+    b.notifier.tick("idle")
+    b.slack.answers += [(503, "", {})] * 1000  # Slack down past routine_expire (2 h)
+    for _ in range(20):
+        b.clock.advance(minutes=10)
+        b.notifier.tick("idle")
+        b.flush()
+    assert b.events_named("slack_dropped")[0]["reason"] == "expired"
+    b.slack.answers.clear()
+    b.clock.advance(minutes=10)
+    b.notifier.tick("idle")
+    b.clock.advance(minutes=5)  # the sender's backoff after the 503s runs out
+    out = [x for x in b.flush() if "💤" in x]
+    assert len(out) == 1 and "What the agent can take" in out[0]
+    for _ in range(4):
+        b.clock.advance(hours=1)
+        b.notifier.tick("idle")
     assert [x for x in b.flush() if "💤" in x] == []
 
 
-def test_idle_reminders_wait_for_working_hours_and_the_morning_status_stands_for_one(b):
+def test_an_idle_notice_held_past_the_working_day_is_told_the_next_morning(b):
+    b.clock.t = datetime(2026, 10, 20, 15, 30, tzinfo=UTC)  # 18:30 in Kyiv
     b.notifier.tick("idle")
-    b.clock.t = datetime(2026, 10, 20, 15, 0, tzinfo=UTC)  # 18:00 in Kyiv
+    b.clock.t = datetime(2026, 10, 20, 15, 50, tzinfo=UTC)
+    b.slack.answers += [(503, "", {})] * 3
     b.notifier.tick("idle")
     b.flush()
-    b.clock.t = datetime(2026, 10, 20, 18, 0, tzinfo=UTC)  # 21:00: off hours, three hours idle
+    b.clock.t = datetime(2026, 10, 20, 16, 30, tzinfo=UTC)  # 19:30: Slack back, the day over: dropped
     b.notifier.tick("idle")
     assert [x for x in b.flush() if "💤" in x] == []
-    b.clock.t = datetime(2026, 10, 21, 6, 0, tzinfo=UTC)  # 09:00 next day: the status says it, no 💤 behind it
+    b.clock.t = datetime(2026, 10, 21, 6, 0, tzinfo=UTC)  # 09:00, the same spell: one 💤 after the status
     b.notifier.tick("idle")
     out = b.flush()
-    assert [x[:2] for x in out] == ["☀️"] and "Nothing in work and nothing queued" in out[0]
-    b.clock.t = datetime(2026, 10, 21, 8, 0, tzinfo=UTC)  # two hours after the status
+    b.clock.advance(minutes=10)  # past the sender's backoff after the last 503
+    out += b.flush()
+    b.clock.advance(hours=3)
     b.notifier.tick("idle")
-    [again] = b.flush()
-    assert again.startswith("💤 Still idle")
+    out = [x for x in out + b.flush() if "💤" in x]
+    assert len(out) == 1 and "What the agent can take" in out[0]
+
+
+def test_idle_notices_an_older_runner_queued_are_not_posted(b):
+    b.notifier.tick("idle")
+    b.clock.advance(minutes=16)
+    live = {"meta": "idle_since", "value": b.notifier.outbox.meta("idle_since"), "hours": True}
+    since = float(live["value"])
+    with b.store.transaction():  # what the old runner left in runner.db: its first 💤 and a repeat, unsent
+        b.notifier.put(f"idle:{since:.0f}", "idle", notify.ROUTINE, "💤 Nothing to take: the queue is empty.",
+                       live_while=live)
+        b.notifier.put(f"idle:{since:.0f}:1", "idle", notify.ROUTINE, "💤 Still idle, 2 h now", live_while=live)
+        b.notifier.put("started:1", "runner_started", notify.RUNNER, "🟢 Arceus runner started (live mode).")
+        b.notifier.outbox.set_meta("idle_told", str(since))
+    b.notifier = b.new_notifier()  # the new runner starts on the same runner.db
+    b.notifier.tick("idle")
+    out = b.flush()
+    assert [x for x in out if "Still idle" in x or "runner started" in x] == []
+    [idle] = [x for x in out if "💤" in x]  # the spell told once, the new way
+    assert "What the agent can take" in idle
+    b.clock.advance(hours=3)
+    b.notifier.tick("idle")
+    assert b.flush() == []
 
 
 def test_a_waiting_idle_notice_is_not_posted_once_work_came(b):
+    b.notifier.tick("idle")
     b.clock.advance(minutes=16)
     b.notifier.tick("idle")  # the 💤 is queued; Slack has not taken it yet
     b.notifier.tick("working")  # then a ticket is taken
@@ -504,6 +615,7 @@ def test_a_waiting_idle_notice_is_not_posted_once_work_came(b):
 
 
 def test_the_sender_checks_the_idle_spell_itself(b):
+    b.notifier.tick("idle")
     b.clock.advance(minutes=16)
     b.notifier.tick("idle")
     b.notifier.outbox.set_meta("idle_since", "1")  # another spell by the time the sender gets to it
@@ -523,16 +635,6 @@ def test_an_idle_notice_held_past_the_working_day_is_dropped(b):
     assert b.events_named("slack_dropped")[-1]["reason"] == "the working day ended before it went out"
 
 
-def test_idle_repeat_can_be_switched_off(tmp_path):
-    bench = Bench(tmp_path, idle_repeat=None)
-    bench.notifier.tick("idle")
-    bench.clock.advance(minutes=20)
-    bench.notifier.tick("idle")
-    bench.clock.advance(hours=5)
-    bench.notifier.tick("idle")
-    assert [x for x in bench.flush() if "Still idle" in x] == []
-
-
 def test_idle_reminder_offers_the_code_review_when_it_is_on(tmp_path):
     bench = Bench(tmp_path, review_agent=True)
     [review] = [line for line in bench.notifier.can_do() if "review" in line.lower() and "/review" in line]
@@ -540,13 +642,12 @@ def test_idle_reminder_offers_the_code_review_when_it_is_on(tmp_path):
     assert "without changing the code" in review and "does not approve" in review  # the example has no approver
     # With MRs waiting on people, the reminder says the agent can take their review.
     bench.task(state="code_review", mr_urls=json.dumps(["https://gl.example/acme/mr/1"]))
+    bench.notifier.tick("working")
     bench.notifier.tick("idle")
     bench.clock.advance(minutes=20)
     bench.notifier.tick("idle")
-    bench.clock.advance(hours=2)
-    bench.notifier.tick("idle")
-    [again] = [x for x in bench.flush() if "Still idle" in x]
-    assert "1 task(s) wait in code review with people. `/review` on their ticket hands the review to the agent." in again
+    [idle] = [x for x in bench.flush() if "💤" in x]
+    assert "1 task(s) wait in code review with people. `/review` on their ticket hands the review to the agent." in idle
 
 
 def test_the_daily_status_goes_once_a_working_day(tmp_path):
@@ -608,8 +709,28 @@ def test_health_fail_at_once_service_after_ten_minutes_and_back_once(b):
                                                "✅ service.youtrack is back to normal"]
 
 
-def test_quick_restarts_are_counted_and_downtime_is_told(b):
-    b.notifier.tick("idle")  # heartbeat
+def test_starts_and_stops_are_not_told(b):
+    b.notifier.tick("idle")
+    b.flush()
+    for _ in range(3):
+        b.events.emit("runner_started", mode="live")
+        b.clock.advance(hours=1)
+        b.events.emit("runner_stopped", reason="signal")
+        b.clock.advance(hours=1)
+    assert [x for x in b.flush() if "runner" in x] == []
+    assert len(b.events_named("runner_started")) == 3  # still in events.jsonl
+
+
+def test_a_start_or_stop_queued_before_is_not_posted(b):
+    b.notifier.put("stop", "runner_stopped", notify.RUNNER, "⚪️ stopped")
+    b.notifier = b.new_notifier()
+    assert b.flush() == []
+
+
+def test_quick_restarts_are_counted_and_downtime_is_told(tmp_path):
+    b = Bench(tmp_path, runner_lifecycle=True)
+    b.notifier.tick("working")  # heartbeat
+    b.flush()
     b.events.emit("runner_started", mode="live")
     b.clock.advance(minutes=1)
     b.events.emit("runner_stopped", reason="exit")

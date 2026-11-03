@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from arceus_runner import loop
-from arceus_runner.config import SlackConfig
+from arceus_runner.config import SlackConfig, SlackNotify
 from arceus_runner.db import AlreadyRunning, InstanceLock, ReviewStore as Store
 from arceus_runner.events import EventLog
 from arceus_runner.http import AUTH_RETRY_SECONDS
@@ -252,7 +252,8 @@ def test_run_reports_to_the_slack_webhook_and_keeps_its_url_out_of_the_log(cfg, 
 
     from arceus_runner import notify
     hook = "https://hooks.slack.com/services/T0ACME/B0ACME/XXXXsecretXXXX"
-    cfg = cfg.model_copy(update={"slack": SlackConfig(webhook_env="SLACK_WEBHOOK_URL")})
+    cfg = cfg.model_copy(update={"slack": SlackConfig(webhook_env="SLACK_WEBHOOK_URL",
+                                                     notify=SlackNotify(runner_lifecycle=True))})
     secrets = dataclasses.replace(secrets, slack_webhook=hook)
     posts: list[str] = []
 
@@ -266,7 +267,7 @@ def test_run_reports_to_the_slack_webhook_and_keeps_its_url_out_of_the_log(cfg, 
     monkeypatch.setattr(loop, "build_code_host", lambda c, s: real_gl(c, s, transport=httpx.MockTransport(fake_gl)))
     monkeypatch.setattr(notify, "build", lambda *a, **k: real_build(*a, **k, transport=httpx.MockTransport(slack)))
     assert loop.run(cfg, secrets, once=True) == 0
-    # The start went out before the sender stopped; the stop right after it is a quick restart, counted not told.
+    # Told when switched on: the start went out before the sender stopped; the stop right after it is a quick restart, counted not told.
     assert any(p.startswith("🟢 Arceus runner started (observe mode).") for p in posts)
     assert not any("stopped" in p for p in posts)
     log = cfg.paths.events.read_text()

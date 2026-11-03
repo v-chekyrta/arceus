@@ -190,10 +190,11 @@ class SlackNotify(Strict):
     summary_every: Duration = timedelta(minutes=30)     # what a running task did, only when it did something
     summaries_off_hours: bool = False                   # off hours the summary waits for the working day
     idle_after: Duration = timedelta(minutes=15)        # nothing to take this long, in working hours: said once
-    # Still nothing to take: said again this often (working hours), with what the agent can be given. null: never.
-    idle_repeat: Duration | None = timedelta(hours=2)
+    # No longer used: an idle spell is told once. Kept so a config.yaml that still sets it loads.
+    idle_repeat: Duration | None = None
     question_reminder: Duration = timedelta(hours=24)   # an unanswered question or held text: again, in working hours
     service_down_after: Duration = timedelta(minutes=10)  # the tracker or code host unreachable this long
+    runner_lifecycle: bool = False                      # tell the runner's starts and stops (off: events.jsonl only)
     restart_quiet: Duration = timedelta(minutes=10)     # starts and stops closer than this are counted, not told
     daily_status: bool = True                           # one status at the start of each working day
     routine_expire: Duration = timedelta(hours=2)       # a summary not delivered by then is dropped as stale

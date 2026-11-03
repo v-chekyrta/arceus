@@ -139,17 +139,17 @@ The runner reports to the project's channel through a Slack incoming webhook: wh
 | The agent has written nothing on its own turn | `limits.agent_quiet_after` (20m) | once per quiet spell |
 | Paused for a usage limit | the limit runs out | once per pause |
 | Reminder of an unanswered question or a held text, with the mention | every `question_reminder` (24h) | working hours only |
-| Nothing to take: the queue is empty, what waits on people | `idle_after` (15m) with nothing running, queued or waiting on a person | once, working hours only |
-| Still nothing to take: for how long, and what the agent can be given (the queue tag, research, `/continue`, code review on request: how to ask and what it does, or that it is off and how to turn it on; with MRs waiting on people, that the agent can review them) | the idle spell goes on | every `idle_repeat` (2h), working hours only; the morning status during an idle spell counts as one |
+| Nothing to take: the queue is empty, what waits on people, and what the agent can be given (the queue tag, research, `/continue`, code review on request: how to ask and what it does, or that it is off and how to turn it on; with MRs waiting on people, that the agent can review them) | `idle_after` (15m) with nothing running, queued or waiting on a person | once per idle spell, working hours only; a tracker outage does not start a new spell |
 | Status: in work, waiting for answers, in code review, failed in the last day, the queue | the first pass of each working day | once a day |
 | A health check fails; the tracker or the code host does not answer for `service_down_after` (10m); a warning such as low disk or an expiring token; each one back to normal | the change | once per change |
-| Runner started (and how long it was down), stopped; a pass that raised | start and stop; restarts closer than `restart_quiet` (10m) are counted into the next start | an error at most once an hour |
+| A pass that raised | the error | at most once an hour |
+| Runner started (and how long it was down), stopped: off by default, `runner_lifecycle: true` turns it on | start and stop; restarts closer than `restart_quiet` (10m) are counted into the next start | once per start or stop |
 
 The settings are under `slack.notify` in [config.example.yaml](../config/config.example.yaml). Mentions come only from `slack.people`, an optional map of tracker login → Slack member ID: the webhook's text carries `<@U012AB3CD>` and Slack pings that member, no bot or token involved; left empty, people are named as plain text and nobody is pinged; text from tickets and from the agent is escaped, so an `<!channel>` in it stays text. Questions are still answered on the ticket: the webhook only posts.
 
 Messages go through `runner.db` and a thread of their own, so the loop never waits for Slack and a Slack outage stops no work: they wait and go out when Slack answers again, Slack's `Retry-After` respected, at most one a second. A question or reminder whose task has moved on before it went out is dropped. A transition is told from the task's state in `runner.db`, so one that happened just before a crash is told after the restart. A message whose post timed out may be posted twice; each carries a number (`#123`) to tell. Routine messages not delivered in 2 hours are dropped. A webhook Slack refuses (revoked, channel archived) shows as a `WARN` `slack.webhook` line in `doctor` and on the dashboards and never stops new tasks; replace the URL and restart.
 
-A runner that is not running cannot say so. The next start says how long it was down, and a working day without the morning status means it is not running; an alert on `runner_last_tick_seconds` in Grafana catches it sooner.
+A runner that is not running cannot say so. A working day without the morning status means it is not running (with `runner_lifecycle: true` the next start also says how long it was down); an alert on `runner_last_tick_seconds` in Grafana catches it sooner.
 
 ## Google documents
 

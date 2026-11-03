@@ -72,11 +72,11 @@ slack:
   notify:
     summary_every: 30m          # what a running task did, only when it did something
     summaries_off_hours: false  # off hours the summary waits for the working day
-    idle_after: 15m             # nothing to take this long, in working hours: said
-    idle_repeat: 2h             # still nothing: said again this often, with what the agent can take (null: never)
+    idle_after: 15m             # nothing to take this long, in working hours: said once, with what the agent can take
     question_reminder: 24h      # an unanswered question or held text again, in working hours
     service_down_after: 10m     # the tracker or the code host not answering this long
-    restart_quiet: 10m          # starts and stops closer than this are counted, not told one by one
+    runner_lifecycle: false     # true: the runner's starts (with how long it was down) and stops go to the channel
+    restart_quiet: 10m          # with runner_lifecycle: starts and stops closer than this are counted, not told one by one
     daily_status: true          # where everything stands, at the start of each working day
 
 schedule:

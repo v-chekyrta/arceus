@@ -16,18 +16,19 @@ questions in noise within the hour, and Slack takes about one message a second p
     a usage limit is out                 paused until the window resets             once per pause
     a question or held text waits        reminder, with the mention                 every question_reminder, in
                                                                                     working hours
-    nothing to take                      the queue is empty, what waits on people   after idle_after, then every
-                                         again: how long, what it can be given      idle_repeat while it lasts,
-                                                                                    working hours only
+    nothing to take                      the queue is empty, what waits on people,  once per idle spell, after
+                                         what the agent can be given                idle_after, working hours only
     a working day starts                 status: in work, waiting, in review,       once a working day
                                          failed, queue
     health                               a check fails, a service is unreachable    on the change, and once when
                                          for service_down_after, and back           it is back
-    the runner                           started (with how long it was down),       once; restarts closer than
-                                         stopped, a tick failing                    restart_quiet are counted
+    the runner                           a tick failing                             at most once an hour
+                                         started (with how long it was down),       only with runner_lifecycle;
+                                         stopped                                    restarts closer than
+                                                                                    restart_quiet are counted
 
-A runner that died cannot say so; the next start says how long it was down, and the daily status is the heartbeat
-whose absence says it. Watching `runner_last_tick_seconds` from outside is the alert for it.
+A runner that died cannot say so; the daily status is the heartbeat whose absence says it, and with runner_lifecycle
+the next start says how long it was down. Watching `runner_last_tick_seconds` from outside is the alert for it.
 
 Durability. Every message goes through the `slack_outbox` table and a sender thread of its own posts it, so the loop
 never waits for Slack and a Slack outage stops nothing. A task's state is told from runner.db itself, compared with
@@ -138,6 +139,10 @@ class Outbox:
         self.conn.execute("UPDATE slack_outbox SET attempts = attempts + 1, last_error = ?,"
                           " uncertain = MAX(uncertain, ?) WHERE id = ?", (error, int(uncertain), row_id))
 
+    def status_of(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT status FROM slack_outbox WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
     def prune(self, before: float) -> None:
         self.conn.execute("DELETE FROM slack_outbox WHERE status != 'pending' AND done_at < ?", (before,))
 
@@ -174,6 +179,12 @@ class Outbox:
     def drop_pending(self, kind: str, at: float, why: str) -> int:
         cur = self.conn.execute("UPDATE slack_outbox SET status = 'dropped', done_at = ?, last_error = ?"
                                 " WHERE status = 'pending' AND kind = ?", (at, why, kind))
+        return cur.rowcount
+
+    def drop_pending_but(self, kind: str, keep: str, at: float, why: str) -> int:
+        """Like drop_pending, sparing the messages whose key matches the GLOB `keep`."""
+        cur = self.conn.execute("UPDATE slack_outbox SET status = 'dropped', done_at = ?, last_error = ?"
+                                " WHERE status = 'pending' AND kind = ? AND key NOT GLOB ?", (at, why, kind, keep))
         return cur.rowcount
 
 
@@ -382,6 +393,15 @@ class Notifier:
                 for t in self.store.tasks():
                     self.outbox.set_told_state(t.task_id, self.sig(t))
                 self.outbox.set_meta("seeded", self.now().isoformat())
+        with self.store.transaction():
+            # Before the sender starts: what an older runner queued and this one no longer tells does not go out now.
+            at = self.now().timestamp()
+            if not self.n.runner_lifecycle:
+                for kind in ("runner_started", "runner_stopped"):
+                    self.outbox.drop_pending(kind, at, "starts and stops are not told")
+            if self.outbox.drop_pending_but("idle", "idle_offer:*", at, "an older runner's idle notice"):
+                # Its 💤 had no commands, or was a repeat: this spell is told once more, the new way.
+                self.outbox.drop_meta("idle_told")
         events.listen(self.on_event)
 
     # -- putting a message in the outbox --
@@ -435,6 +455,11 @@ class Notifier:
         if now - last < self.n.restart_quiet.total_seconds():
             self.outbox.set_meta("restarts_untold", str(int(self.outbox.meta("restarts_untold") or 0) + 1))
             return
+        if not self.n.runner_lifecycle:
+            # Not told, but counted as told: switched back on, the next start says what happened since this one.
+            self.outbox.set_meta("start_told", str(now))
+            self.outbox.set_meta("restarts_untold", "0")
+            return
         text = f"🟢 Arceus runner started ({esc(r.get('mode'))} mode)."
         beat = float(self.outbox.meta("heartbeat") or 0)
         if beat and now - beat > self.n.restart_quiet.total_seconds():
@@ -453,6 +478,8 @@ class Notifier:
         self.outbox.set_meta("heartbeat", str(now))
         if now - float(self.outbox.meta("start_told") or 0) < self.n.restart_quiet.total_seconds():
             return  # a quick restart: the next start counts it
+        if not self.n.runner_lifecycle:
+            return
         why = "it was asked to stop" if r.get("reason") == "signal" else "it exited"
         # Ahead of the runner's other news: it has DRAIN_SECONDS to go out before the process ends.
         self.put(f"stopped:{r['ts']}", "runner_stopped", TRANSITION,
@@ -567,7 +594,7 @@ class Notifier:
         self.sync_tasks()
         self.remind()
         self.summarize()
-        self.daily(situation, queue_known and situation != "unknown")  # first: an idle status replaces a 💤
+        self.daily(situation, queue_known and situation != "unknown")
         self.idle(situation)
         self.outbox.set_meta("heartbeat", str(self.now().timestamp()))
 
@@ -716,9 +743,12 @@ class Notifier:
         self.summary_from = now
 
     def idle(self, situation: str) -> None:
-        """Nothing to take: said after idle_after of it in working hours, then again every idle_repeat while it lasts,
-        with what the agent can be given. Waiting on people (a question, a held text) or not knowing (the queue
-        unreadable) is not idle. The daily status said during an idle spell counts as a telling of it."""
+        """Nothing to take: said once per idle spell, after idle_after of it in working hours, with what the agent can
+        be given. Waiting on people (a question, a held text) or work ends the spell; not knowing (the queue
+        unreadable, health keeping new work out) neither ends it nor counts toward it, so a tracker outage does not
+        start a new one. The daily status does not tell it: only the 💤 says what the agent can take."""
+        if situation == "unknown":
+            return
         if situation != "idle":
             if self.outbox.meta("idle_since"):
                 # Over: a 💤 still waiting for Slack would now say something false.
@@ -732,33 +762,29 @@ class Notifier:
         if not since:
             self.outbox.set_meta("idle_since", str(now))
             return
-        if not self.working():
+        told = self.outbox.meta("idle_told")
+        if told and self.outbox.status_of(told) != "dropped":
+            return  # queued, posted or refused by Slack (or done so long ago that it is pruned): told
+        # Not told yet, or its 💤 expired or outlived the working day unsent while the spell went on: (again) now.
+        if not self.working() or now - since < self.n.idle_after.total_seconds():
             return
-        told = float(self.outbox.meta("idle_told") or 0)
         review = [t for t in self.store.tasks("code_review") if not t.people_work]
         waiting = f" {len(review)} task(s) wait in code review with people." if review else ""
-        if review and told and self.cfg.review_agent.enabled:
+        if review and self.cfg.review_agent.enabled:
             waiting += f" `{esc(self.cfg.review_agent.command)}` on their ticket hands the review to the agent."
-        if not told:
-            if now - since < self.n.idle_after.total_seconds():
-                return
-            tag = self.cfg.tracker.tags.queue
-            key, text = f"idle:{since:.0f}", (f"💤 Nothing to take: the queue is empty. Add the `{esc(tag)}` tag to a "
-                                              f"ticket to start the agent.{waiting}")
-        else:
-            if self.n.idle_repeat is None or now - told < self.n.idle_repeat.total_seconds():
-                return
-            n = int(self.outbox.meta("idle_repeats") or 0) + 1
-            self.outbox.set_meta("idle_repeats", str(n))
-            key = f"idle:{since:.0f}:{n}"
-            text = (f"💤 Still idle, {ago(now - since)} now: nothing in the queue.{waiting}\n"
-                    "What the agent can take:\n" + "\n".join(f"• {line}" for line in self.can_do())
-                    + "\nOnly people on the project's list can start it; its questions are answered on the ticket.")
+        tag = self.cfg.tracker.tags.queue
+        text = (f"💤 Nothing to take: the queue is empty. Add the `{esc(tag)}` tag to a ticket to start the agent."
+                f"{waiting}\n" + self.offer())
+        key = f"idle_offer:{since:.0f}:{now:.0f}"
         with self.store.transaction():
             # Only while this spell lasts and the working day does: the sender checks both before it posts.
             self.put(key, "idle", ROUTINE, text,
                      live_while={"meta": "idle_since", "value": self.outbox.meta("idle_since"), "hours": True})
-            self.outbox.set_meta("idle_told", str(now))
+            self.outbox.set_meta("idle_told", key)
+
+    def offer(self) -> str:
+        return ("What the agent can take:\n" + "\n".join(f"• {line}" for line in self.can_do())
+                + "\nOnly people on the project's list can start it; its questions are answered on the ticket.")
 
     def can_do(self) -> list[str]:
         """What a person can give the agent, as this project is set up."""
@@ -825,9 +851,6 @@ class Notifier:
         with self.store.transaction():
             self.put(f"daily:{today}", "daily", ROUTINE, "\n".join(lines))
             self.outbox.set_meta("daily", today)
-            if situation == "idle" and self.outbox.meta("idle_since"):
-                # The status just said nothing is in work: no 💤 right behind it; the next one counts from here.
-                self.outbox.set_meta("idle_told", str(now))
 
 
 def test_message(webhook: Webhook, project: str) -> str:
