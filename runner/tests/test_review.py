@@ -69,6 +69,20 @@ def test_mr_description_says_what_was_done(w):
     assert "/issue/ACME-1" in mr["description"] and "passed review. Arceus pushed the branch" in mr["description"]
 
 
+def test_a_markdown_summary_keeps_its_lines_in_the_mr(w):
+    take(w)
+    w.agent_commits()
+    summary = ("Users can reset their password.\n\n### Changes\n- New `reset_token` field.\n"
+               "- Codex: `POST reset/` refuses an unknown email.\n\n### How it was checked\n- `make verify` passes.")
+    w.settle("ACME-1", "waiting_review", outcome={"summary": summary})
+    w.tick()
+    [mr] = w.gl.mrs
+    assert ("## What was done\nUsers can reset their password.\n\n### Changes\n- New `reset_token` field.\n"
+            "- `POST reset/` refuses an unknown email.\n\n### How it was checked\n- `make verify` passes.\n\n"
+            "## Commits\n") in mr["description"]
+    assert mr["description"].count("## Checks") == 1
+
+
 def test_a_review_note_goes_to_the_agent_once_after_quiet(w):
     published(w)
     w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function", path="app/login.py", line=12)
