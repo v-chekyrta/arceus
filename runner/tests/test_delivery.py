@@ -14,6 +14,7 @@ import pytest
 
 from arceus_runner import loop
 from arceus_runner.config import Config
+from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
 from arceus_runner.db import ReviewStore as TaskStore
 from arceus_runner.engine import Engine
 from arceus_runner.events import EventLog
@@ -779,7 +780,7 @@ def test_notes_of_comments_only_change_nothing(tmp_path, secrets):
 
 @pytest.mark.parametrize("text,reason", [
     (None, "does not exist"),
-    ("x" * 8193, "is 8193 bytes without comments, more than 8192; shorten it"),
+    ("x" * 16385, "is 16385 bytes without comments, more than 16384; shorten it"),
     (b"\xff\xfe", "cannot be read"),
 ])
 def test_notes_that_cannot_be_given_whole_stop_the_task(tmp_path, secrets, text, reason):
@@ -792,6 +793,15 @@ def test_notes_that_cannot_be_given_whole_stop_the_task(tmp_path, secrets, text,
     assert w.calls("dispatch") == [] and not (w.cfg.paths.workspace / "AGENTS.md").exists()
     w.events.close()
     w.store.close()
+
+
+def test_notes_count_bytes_up_to_the_limit_inclusive(tmp_path):
+    notes = tmp_path / "project-notes.md"
+    notes.write_text("<!-- guidance -->\n" + "я" * (PROJECT_NOTES_LIMIT // 2) + "\n")
+    assert project_notes(notes) == "я" * (PROJECT_NOTES_LIMIT // 2)
+    notes.write_text("я" * (PROJECT_NOTES_LIMIT // 2) + "x")
+    with pytest.raises(ProjectNotesError, match=f"is {PROJECT_NOTES_LIMIT + 1} bytes"):
+        project_notes(notes)
 
 
 def test_a_changed_repository_missing_from_bulavas_report_blocks_publication(w):

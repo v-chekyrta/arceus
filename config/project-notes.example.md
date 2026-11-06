@@ -18,7 +18,7 @@ What does not belong here:
 - Secrets, tokens, passwords.
 - What one ticket needs: that goes on the ticket.
 
-The server's notes win where these contradict them. At most 8 KB without the comments; a longer file
+The server's notes win where these contradict them. At most 16 KB without the comments; a longer file
 stops new tasks until it is shortened (arceus-runner check shows the size). A task keeps the notes it
 started with to its end, its code review included; a change reaches the next task.
 -->

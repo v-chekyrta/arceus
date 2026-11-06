@@ -78,7 +78,7 @@ HOME_IGNORE = """\
 
 FETCHED_KEPT = 4  # deliveries whose fetched files are kept in memory while they wait (Delivery._fetched): at most
                   # 4 × materials.MAX_TOTAL_BYTES
-PROJECT_NOTES_LIMIT = 8 * 1024  # bytes: every session of every task reads them whole
+PROJECT_NOTES_LIMIT = 16 * 1024  # bytes: every session of every task reads them whole
 PROJECT_NOTES_HEAD = ("These notes come from the people who run this project. Where they contradict the server's "
                       "notes or the rules above, those win.")
 

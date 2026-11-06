@@ -342,7 +342,7 @@ def test_check_shows_the_project_notes_and_fails_on_a_missing_file(tmp_path, cap
             "is fixed") in capsys.readouterr().out
     notes.write_text("<!-- guidance -->\nUse pnpm.\n")
     main(["--config", str(path), "check", "--offline"])
-    assert f"config.project_notes: {notes}: 9 of 8192 bytes" in capsys.readouterr().out
+    assert f"config.project_notes: {notes}: 9 of 16384 bytes" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("section,value,expected", [
