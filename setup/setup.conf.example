@@ -6,8 +6,8 @@
 # and can read the runner's tokens.
 
 # Pinned tool versions. Change them here, re-run setup: the old version is replaced.
-CLAUDE_CODE_VERSION=2.1.316
-CODEX_VERSION=0.166.0
+CLAUDE_CODE_VERSION=2.1.319
+CODEX_VERSION=0.167.0
 CHROME_DEVTOOLS_MCP_VERSION=1.10.1   # must match Bulava's engine/supervisor/automation-mcp.json
 # Google Sheets, Docs and Drive for the agent, read-only (README, "Google documents"). Empty: no Google.
 WORKSPACE_MCP_VERSION=2.3.0
@@ -17,4 +17,4 @@ WORKSPACE_MCP_VERSION=2.3.0
 # /var/lib/arceus/bulava.git), or a branch to follow. To update: `git ls-remote <source> refs/heads/main`,
 # check engine/SERVER.md, re-run setup between tasks (it refuses while a task is running).
 BULAVA_SOURCE=https://github.com/Stepanokdev/bulava
-BULAVA_REF=b38d78b15d576bd47a6a68b9a71dc0ecef034bdc   # main, 1.17 (2026-11-04)
+BULAVA_REF=52fa0ed684a9f1b1489c71d9014a6962d4908492   # main, 1.18.1 (2026-11-07)
