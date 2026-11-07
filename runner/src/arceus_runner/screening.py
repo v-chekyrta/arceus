@@ -398,7 +398,7 @@ def classifier_env(base: dict[str, str]) -> dict[str, str]:
     """What the classifier's process gets: a home, a PATH and the Claude token, nothing of the runner's."""
     home = os.environ.get("HOME", str(Path.home()))
     return {"HOME": home, "USER": os.environ.get("USER", ""), "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "PATH": f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin", **base}
+            "PATH": f"/usr/local/bin:{home}/.local/bin:/usr/bin:/bin", "DISABLE_AUTOUPDATER": "1", **base}
 
 
 Classify = Callable[[dict], Verdict]

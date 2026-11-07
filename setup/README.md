@@ -35,7 +35,7 @@ Setup never overwrites `data/config.yaml`, `secrets.env`, `bulava.env` or `proje
 
 | Path | Owner | What it is |
 |---|---|---|
-| `/opt/agent-tools` | root, read-only | `claude`, `codex` and `chrome-devtools-mcp` at pinned versions, linked from `/usr/local/bin`; `workspace-mcp/`, the Google MCP server in a virtualenv of its own |
+| `/opt/agent-tools` | root, read-only | `claude`, `codex` and `chrome-devtools-mcp` at pinned versions, linked from `/usr/local/bin`; `workspace-mcp/`, the Google MCP server in a virtualenv of its own. The only `claude` and `codex` on the machine: setup removes the copies Claude's native installer (`~/.local/bin/claude`, `~/.local/share/claude`) and `npm i -g` under nvm leave in the user's home, and the services find `/usr/local/bin` first and run with `DISABLE_AUTOUPDATER=1`. To update them, change the versions in `setup.conf` and re-run setup; `claude update` and `codex update` do not apply here |
 | `/opt/arceus-runner` | root, read-only | the runner's code and virtualenv |
 | `/opt/bulava/engine` | root, read-only | the Bulava engine at `BULAVA_REF`: a full commit (the default), a tag or a branch the server follows (for example `factory`). A new commit is installed by the next `sudo ./setup.sh`, never while a task runs. The engine's `install.sh` runs as the user and writes to their `~/.claude` (worker hooks, status line) and `~/.local/bin` |
 | `/var/lib/arceus/bulava.git` | root | a mirror of the Bulava repository that keeps every commit setup installed (`refs/arceus/<commit>`), so a pinned commit stays installable after Bulava rewrites its branches |

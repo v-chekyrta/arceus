@@ -237,7 +237,26 @@ npm_pkgs() {
     "chrome-devtools-mcp@$CHROME_DEVTOOLS_MCP_VERSION"
 }
 installed_npm_version() { jq -r .version "$TOOLS/lib/node_modules/$1/package.json" 2>/dev/null || true; }
+# Copies of claude and codex outside $TOOLS: Claude's native installer (it updates itself), and `npm i -g`
+# or `codex update` under the user's nvm. A shell that finds them first runs a version nobody pinned,
+# and `claude update` / `codex update` update them instead of the pinned ones.
+stray_agent_tools() {
+  local p
+  for p in "$RUN_HOME/.local/bin/claude" "$RUN_HOME/.local/bin/codex" "$RUN_HOME/.local/share/claude" \
+           "$RUN_HOME"/.nvm/versions/node/*/bin/claude "$RUN_HOME"/.nvm/versions/node/*/bin/codex \
+           "$RUN_HOME"/.nvm/versions/node/*/lib/node_modules/@anthropic-ai/claude-code \
+           "$RUN_HOME"/.nvm/versions/node/*/lib/node_modules/@openai/codex; do
+    if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\n' "$p"; fi
+  done
+}
+remove_stray_agent_tools() {
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] && rm -rf -- "$p" && say "  removed $p: claude and codex are the pinned ones in $TOOLS"
+  done < <(stray_agent_tools)
+}
 check_agent_tools() {
+  [ -z "$(stray_agent_tools)" ] || return 1
   [ "$(installed_npm_version @anthropic-ai/claude-code)" = "$CLAUDE_CODE_VERSION" ] || return 1
   [ "$(installed_npm_version @openai/codex)" = "$CODEX_VERSION" ] || return 1
   [ "$(installed_npm_version chrome-devtools-mcp)" = "$CHROME_DEVTOOLS_MCP_VERSION" ] || return 1
@@ -257,6 +276,7 @@ apply_agent_tools() {
   npm install --global --prefix "$TOOLS" --no-fund --no-audit "${pkgs[@]}"
   chown -R root:root "$TOOLS"; chmod -R go-w "$TOOLS"
   local b; for b in claude codex chrome-devtools-mcp; do ln -sfn "$TOOLS/bin/$b" "/usr/local/bin/$b"; done
+  remove_stray_agent_tools
   if [ -n "$WORKSPACE_MCP_VERSION" ]; then
     rm -rf "$GOOGLE_MCP"   # a clean venv: pip would otherwise keep whatever an older version pulled in
     python3 -m venv "$GOOGLE_MCP"
@@ -416,7 +436,7 @@ check_bulava_install() {
 apply_bulava_install() {
   bulava_wanted || return 0
   (cd /tmp && runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" \
-    PATH="$RUN_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" bash "$ENGINE/install.sh") | sed 's/^/  install.sh: /'
+    PATH="/usr/local/bin:$RUN_HOME/.local/bin:/usr/bin:/bin" bash "$ENGINE/install.sh") | sed 's/^/  install.sh: /'
   install -d -m 755 "$(dirname "$INSTALLED_STAMP")"
   engine_stamp > "$INSTALLED_STAMP"
 }
@@ -509,7 +529,8 @@ engine_env_lines() {
     "Environment=SUPERVISOR_AUTOMATION_MCP_CONFIG=$MCP_CONFIG" \
     "Environment=SUPERVISOR_ALLOW_TOOLS=google" \
     "Environment=\"SUPERVISOR_SERVER_EXTRA_SECRET_PATHS=$DATA_DIR/secrets.env $DATA_DIR/bulava.env $DATA_DIR/runner.db $DATA_DIR/runner.lock $GOOGLE_DIR\"" \
-    "Environment=PATH=$RUN_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    "Environment=PATH=/usr/local/bin:$RUN_HOME/.local/bin:/usr/bin:/bin" \
+    "Environment=DISABLE_AUTOUPDATER=1"
   engine_check_lines
 }
 
