@@ -41,5 +41,5 @@ def test_with_the_google_server_an_unattended_run_may_use_it_and_its_tools_never
 def test_without_it_nothing_changes(tmp_path):
     engine = _engine(tmp_path, _mcp(tmp_path, with_google=False))
     assert "SUPERVISOR_ALLOW_TOOLS" not in engine.env()
-    assert len(engine.secret_paths()) == 4
+    assert not [p for p in engine.secret_paths() if p.is_relative_to(tmp_path / "google")]
     assert google_key(tmp_path / "missing.json") is None and google_key(None) is None

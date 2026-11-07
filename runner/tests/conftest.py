@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from arceus_runner.config import Config, Secrets
+from arceus_runner.checks import Check
 from arceus_runner.integrations import build_code_host, build_tracker
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "config.example.yaml"
@@ -81,3 +82,5 @@ def no_engine_tmux_server(monkeypatch):
     monkeypatch.setattr("arceus_runner.health.engine_tmux_env", lambda socket="bulava": None)
     # Nor are its systemd units, if it has any.
     monkeypatch.setattr("arceus_runner.health.autostart", lambda: [])
+    # Nor its free disk: a full CI runner or laptop would stop new tasks in tests that are not about it.
+    monkeypatch.setattr("arceus_runner.health.disk", lambda cfg: Check("disk_free", "ok", "50% free (100 GB)"))

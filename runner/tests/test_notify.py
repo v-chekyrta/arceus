@@ -623,6 +623,7 @@ def test_an_idle_notice_held_past_the_working_day_is_told_the_next_morning(b):
     b.clock.t = datetime(2026, 10, 20, 16, 30, tzinfo=UTC)  # 19:30: Slack back, the day over: dropped
     b.notifier.tick("idle")
     assert [x for x in b.flush() if "💤" in x] == []
+    assert b.events_named("slack_dropped")[-1]["reason"] == "the working day ended before it went out"
     b.clock.t = datetime(2026, 10, 21, 6, 0, tzinfo=UTC)  # 09:00, the same spell: one 💤 after the status
     b.notifier.tick("idle")
     out = b.flush()
@@ -675,17 +676,6 @@ def test_the_sender_checks_the_idle_spell_itself(b):
     assert [x for x in b.flush() if "💤" in x] == []
     last = b.events_named("slack_dropped")[-1]
     assert (last["kind"], last["reason"]) == ("idle", "the idle spell ended before it went out")
-
-
-def test_an_idle_notice_held_past_the_working_day_is_dropped(b):
-    b.notifier.tick("idle")
-    b.clock.t = datetime(2026, 10, 20, 15, 50, tzinfo=UTC)  # 18:50 in Kyiv, idle since the morning
-    b.slack.answers += [(503, "", {})] * 3
-    b.notifier.tick("idle")
-    b.flush()
-    b.clock.t = datetime(2026, 10, 20, 16, 30, tzinfo=UTC)  # 19:30: Slack back, the day over, still idle
-    assert [x for x in b.flush() if "💤" in x] == []
-    assert b.events_named("slack_dropped")[-1]["reason"] == "the working day ended before it went out"
 
 
 def test_idle_reminder_offers_the_code_review_when_it_is_on(tmp_path):

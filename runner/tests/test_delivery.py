@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import atexit
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -39,6 +42,27 @@ def no_real_tools(monkeypatch):
     monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
 
 
+REPOS = ("acme-platform", "acme-theme", "acme-infra")
+_template: Path | None = None
+
+
+def _origins_template() -> Path:
+    """The origins and their seed clones, made once per test process and copied into each World:
+    every test still gets repositories of its own, without paying for git init, commit and push."""
+    global _template
+    if _template is None:
+        root = Path(tempfile.mkdtemp(prefix="arceus-origins-"))
+        atexit.register(shutil.rmtree, root, True)
+        for name in REPOS:
+            origin, seed = root / "origin" / f"{name}.git", root / "seed" / name
+            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
+            git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+            git(seed, "push", "-q", str(origin), "main")
+        _template = root
+    return _template
+
+
 class World:
     def __init__(self, tmp: Path, secrets, engine_dir: Path | None = None, engine_env: dict | None = None,
                  claude_checks: dict | None = None, settings: dict | None = None):
@@ -61,15 +85,9 @@ class World:
         (tmp / "bulava.env").chmod(0o600)
 
         # origins: a bare repository with one commit on main for every repository of the group
-        self.origins = {}
-        for name in ("acme-platform", "acme-theme", "acme-infra"):
-            origin = tmp / "origin" / f"{name}.git"
-            seed = tmp / "seed" / name
-            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
-            subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
-            git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
-            git(seed, "push", "-q", str(origin), "main")
-            self.origins[name] = origin
+        for part in ("origin", "seed"):
+            shutil.copytree(_origins_template() / part, tmp / part)
+        self.origins = {name: tmp / "origin" / f"{name}.git" for name in REPOS}
         self.origin = self.origins["acme-platform"]
 
         raw = example_raw()
@@ -418,15 +436,6 @@ def test_dirty_tree_refusal_fails_the_task(w):
     assert task.state == "failed" and "uncommitted changes" in task.reason
 
 
-def test_session_lost_after_reboot_is_sent_on(w):
-    take(w)
-    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(attempt_live=False))
-    w.tick()
-    [send] = w.calls("worker-send")
-    assert "resume-ACME-1-1" in send["argv"] and "--answers" not in send["argv"]
-    assert w.store.task("ACME-1").state == "dispatched"
-
-
 def test_a_reboot_is_sent_on_once_and_the_time_it_was_down_is_not_counted(w):
     take(w)
     w.now = datetime.now(UTC) + timedelta(hours=7)  # down for most of attempt_timeout (8 h)
@@ -434,6 +443,7 @@ def test_a_reboot_is_sent_on_once_and_the_time_it_was_down_is_not_counted(w):
     w.tick()
     w.tick()
     assert ["resume-ACME-1-1" in c["argv"] for c in w.calls("worker-send")] == [True]
+    assert "--answers" not in w.calls("worker-send")[0]["argv"] and w.store.task("ACME-1").state == "dispatched"
     w.now += timedelta(hours=5)  # 12 h since the first start, 5 h into the attempt after the reboot
     w.tick()
     assert w.store.task("ACME-1").state == "dispatched"
@@ -780,7 +790,8 @@ def test_notes_of_comments_only_change_nothing(tmp_path, secrets):
 
 @pytest.mark.parametrize("text,reason", [
     (None, "does not exist"),
-    ("x" * 16385, "is 16385 bytes without comments, more than 16384; shorten it"),
+    ("x" * (PROJECT_NOTES_LIMIT + 1),
+     f"is {PROJECT_NOTES_LIMIT + 1} bytes without comments, more than {PROJECT_NOTES_LIMIT}; shorten it"),
     (b"\xff\xfe", "cannot be read"),
 ])
 def test_notes_that_cannot_be_given_whole_stop_the_task(tmp_path, secrets, text, reason):

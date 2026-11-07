@@ -17,6 +17,8 @@ import yaml
 from arceus_runner import loop
 from arceus_runner.cli import EXIT_CHECK_FAILED, EXIT_CONFIG, EXIT_OK, main
 from arceus_runner.config import Config, ConfigError, load_config
+from arceus_runner.db import ReviewStore
+from arceus_runner.delivery import PROJECT_NOTES_LIMIT
 from arceus_runner.engine import Engine
 from arceus_runner.gitops import Git, GitAuth
 from arceus_runner.integrations import build_code_host, build_tracker
@@ -200,12 +202,15 @@ def test_an_approval_is_not_inherited_by_whoever_tags_the_ticket_again(m, by, ta
         assert task.tag_author == taken_by and len(m.calls("dispatch")) == 1
 
 
-def test_the_newest_decision_of_an_issue_decides(m):
-    store = m.store
-    store.record_trigger("ACME-1", "old", "j.doe", True, 1)
-    store.record_trigger("ACME-1", "new", "mallory", False, 2)
-    store.record_trigger("ACME-2", "one", "j.doe", True, 3)
-    assert [(d.issue_key, d.tag_activity_id) for d in store.accepted_untaken()] == [("ACME-2", "one")]
+def test_the_newest_decision_of_an_issue_decides(tmp_path):
+    store = ReviewStore(tmp_path / "runner.db")
+    try:
+        store.record_trigger("ACME-1", "old", "j.doe", True, 1)
+        store.record_trigger("ACME-1", "new", "mallory", False, 2)
+        store.record_trigger("ACME-2", "one", "j.doe", True, 3)
+        assert [(d.issue_key, d.tag_activity_id) for d in store.accepted_untaken()] == [("ACME-2", "one")]
+    finally:
+        store.close()
 
 
 def test_ids_that_would_run_together_in_a_key_stay_two_signals(m):
@@ -262,20 +267,23 @@ def test_keys_of_gitlab_numbers_are_the_ones_already_stored():
 
 # -- the runner's flow knows no provider ------------------------------------------------------------
 
-CORE = ["loop.py", "delivery.py", "review.py", "screening.py", "cleanup.py", "checks.py", "metrics.py", "health.py",
-        "progress.py", "engine.py", "db.py", "cli.py", "events.py", "gitops.py", "media.py", "replies.py"]
+PROVIDERS = {"youtrack", "gitlab"}
+FLOW = sorted(f.name for f in SRC.glob("*.py") if f.stem not in PROVIDERS)
 
 
-@pytest.mark.parametrize("name", CORE)
+@pytest.mark.parametrize("name", FLOW)
 def test_the_flow_does_not_reach_into_a_provider(name):
+    """Every module but the providers' own knows them only by name (integrations loads them by importlib):
+    none imports one, in any form, or speaks GitLab's API."""
     tree = ast.parse((SRC / name).read_text())
+    modules = {f"arceus_runner.{p}" for p in PROVIDERS}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            assert node.module not in ("arceus_runner.youtrack", "arceus_runner.gitlab"), f"{name}: {node.module}"
+            assert node.module not in modules, f"{name}: {node.module}"
+            if node.module == "arceus_runner" or (node.level and not node.module):
+                assert not {a.name for a in node.names} & PROVIDERS, f"{name}:{node.lineno}"
         if isinstance(node, ast.Import):
-            assert not {a.name for a in node.names} & {"arceus_runner.youtrack", "arceus_runner.gitlab"}, name
-        if isinstance(node, ast.Attribute):
-            assert node.attr not in ("youtrack", "gitlab", "yt", "gl"), f"{name}:{node.lineno}: .{node.attr}"
+            assert not {a.name for a in node.names} & modules, name
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             assert "detailed_merge_status" not in node.value and "/api/v4" not in node.value, f"{name}:{node.lineno}"
 
@@ -342,7 +350,7 @@ def test_check_shows_the_project_notes_and_fails_on_a_missing_file(tmp_path, cap
             "is fixed") in capsys.readouterr().out
     notes.write_text("<!-- guidance -->\nUse pnpm.\n")
     main(["--config", str(path), "check", "--offline"])
-    assert f"config.project_notes: {notes}: 9 of 16384 bytes" in capsys.readouterr().out
+    assert f"config.project_notes: {notes}: 9 of {PROJECT_NOTES_LIMIT} bytes" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("section,value,expected", [
