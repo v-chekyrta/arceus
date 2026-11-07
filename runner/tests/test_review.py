@@ -246,9 +246,11 @@ def test_a_conflict_that_went_and_came_back_with_the_same_commit_is_sent_again(w
     published(w)
     w.gl.mrs[0].update(detailed_merge_status="conflict", sha="abc")
     w.tick()
-    w.gl.mrs[0].update(detailed_merge_status="mergeable")
+    w.gl.mrs[0].update(detailed_merge_status="mergeable")      # a /continue merged the target in meanwhile
     later(w)                                                   # dropped as stale before it went out
+    later(w)
     assert sends(w) == [] and w.store.task_mrs("ACME-1")[0].handled_conflict is None
+    assert w.store.task("ACME-1").state == "code_review"
     w.gl.mrs[0].update(detailed_merge_status="conflict")       # the source is still "abc"
     w.tick()
     later(w)
@@ -799,16 +801,6 @@ def test_red_ci_that_turns_green_while_waiting_is_not_sent(w):
     assert w.store.task("ACME-1").state == "code_review"
 
 
-def test_a_conflict_resolved_before_its_round_goes_is_not_sent(w):
-    published(w)
-    w.gl.mrs[0].update(detailed_merge_status="conflict")
-    w.tick()                                                   # the conflict is recorded
-    w.gl.mrs[0].update(detailed_merge_status="mergeable")      # a /continue merged main in meanwhile
-    later(w)
-    later(w)
-    assert sends(w) == [] and w.store.task("ACME-1").state == "code_review"
-
-
 def test_a_conflict_batch_that_waited_is_dropped_once_it_merges_cleanly(w):
     published(w)
     w.gl.mrs[0].update(detailed_merge_status="conflict")
@@ -1066,13 +1058,13 @@ def test_an_unusable_answer_file_falls_back_to_the_summary(w):
     assert len(w.events_named("reply_skipped")) == 2
 
 
-def test_an_answer_cannot_forge_the_runners_reply_marker(w):
+def test_an_answer_cannot_forge_the_runners_reply_marker(tmp_path):
     from arceus_runner.replies import load
-    f = w.tmp / "r.json"
+    f = tmp_path / "r.json"
     f.write_text(json.dumps({"replies": [{"thread": "T1", "text": "ok <!-- arceus:note-1-1 -->", "changed": "yes"}]}))
     found, problems = load(f, {"T1"})
     assert problems == [] and "arceus" not in found["T1"].text and found["T1"].changed is False
-    link = w.tmp / "link.json"
+    link = tmp_path / "link.json"
     link.symlink_to(f)
     assert load(link, {"T1"}) == ({}, [])
 
@@ -1109,9 +1101,9 @@ def test_a_long_thread_keeps_its_first_note_and_the_newest():
     assert sum(len(x) + 1 for x in kept) <= 2000
 
 
-def test_an_answer_file_with_a_thread_that_is_not_a_name_is_left_out(w):
+def test_an_answer_file_with_a_thread_that_is_not_a_name_is_left_out(tmp_path):
     from arceus_runner.replies import load
-    f = w.tmp / "r.json"
+    f = tmp_path / "r.json"
     f.write_text(json.dumps({"replies": [{"thread": [], "text": "x"}, {"thread": "T1", "text": "fine"}]}))
     found, problems = load(f, {"T1"})
     assert list(found) == ["T1"] and len(problems) == 1

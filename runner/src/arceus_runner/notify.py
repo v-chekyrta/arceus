@@ -498,7 +498,8 @@ class Notifier:
         if untold:
             times = "time" if untold == 1 else "times"
             text += f" It restarted {untold} more {times} since the last notice: see `journalctl -u arceus-runner`."
-        self.put(f"started:{r['ts']}", "runner_started", RUNNER, text)
+        # Keyed by the notifier's clock, as everything it decides: two starts are two messages, never one key.
+        self.put(f"started:{now}", "runner_started", RUNNER, text)
         self.outbox.set_meta("start_told", str(now))
         self.outbox.set_meta("restarts_untold", "0")
 
@@ -511,7 +512,7 @@ class Notifier:
             return
         why = "it was asked to stop" if r.get("reason") == "signal" else "it exited"
         # Ahead of the runner's other news: it has DRAIN_SECONDS to go out before the process ends.
-        self.put(f"stopped:{r['ts']}", "runner_stopped", TRANSITION,
+        self.put(f"stopped:{now}", "runner_stopped", TRANSITION,
                  f"⚪️ Arceus runner stopped: {why}. Nothing is taken or followed until it starts again.")
 
     def _on_review_dispatched(self, r: dict) -> None:

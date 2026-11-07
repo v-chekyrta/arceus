@@ -1,0 +1,43 @@
+# Every pull request and every merge to main runs ./verify.sh --offline on a clean Linux machine: the runner's
+# tests and the setup script's tests. No secrets, no model, no network beyond installing the dependencies.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # A new commit on a pull request makes its older run moot; a run on main is never cancelled.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]   # the oldest the runner allows, and the one it is developed on
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: runner/pyproject.toml
+      - name: Install the runner with its test dependencies
+        run: |
+          python -m venv runner/.venv
+          runner/.venv/bin/pip install -q -e 'runner[test]'
+      - name: ./verify.sh --offline
+        env:
+          # Why each skipped test skipped, and where the time went.
+          PYTEST_ADDOPTS: -rs --durations=15
+        run: ./verify.sh --offline

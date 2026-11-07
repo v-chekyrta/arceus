@@ -256,6 +256,8 @@ def test_run_reports_to_the_slack_webhook_and_keeps_its_url_out_of_the_log(cfg, 
                                                      notify=SlackNotify(runner_lifecycle=True))})
     secrets = dataclasses.replace(secrets, slack_webhook=hook)
     posts: list[str] = []
+    monkeypatch.setattr(notify, "MIN_GAP", 0.01)   # the pacing between posts and the wait on stop are not what
+    monkeypatch.setattr(notify, "DRAIN_SECONDS", 1)  # this test checks: real seconds otherwise
 
     def slack(request: httpx.Request) -> httpx.Response:
         posts.append(json.loads(request.content)["text"])

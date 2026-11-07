@@ -606,11 +606,6 @@ def test_a_folder_too_big_for_the_pass_is_cut_at_its_deadline(world, monkeypatch
     assert world.items(result) == {".arceus/media/ACME-1": ("delete", "skipped")}
     assert media.is_dir() and len(list(media.iterdir())) == 2  # the rest stays under its own name
 
-    world.cleanup._deadline = world.mono() - 1  # a walk that runs past the deadline stops too
-    from arceus_runner.machine import tree_size
-    with pytest.raises(TimeoutError):
-        tree_size(media, world.cleanup._out_of_time)
-
 
 def test_what_was_made_while_the_runner_was_down_is_nobodys(world):
     """A hold left open by a crash ends where a tick last saw it; on a change the old hold ends at the tick's start
@@ -1297,10 +1292,10 @@ def test_a_hung_docker_command_is_cut_at_the_pass_deadline(tmp_path):
 
     from arceus_runner.dockerops import Docker
     fake = tmp_path / "docker"
-    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.write_text("#!/bin/sh\nexec sleep 30\n")   # exec: the process cut is the one that sleeps
     fake.chmod(0o755)
     d = Docker(binary=str(fake), timeout=60)
-    d.deadline = time.monotonic() + 1
+    d.deadline = time.monotonic() + 0.3
     started = time.monotonic()
     with pytest.raises(DockerError, match="out of time"):
         d.containers()

@@ -139,14 +139,14 @@ def test_a_planted_instruction_in_a_file_holds_the_ticket_and_its_files(w):
 def test_a_file_replaced_after_an_approval_is_screened_again(w):
     w.screen.rules.append(("secret plan", BLOCK))
     db_id = queue(w)
-    fid = w.yt.attach(db_id, "j.doe", "plan.md", b"secret plan")
+    w.yt.attach(db_id, "j.doe", "plan.md", b"secret plan")
     w.tick()
     code = hold_code(w)
     w.yt.files[db_id][0]["data"] = b"secret plan, edited"
     w.yt.files[db_id][0]["size"] += 8
     decide(w, "allow", code)
     assert w.calls("dispatch") == []  # the approval was for the other bytes
-    assert hold_code(w) != code and fid
+    assert hold_code(w) != code
 
 
 def test_an_answer_with_a_file_carries_the_file(w):

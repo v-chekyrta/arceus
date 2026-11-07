@@ -63,7 +63,7 @@ def test_the_research_tag_makes_a_question_and_the_agent_is_told_so(w):
     task = w.store.task("ACME-1")
     assert (task.kind, task.state, task.branch) == ("research", "dispatched", BRANCH)
     [d] = w.calls("dispatch")
-    text = d["argv"][15]
+    text = d["argv"][-1]
     assert text.startswith("ACME-1: Why is login slow") and "This is a research ticket" in text
     assert f"`{answer_file(w)}`" in text and "succeeded_research" in text
     [claim] = [t for t in w.bot_comments() if "[arceus:claim]" in t]
@@ -74,7 +74,7 @@ def test_the_research_tag_makes_a_question_and_the_agent_is_told_so(w):
 def test_a_ticket_without_the_research_tag_is_ordinary_work(w):
     take(w)
     task = w.store.task("ACME-1")
-    assert task.kind == "code" and "research ticket" not in w.calls("dispatch")[0]["argv"][15]
+    assert task.kind == "code" and "research ticket" not in w.calls("dispatch")[0]["argv"][-1]
 
 
 def test_an_unreviewable_answer_is_posted_whole_and_marked_as_not_reviewed(w):
@@ -250,20 +250,6 @@ def test_a_failed_research_ticket_says_it_could_not_answer(w):
     assert note.startswith("Arceus could not answer this ticket") and "merge request" not in note
 
 
-def test_answered_state_moves_the_ticket(tmp_path, secrets):
-    w = World(tmp_path, secrets, settings={"tracker": {"states": {
-        "queued": "To Do", "in_progress": "In Progress", "code_review": "Code Review", "answered": "Done"}}})
-    try:
-        ask(w)
-        write_answer(w, "Done.")
-        researched(w)
-        w.tick()
-        assert w.yt.issue_fields["2-1"]["State"] == {"name": "Done"}
-    finally:
-        w.events.close()
-        w.store.close()
-
-
 def test_a_follow_up_question_is_answered_again(w):
     db_id = ask(w)
     write_answer(w, "First answer.")
@@ -369,16 +355,17 @@ def test_a_failed_run_leaves_no_answer_for_the_next(w):
     assert "Half an answer" not in json.dumps(w.yt.comments)
 
 
-def test_answered_null_leaves_the_ticket_in_progress(tmp_path, secrets):
+@pytest.mark.parametrize("answered, state", [("Done", "Done"), (None, "In Progress")])
+def test_an_answered_ticket_moves_to_the_answered_state_if_there_is_one(tmp_path, secrets, answered, state):
     w = World(tmp_path, secrets, settings={"tracker": {"states": {
-        "queued": "To Do", "in_progress": "In Progress", "code_review": "Code Review", "answered": None}}})
+        "queued": "To Do", "in_progress": "In Progress", "code_review": "Code Review", "answered": answered}}})
     try:
         ask(w)
         write_answer(w, "Done.")
         researched(w)
         w.tick()
         assert w.store.task("ACME-1").state == "done"
-        assert w.yt.issue_fields["2-1"]["State"] == {"name": "In Progress"}
+        assert w.yt.issue_fields["2-1"]["State"] == {"name": state}
     finally:
         w.events.close()
         w.store.close()

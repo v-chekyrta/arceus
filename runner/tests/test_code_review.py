@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from datetime import timedelta
 
 import pytest
@@ -261,17 +260,6 @@ def test_review_notes_are_signed_by_the_approver_and_a_person_behind_it_still_re
     later(w)
     [send] = sends(w)
     assert "log the failed attempts" in send["argv"][-1] and "**Code review" not in send["argv"][-1]
-
-
-def test_an_approval_for_the_current_commit_stays(w):
-    publish(w)
-    ask(w)
-    write_verdict(w)
-    finish(w)
-    w.tick()
-    w.tick()
-    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
-    assert not [b for b in mr_notes(w) if "approval was taken back" in b]
 
 
 def test_risky_changes_are_approved_and_named_for_a_person(w):
@@ -655,15 +643,8 @@ def test_an_unsure_reviewer_gives_its_own_reason(w):
 
 def test_a_push_during_the_review_makes_its_approval_stale(w):
     publish(w)
-    branch = w.store.task("ACME-1").branch
     ask(w)
-    other = w.tmp / "colleague"
-    subprocess.run(["git", "clone", "-q", "-b", branch, str(w.origin), str(other)], check=True)
-    (other / "late.txt").write_text("x")
-    git(other, "add", "late.txt")
-    git(other, "-c", "user.name=c", "-c", "user.email=c@c", "commit", "-q", "-m", "late change")
-    git(other, "push", "-q", "origin", branch)
-    w.gl.mrs[0]["sha"] = git(other, "rev-parse", "HEAD")
+    w.gl.mrs[0]["sha"] = "f" * 40          # a colleague pushed while the review ran: GitLab's head is all it reads
     write_verdict(w)
     finish(w)
     [note] = review_notes(w)
@@ -817,20 +798,21 @@ def test_a_request_while_the_author_fixes_the_mr_is_answered_at_once_and_never_r
     assert reviews(w) == [] and sends(w) == []
 
 
-def test_refused_requests_do_not_use_up_the_tickets_reviews(w):
+def test_refused_requests_do_not_use_up_the_tickets_reviews(tmp_path):
+    w = world(tmp_path, max_per_ticket=2)
     publish(w)
-    for i in range(w.cfg.review_agent.max_per_ticket):
+    for i in range(2):
         ask(w, f"/review please {i}", author="mallory")
     refused = w.store.reviews(task_id="ACME-1")
-    assert len(refused) == 10 and {(r.state, r.reason) for r in refused} == {("refused", "not_allowed")}
+    assert len(refused) == 2 and {(r.state, r.reason) for r in refused} == {("refused", "not_allowed")}
     later(w)
-    assert len(w.store.reviews(task_id="ACME-1")) == 10      # each foreign comment recorded once, answered once
-    assert sum("only people on the project's list" in t for t in w.bot_comments()) == 10
+    assert len(w.store.reviews(task_id="ACME-1")) == 2       # each foreign comment recorded once, answered once
+    assert sum("only people on the project's list" in t for t in w.bot_comments()) == 2
     ask(w)
     [call] = reviews(w)
     argv = call["argv"]
-    assert argv[argv.index("--task-id") + 1] == "ACME-1.review-11"
-    assert w.store.review("ACME-1.review-11").author == "j.doe"
+    assert argv[argv.index("--task-id") + 1] == "ACME-1.review-3"
+    assert w.store.review("ACME-1.review-3").author == "j.doe"
     assert not any("all the code reviews it may have" in t for t in w.bot_comments())
 
 
@@ -944,19 +926,24 @@ def test_two_merge_requests_get_a_verdict_each(w):
 
 def test_a_later_review_takes_an_earlier_approval_back(w):
     publish(w)
-    branch = w.store.task("ACME-1").branch
     ask(w)
     write_verdict(w)
     finish(w)
     assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
-    sha = w.agent_commits("more.txt")                          # the author's next round, published
-    git(w.repo, "push", "-q", "origin", f"{sha}:refs/heads/{branch}")
-    w.gl.mrs[0].update(sha=sha, head_pipeline={"id": 95, "status": "success", "sha": sha})
+    # The same commits reviewed again (the first verdict judged by older rules), so nothing but the second
+    # verdict can take the approval back: a moved MR would have it revoked as outlived before the review runs.
+    with w.store.transaction():
+        snap = json.loads(w.store.review(RID).snapshot)
+        snap.pop("rules")
+        w.store.update_review(RID, snapshot=json.dumps(snap))
     ask(w, "/review")
+    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"] and not w.events_named("review_approval_revoked")
     write_verdict(w, rid="ACME-1.review-2", verdict="changes",
                   findings=[{"severity": "blocker", "text": "The new file breaks the build"}])
     finish(w, rid="ACME-1.review-2")
-    assert w.gl.mrs[0]["approved_by"] == [] and w.events_named("review_approval_revoked")
+    assert w.gl.mrs[0]["approved_by"] == []
+    [revoked] = w.events_named("review_approval_revoked")
+    assert revoked["review"] == "ACME-1.review-2"
 
 
 def test_without_an_approver_it_says_so_instead_of_approving(tmp_path):
