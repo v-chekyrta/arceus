@@ -385,6 +385,11 @@ class GitLabHost:
     def mr_head_ref(self, iid: Id) -> str:
         return f"refs/merge-requests/{iid}/head"
 
+    def file_url(self, repo: Repo, sha: str, path: str, line: int | None = None) -> str:
+        """A file of the repository at a commit, on GitLab's web pages."""
+        base = repo.http_url.removesuffix(".git")
+        return f"{base}/-/blob/{sha}/{quote(path)}" + (f"#L{line}" if line else "")
+
     def git_auth(self) -> GitAuth:
         return GitAuth(self.cfg.url, self.cfg.bot_user, self._token)
 

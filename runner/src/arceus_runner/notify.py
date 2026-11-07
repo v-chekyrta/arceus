@@ -9,6 +9,8 @@ questions in noise within the hour, and Slack takes about one message a second p
                                          done, failed, stopped, held by security
     a code review starts, and its result who asked, how many MRs; per MR approved,     once each, at once
                                          needs changes, could not be confirmed
+    a test run of the platform starts,   by command or on schedule; the outcome, the    once each, at once
+    and when it finishes                 agent's short summary, the report's link
     a running task did something         tool calls (and how many came back with    at most every summary_every,
                                          an error), the engine's step, the latest   only when there was any,
                                                                                     in working hours by default
@@ -65,6 +67,12 @@ from arceus_runner.slack import Webhook
 # Who goes first when several wait: a person is needed > a task moved > the runner's own news > routine.
 URGENT, TRANSITION, RUNNER, ROUTINE = 0, 1, 2, 3
 # A finished code review (code_review.py): the overall outcome, then each merge request's.
+# A finished test run of the platform (qa.py).
+QA_HEADS = {"passed": "✅ Platform test found no problems",
+            "partial": "☑️ Platform test found no problems in what it checked, but could not check everything",
+            "found": "🐞 Platform test found {n} problem{s}",
+            "blocked": "⛔️ Platform test could not test", "unfinished": "⚠️ Platform test did not finish",
+            "stopped": "⏹ Platform test stopped"}
 REVIEW_HEADS = {"approved": "✅ Code review approved", "attention": "👀 Code review approved, a person has to look first",
                 "ready": "☑️ Code review found no problems, not everything is approved", "changes": "🛠 Code review: changes needed",
                 "unverified": "⚠️ Code review could not confirm", "nothing": "⚪️ Code review: nothing left to review",
@@ -80,6 +88,11 @@ TEXT_LIMIT = 600
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
+def is_qa(task_id: object) -> bool:
+    """A test run of the platform (qa.py), not a ticket: its engine task is qa-<n>."""
+    return isinstance(task_id, str) and task_id.startswith("qa-")
+
+
 def esc(text: object) -> str:
     """Slack reads &, < and > as markup (<!channel>, <@U…>, links): in someone else's text they are text."""
     return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -88,6 +101,20 @@ def esc(text: object) -> str:
 def clip(text: object, limit: int = TEXT_LIMIT) -> str:
     text = str(text or "").strip()
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def clip_sentences(text: object, limit: int = TEXT_LIMIT) -> str:
+    """The whole sentences of `text` that fit in `limit`, so a long summary reads as finished, not cut mid-word;
+    only when not even the first sentence fits is it cut at a word instead."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    head = text[:limit + 1]
+    end = max(head.rfind(m) for m in (". ", "! ", "? ", ".\u00a0"))
+    if end >= 0:
+        return head[:end + 1] + " …"
+    cut = head[:limit].rsplit(" ", 1)[0] if " " in head[:limit] else head[:limit]
+    return cut.rstrip(",;:") + "…"
 
 
 def ago(seconds: float) -> str:
@@ -419,7 +446,9 @@ class Notifier:
         return f"<@{sid}> " if sid else ""
 
     def line(self, task_id: str, task: Task | None = None) -> str:
-        """The ticket as a link with its title: `ACME-12 Fix the login form`."""
+        """The ticket as a link with its title: `ACME-12 Fix the login form`; a test run as its number."""
+        if is_qa(task_id):
+            return f"*the platform test, run {esc(task_id.removeprefix('qa-'))}*"
         task = task or self.store.task(task_id)
         key = task_id.split(".review-")[0]
         link = f"*<{self.issue_url(key)}|{esc(key)}>*"
@@ -441,7 +470,7 @@ class Notifier:
             if handler:
                 handler(record)
             task_id = record.get("task_id")
-            if isinstance(task_id, str) and ".review-" not in task_id:
+            if isinstance(task_id, str) and ".review-" not in task_id and not is_qa(task_id):
                 # At once, not at the end of the tick: a task can pass through a state within one tick (answered,
                 # then finished) and each step is told. Inside the caller's transaction when it has one, so the
                 # telling stands or falls with the state change.
@@ -508,6 +537,28 @@ class Notifier:
         lines.append(f"Details on the ticket: {self.issue_url(row.task_id)}")
         self.put(f"review:{row.id}:published", "review_published", TRANSITION, "\n".join(lines), task_id=row.task_id)
 
+    def _on_qa_dispatched(self, r: dict) -> None:
+        by = "on schedule" if r.get("source") == "schedule" else f"by {esc(r.get('by'))}"
+        self.put(f"qa:{r['task_id']}:started", "qa_started", TRANSITION,
+                 f"🧪 Platform test started: run {esc(r.get('run'))}, {by}.")
+
+    def _on_qa_published(self, r: dict) -> None:
+        run = self.store.qa_run(r["task_id"]) if hasattr(self.store, "qa_run") else None
+        if run is None:
+            return
+        n = int(r.get("findings") or 0)
+        head = QA_HEADS.get(run.outcome or "", "🧪 Platform test finished").format(n=n, s="s" if n != 1 else "")
+        result = json.loads(run.result or "{}")
+        lines = [f"{head}: run {run.n}."]
+        said = (result.get("blocked") if run.outcome == "blocked" else "") or result.get("summary")
+        if said:
+            lines.append(esc(clip_sentences(said, 600)))
+        if run.reason and run.outcome not in ("found", "passed", "partial"):
+            # Why this is not a clean result, in the runner's words: the agent's summary may sound like one.
+            lines.append(f"Why: {esc(clip(run.reason, 300))}")
+        lines.append(f"Report (through the SSH tunnel): {r.get('url')}")
+        self.put(f"qa:{run.id}:published", "qa_published", TRANSITION, "\n".join(lines))
+
     def _on_agent_activity(self, r: dict) -> None:
         a = self.activity.setdefault(r["task_id"], Activity())
         a.calls += int(r.get("tools") or 0)
@@ -527,7 +578,8 @@ class Notifier:
         self.put(f"quiet:{r['task_id']}:{r['ts']}", "agent_quiet", TRANSITION,
                  f"🤫 {self.line(r['task_id'])}: the agent has written nothing for {r.get('minutes')} min{step}. "
                  f"It may be stuck; an attempt with no result after {timeout} is stopped.",
-                 task_id=r["task_id"], live_while={"state": "dispatched"} if ".review-" not in r["task_id"] else None)
+                 task_id=r["task_id"],
+                 live_while={"state": "dispatched"} if ".review-" not in r["task_id"] and not is_qa(r["task_id"]) else None)
 
     def _on_attempt_paused_for_limit(self, r: dict) -> None:
         limits = ", ".join(esc(x).replace("_", " ") for x in r.get("limits") or []) or "a usage limit"

@@ -689,6 +689,9 @@ class Cleanup:
             keep = FOLDER_KINDS.get(kind_dir.name)
             if not kind_dir.is_dir() or kind_dir.is_symlink():
                 continue
+            if kind_dir.name == "qa":
+                items += self._plan_qa_folders(kind_dir)
+                continue
             if keep is None:
                 items.append(Item("folder", str(kind_dir), f".arceus/{kind_dir.name}", "report",
                                   "a kind of folder the runner does not know"))
@@ -706,6 +709,22 @@ class Cleanup:
                     items.append(Item("folder", str(d), name, "delete", f"{d.name} is over, {days} days ago",
                                       task=d.name, independent=True,
                                       detail={"bytes": tree_size(d, self._out_of_time)}))
+        return items
+
+    def _plan_qa_folders(self, kind_dir: Path) -> list[Item]:
+        """`.arceus/qa/qa-<n>`: what a test run's agent wrote (qa.py). The runner removes it once the run's report is
+        written; one left over from a finished run goes, one of a run under way stays."""
+        items = []
+        for d in self._list(kind_dir):
+            if not d.is_dir() or d.is_symlink():
+                continue
+            run = self.store.qa_run(d.name) if hasattr(self.store, "qa_run") else None
+            name = f".arceus/qa/{d.name}"
+            if run is None:
+                items.append(Item("folder", str(d), name, "report", f"no test run {d.name} in the runner"))
+            elif run.state == "done":
+                items.append(Item("folder", str(d), name, "delete", f"the test run {d.name} is over",
+                                  independent=True, detail={"bytes": tree_size(d, self._out_of_time)}))
         return items
 
     def _workspace_extras(self) -> list[Item]:

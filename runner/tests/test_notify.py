@@ -15,7 +15,7 @@ from arceus_runner.checks import Check
 from arceus_runner.config import Config
 from arceus_runner.db import ReviewStore as TaskStore
 from arceus_runner.events import EventLog
-from arceus_runner.notify import Notifier, Sender
+from arceus_runner.notify import Notifier, Sender, clip_sentences
 from arceus_runner.slack import Webhook
 
 from .conftest import example_raw, read_events
@@ -407,6 +407,59 @@ def test_a_code_review_is_told_when_it_starts_and_with_its_result_per_merge_requ
     [mixed] = b.flush()  # one approved, one not (no CI): the head does not say none was approved
     assert mixed.startswith("☑️ Code review found no problems, not everything is approved")
 
+
+def test_a_test_run_of_the_platform_is_told_when_it_starts_and_ends_with_its_summary(b):
+    run = b.store.add_qa_run("schedule", "schedule", slot="2026-10-20T02:00:00+03:00")
+    b.events.emit("qa_dispatched", task_id=run.id, run=run.n, source="schedule", by="schedule")
+    [started] = b.flush()
+    assert started.startswith("🧪 Platform test started: run 1, on schedule.")
+    b.store.update_qa_run(run.id, state="done", outcome="found", result=json.dumps(
+        {"summary": "Checked sign-in and checkout. <!channel> Checkout with a discount code fails.",
+         "findings": [{}, {}]}))
+    b.events.emit("qa_published", task_id=run.id, run=run.n, outcome="found", findings=2,
+                  url="http://localhost:3300/1/")
+    [result] = b.flush()
+    assert result.startswith("🐞 Platform test found 2 problems: run 1.")
+    assert "&lt;!channel&gt;" in result and "<!channel>" not in result
+    assert "Report (through the SSH tunnel): http://localhost:3300/1/" in result
+    b.events.emit("qa_published", task_id=run.id, run=run.n, outcome="found", findings=2, url="x")
+    assert b.flush() == []  # told once
+    # The agent's activity while it tests reads as the run, not as a ticket.
+    b.events.emit("agent_quiet", task_id=run.id, minutes=20, ts="t1")
+    [quiet] = b.flush()
+    assert "*the platform test, run 1*" in quiet and "yt.example" not in quiet
+    # A run that checked nothing is told as unfinished with the runner's reason, however its summary sounds.
+    again = b.store.add_qa_run("command", "ops")
+    b.store.update_qa_run(again.id, state="done", outcome="unfinished",
+                          reason="every check was skipped: nothing was tested",
+                          result=json.dumps({"summary": "All good.", "findings": []}))
+    b.events.emit("qa_published", task_id=again.id, run=again.n, outcome="unfinished", findings=0, url="u")
+    [told] = b.flush()
+    assert told.startswith("⚠️ Platform test did not finish: run 2.")
+    assert "Why: every check was skipped: nothing was tested" in told and "no problems" not in told
+
+
+
+def test_a_long_test_run_summary_is_told_in_whole_sentences(b):
+    # Run 1 on the server: a five-sentence summary was cut at 600 characters in the middle of a word.
+    first = "I tested the piloting work merged on Dev in the last two weeks as six roles. " * 3
+    summary = first + "I found 4 major problems: a terminated request can still be edited through the API. " + \
+        "I also found 5 minor UI and copy problems. " * 12
+    run = b.store.add_qa_run("command", "ops")
+    b.store.update_qa_run(run.id, state="done", outcome="found",
+                          result=json.dumps({"summary": summary, "findings": [{}] * 9}))
+    b.events.emit("qa_published", task_id=run.id, run=run.n, outcome="found", findings=9, url="u")
+    [told] = b.flush()
+    said = told.splitlines()[1]
+    assert said.endswith("problems. …") and len(said) <= 602 and "prob …" not in said
+
+
+def test_clip_sentences_keeps_whole_sentences_or_whole_words():
+    assert clip_sentences("One. Two.", 600) == "One. Two."
+    assert clip_sentences("First sentence here. Second one is longer than this.", 30) == "First sentence here. …"
+    assert clip_sentences("a" * 20 + " " + "b" * 40, 30) == "a" * 20 + "…"
+    assert clip_sentences("One two. Three four five six.", 20) == "One two. …"  # a short first sentence still fits
+    assert clip_sentences("  spaced\n  out  ", 600) == "spaced out"
 
 # -- routine: summaries, idle, the daily status ------------------------------------------------------------------
 

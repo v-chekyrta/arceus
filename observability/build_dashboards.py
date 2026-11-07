@@ -125,7 +125,7 @@ BULAVA_LINE = (' | json | line_format "{{.kind}}  {{.task_id}}  attempt {{.attem
 # run's journal, the agent's activity, and Bulava's task stream (its `kind` is the event label there).
 PROGRESS_EVENTS = ("task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|"
                    "workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|"
-                   "review_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|"
+                   "review_.*|qa_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|"
                    "created|attempt-started|attempt-ended|stale-verdict")
 PROGRESS_LINE = (' | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}'
                  '{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}'
@@ -219,9 +219,10 @@ def now_dashboard():
     minutes = lambda warn, crit: [(None, "text"), (warn * 60, WARNING), (crit * 60, CRITICAL)]
     panels = [
         stat("Agent", "runner_agent_busy", grid(0, 0, 4, 4),
-             mappings=mapping([(1, "Working", SERIES[0]), (0, "Idle", MUTED)]),
+             mappings=mapping([(2, "Testing", SERIES[2]), (1, "Working", SERIES[0]), (0, "Idle", MUTED)]),
              desc="Working while a task holds the agent (taken, in Bulava, or being published) or a code review has "
-                  "the workspace. It says nothing about whether the agent is moving; see Step, Agent quiet and Runner "
+                  "the workspace; Testing while a test run of the platform has it (arceus-runner qa run, or "
+                  "qa.schedule). It says nothing about whether the agent is moving; see Step, Agent quiet and Runner "
                   "loop."),
         stat("Queue", "runner_queue_length", grid(4, 0, 4, 4), color="text",
              desc="Tickets tagged by an allowed person and not taken yet."),
@@ -253,7 +254,8 @@ def now_dashboard():
         table("Tasks in progress", "runner_task", grid(0, 8, 14, 8),
               rename={"task_id": "Ticket", "state": "Runner state", "summary": "Summary"},
               hide=("__name__", "instance", "job", "Value"), legend="No open tasks",
-              desc="Every task that is not over: taken, running, being published, waiting for an answer, in review."),
+              desc="Every task that is not over: taken, running, being published, waiting for an answer, in review; "
+                   "and a test run of the platform, queued or under way (qa-<n>, state testing: …)."),
         bargauge("Subscription usage", "runner_usage_percent", "{{provider}} · {{window}}", grid(14, 8, 10, 8),
                  desc="Read by Bulava from Claude and Codex. Work stops when a provider refuses; this shows how close."),
         logs("Task progress", f'{{source=~"runner|bulava", event=~"{PROGRESS_EVENTS}"}}' + PROGRESS_LINE,
@@ -337,8 +339,8 @@ def resources_dashboard():
         stat("Up for", "time() - node_boot_time_seconds", grid(21, 0, 3, 4), unit="dtdurations", color="text",
              desc="Time since the VM booted. A short one explains a gap in the graphs."),
         state_timeline("Agent", "runner_agent_busy", grid(0, 4, 24, 3),
-                       [(1, "Working", SERIES[0]), (0, "Idle", MUTED)],
-                       desc="When a task held the agent. The graphs below share its time axis; task starts and ends "
+                       [(2, "Testing", SERIES[2]), (1, "Working", SERIES[0]), (0, "Idle", MUTED)],
+                       desc="When a task or a test run of the platform held the agent. The graphs below share its time axis; task starts and ends "
                             "are also marked on every graph."),
 
         row("CPU and memory", 7),

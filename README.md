@@ -82,6 +82,7 @@ Some capabilities are optional. Without them the flow keeps working, with less:
 | Attachments on the tracker (`supports_attachments`) | screenshots go to the merge requests only |
 | Assignee (`assign_to_bot`) | nothing is assigned |
 | Approval (`supports_approval`, `approve`, `revoke`; `code_host.approver`) | the review agent says what it found in a note and approves nothing |
+| Links to a file at a commit (`file_url`) | a test run's report names the suspected file and commit without a link |
 
 ## Status
 
@@ -95,6 +96,8 @@ Working and checked on an Ubuntu 26.04 (x86_64) VM against a real YouTrack proje
 - the project's Slack channel through an incoming webhook: the agent starting, asking (with the options and the ticket's link), finishing, failing and going quiet, a half-hourly summary of what it did, idle and health notices, a daily status; the table is in [setup/README.md](setup/README.md#the-projects-slack-channel).
 
 Optional, off by default: **code review on request** (`review_agent`). `/review` on a ticket in Code Review starts a separate Bulava task that reviews the task's open MRs against the ticket, builds and tests them without changing them, and writes a verdict; the runner approves an MR (as a second GitLab account, `code_host.approver`) only when the review passed it, CI passed on that commit and nothing moved meanwhile, and otherwise says on the MR what has to change. When an approved MR touches what `attention_paths` lists (auth, permissions, secrets…) or something the reviewer says a person has to decide, its note also names those changes for a person to look at before merge; verified changes the ticket asked for do not. What only whoever deploys it needs to know (an environment variable to set, a requested runtime upgrade) is listed in the note under its own heading and does not call a person. It also reviews merge requests people wrote: on a ticket in Code Review the agent never worked on, it reviews the GitLab merge requests the ticket links to and says which links it left out and why; what has to change is then for their author. It never asks anyone a question. What has to change in the agent's own work goes back to the author, and its new commits are reviewed again without anyone asking, up to `fix_rounds` times per ticket (default 3); then a person takes over. Checked against the pinned engine with a stub instead of Claude; how it decides is in [setup/README.md](setup/README.md#code-review-on-request).
+
+Optional, off by default: **testing the platform** (`qa`). `arceus-runner qa run`, or a schedule, starts a Bulava task that tests the whole platform in a browser by an instructions file kept on the server ([an example](config/qa-instructions.example.md)), reads the code to explain what it finds, and writes a report per run: what it checked, and each problem with steps, screenshots at the step where it broke, expected against actual and the suspected cause in the code. Reports are served on localhost (an SSH tunnel, like Grafana); Slack hears when a run starts and how it ended. Nothing is posted to the issue tracker. How it works is in [setup/README.md](setup/README.md#testing-the-platform).
 
 Not there yet:
 

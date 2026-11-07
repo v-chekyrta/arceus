@@ -1,8 +1,9 @@
-"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind | slack-test."""
+"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind | slack-test | qa."""
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -14,7 +15,7 @@ from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
 from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, is_legacy, load_config, load_secrets
-from arceus_runner.db import ACTIVE_STATES, AlreadyRunning, InstanceLock, ReviewStore
+from arceus_runner.db import ACTIVE_STATES, QA_UNDER_WAY, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
 from arceus_runner.engine import Engine
 from arceus_runner.health import claude_checks, engine_doctor, local_checks
@@ -22,6 +23,7 @@ from arceus_runner.events import EventLog
 from arceus_runner.integrations import build_code_host, build_tracker
 from arceus_runner.loop import IntegrationChanged, LiveModeUnavailable, make_cleanup, require_mode_ready, run
 from arceus_runner.notify import test_message, webhook_state
+from arceus_runner.qa import read_instructions
 from arceus_runner.slack import Webhook
 
 EXIT_OK = 0
@@ -67,6 +69,7 @@ def cmd_check(args) -> int:
     checks.append(models_check(cfg, probe))
     checks.append(claude_checks(cfg, probe))
     checks.append(review_agent_check(cfg))
+    checks.append(qa_check(cfg))
     checks.append(project_notes_check(cfg))
     if not args.offline:
         checks += run_online_checks(cfg, secrets)
@@ -85,6 +88,20 @@ def models_check(cfg: Config, probe: bulava_mod.Probe) -> Check:
         return Check("config.models", "fail", f"{shown}; the engine in {cfg.paths.bulava} does not take "
                                               f"{', '.join(missing)}: update it (setup.sh) or set them to auto")
     return Check("config.models", "ok", shown)
+
+
+def qa_check(cfg: Config) -> Check:
+    """Whether test runs of the platform can start: the instructions they are given, and when they run (qa.py)."""
+    q = cfg.qa
+    if not q.enabled:
+        return Check("config.qa", "ok", "off")
+    when = (f"`arceus-runner qa run`, and {', '.join(q.schedule.days)} at {q.schedule.at:%H:%M} "
+            f"({cfg.schedule.timezone})") if q.schedule else "`arceus-runner qa run` only"
+    text, why = read_instructions(q.instructions)
+    if text is None:
+        return Check("config.qa", "fail", f"on ({when}), but {why}: a run would only report that")
+    return Check("config.qa", "ok", f"on ({when}); instructions {q.instructions}; reports on "
+                                    f"http://{q.address}:{q.port}/")
 
 
 def review_agent_check(cfg: Config) -> Check:
@@ -205,6 +222,69 @@ def cmd_rebind(args) -> int:
     return EXIT_OK
 
 
+def cmd_qa(args) -> int:
+    """Test runs of the platform (qa.py): queue one, show the latest, or stop one. The runner does the rest."""
+    cfg = load_config(_config_path(args.config))
+    if args.action == "run" and not cfg.qa.enabled:
+        print("qa: off in config.yaml (qa.enabled: false); nothing was queued", file=sys.stderr)
+        return EXIT_CHECK_FAILED
+    if args.action == "status":
+        try:
+            store = ReviewStore.read_only(cfg.paths.db)
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"qa: {e}", file=sys.stderr)
+            return EXIT_CHECK_FAILED
+    else:
+        store = ReviewStore(cfg.paths.db)
+    try:
+        if args.action == "run":
+            under_way = store.qa_runs(*QA_UNDER_WAY)
+            if under_way:
+                r = under_way[0]
+                print(f"qa: run {r.n} is {'queued' if r.state == 'pending' else 'under way'}; nothing more was "
+                      "queued. `arceus-runner qa stop` stops it.", file=sys.stderr)
+                return EXIT_CHECK_FAILED
+            who = os.environ.get("SUDO_USER") or getpass.getuser()
+            run = store.add_qa_run("command", who)
+            if cfg.mode != "live":
+                print(f"qa: the runner is in mode: {cfg.mode}, which starts nothing; run {run.n} waits until it is "
+                      "live", file=sys.stderr)
+            print(f"Run {run.n} queued. The runner starts it once the workspace is free; the report will be at "
+                  f"http://localhost:{cfg.qa.port}/{run.n}/ (through the SSH tunnel).")
+            return EXIT_OK
+        if args.action == "stop":
+            runs = [store.qa_run(f"qa-{args.n}")] if args.n else store.qa_runs(*QA_UNDER_WAY)
+            runs = [r for r in runs if r and r.state in QA_UNDER_WAY]
+            if not runs:
+                print("qa: no such run is queued or under way", file=sys.stderr)
+                return EXIT_CHECK_FAILED
+            for r in runs:
+                store.update_qa_run(r.id, stop_requested=1)
+                print(f"Run {r.n}: asked to stop. The runner stops it on its next pass and writes its report.")
+            return EXIT_OK
+        runs = store.qa_runs(limit=args.last)
+        if args.json:
+            print(json.dumps([vars(r) | {"result": json.loads(r.result) if r.result else None} for r in runs],
+                             ensure_ascii=False, indent=2))
+            return EXIT_OK
+        if not runs:
+            print("No test runs yet. `arceus-runner qa run` queues one.")
+            return EXIT_OK
+        for r in runs:
+            found = len(json.loads(r.result or "{}").get("findings") or [])
+            what = r.outcome if r.state == "done" else r.state
+            what += f", {found} problem{'s' if found != 1 else ''}" if r.state == "done" and found else ""
+            what += ", stop asked" if r.stop_requested and r.state != "done" else ""
+            by = "schedule" if r.source == "schedule" else r.requested_by
+            print(f"run {r.n}: {what} (by {by}, queued {r.created_at}"
+                  + (f", finished {r.finished_at}" if r.finished_at else "") + ")"
+                  + (f": {r.reason}" if r.reason and r.state == "done" else ""))
+        print(f"Reports: http://localhost:{cfg.qa.port}/ (through the SSH tunnel)")
+        return EXIT_OK
+    finally:
+        store.close()
+
+
 def cmd_cleanup(args) -> int:
     """What a full cleanup pass would do now, the last pass (both read only), or (--act) a pass now."""
     cfg = load_config(_config_path(args.config))
@@ -268,6 +348,11 @@ def _cleanup_now(cfg: Config, as_json: bool) -> int:
             review = store.review_holding()
             if review:
                 print(f"cleanup: the code review {review.id} holds the workspace ({review.state}); not now",
+                      file=sys.stderr)
+                return EXIT_CHECK_FAILED
+            testing = store.qa_holding()
+            if testing:
+                print(f"cleanup: the test run {testing.id} holds the workspace ({testing.state}); not now",
                       file=sys.stderr)
                 return EXIT_CHECK_FAILED
             engine = Engine(cfg) if bulava_mod.probe(cfg.paths.bulava).installed else None
@@ -378,6 +463,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("slack-test", help="post one test message to the project's channel through the webhook")
     st.set_defaults(fn=cmd_slack_test)
+
+    q = sub.add_parser("qa", help="test runs of the platform: queue one, see the latest, stop one")
+    qsub = q.add_subparsers(dest="action", required=True)
+    qsub.add_parser("run", help="queue a test run of the platform by qa.instructions")
+    qs = qsub.add_parser("status", help="the latest runs and how they ended")
+    qs.add_argument("--last", type=int, default=10, help="how many runs (default 10)")
+    qs.add_argument("--json", action="store_true")
+    qx = qsub.add_parser("stop", help="stop the queued or running test run (its report says what it found so far)")
+    qx.add_argument("n", nargs="?", type=int, help="the run's number (default: the one under way)")
+    q.set_defaults(fn=cmd_qa)
 
     b = sub.add_parser("probe-bulava", help="which agreed contracts the installed engine advertises")
     b.add_argument("--root", help="engine directory (default: paths.bulava from config)")

@@ -561,7 +561,7 @@
       "id": 35,
       "type": "state-timeline",
       "title": "Agent",
-      "description": "When a task held the agent. The graphs below share its time axis; task starts and ends are also marked on every graph.",
+      "description": "When a task or a test run of the platform held the agent. The graphs below share its time axis; task starts and ends are also marked on every graph.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -601,15 +601,20 @@
             {
               "type": "value",
               "options": {
+                "2": {
+                  "text": "Testing",
+                  "color": "#199e70",
+                  "index": 0
+                },
                 "1": {
                   "text": "Working",
                   "color": "#3987e5",
-                  "index": 0
+                  "index": 1
                 },
                 "0": {
                   "text": "Idle",
                   "color": "#898781",
-                  "index": 1
+                  "index": 2
                 }
               }
             }

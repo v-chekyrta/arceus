@@ -1523,7 +1523,7 @@ def test_the_upgrade_to_schema_18_keeps_every_task_as_it_was(tmp_path):
     conn.close()
     store = ReviewStore(path)
     try:
-        assert store.version == len(MIGRATIONS) == 18
+        assert store.version == len(MIGRATIONS) >= 18
         t = store.task("ACME-1")
         assert (t.kind, t.state, t.branch, t.question, t.published_at_ms, t.review_rounds) == \
             ("research", "code_review", "agent/ACME-1-x", '{"id": "q1"}', 123, 2)

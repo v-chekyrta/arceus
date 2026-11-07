@@ -214,6 +214,11 @@ class Git:
         """Check out a branch, or a commit (detached), that the repository already has."""
         self._run(["checkout", "--quiet", ref], repo)
 
+    def ref_sha(self, repo: Path, ref: str) -> str | None:
+        """The commit a ref (`origin/main`) points at in the local repository, as last fetched."""
+        res = self._run(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo, check=False)
+        return res.stdout.strip() or None
+
     def branch_sha(self, repo: Path, branch: str) -> str | None:
         res = self._run(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo, check=False)
         return res.stdout.strip() or None

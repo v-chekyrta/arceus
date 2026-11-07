@@ -28,7 +28,8 @@ class Metrics:
         self.health = Gauge("runner_health", "Health check: 0 ok, 1 warn, 2 fail", ["check"], registry=r)
         self.tasks = Gauge("runner_tasks", "Tasks the runner took, by runner state", ["state"], registry=r)
         self.queue = Gauge("runner_queue_length", "Accepted tickets waiting to be taken", registry=r)
-        self.busy = Gauge("runner_agent_busy", "1 while a task or a code review holds the agent", registry=r)
+        self.busy = Gauge("runner_agent_busy", "1 while a task or a code review holds the agent, 2 while a test run of "
+                          "the platform does", registry=r)
         self.can_take = Gauge("runner_can_take", "1 when health allows new work", registry=r)
         # role: tracker or code_host, so a dashboard reads them whichever provider config.yaml names.
         self.service_up = Gauge("runner_service_up", "1 when the service answers", ["service", "role"], registry=r)
@@ -87,6 +88,9 @@ class Metrics:
             counts[t.state] = counts.get(t.state, 0) + 1
             if t.state not in ("failed", "done", "stopped"):
                 self.task.labels(t.task_id, t.state, t.summary[:80]).set(1)
+        if hasattr(runner.store, "qa_runs"):
+            for run in runner.store.qa_runs("pending", "preparing", "running", "restoring", "publishing"):
+                self.task.labels(run.id, f"testing: {run.state}", f"Platform test, run {run.n}").set(1)
         self.tasks.clear()
         for state, n in counts.items():
             self.tasks.labels(state).set(n)
@@ -107,7 +111,9 @@ class Metrics:
         # A code review is a record of its own: its ticket sits in code_review, waiting on people, while the
         # review has the workspace and the engine.
         busy = store.tasks("claimed", "dispatched", "publishing") or store.review_holding()
-        self.busy.set(1 if busy else 0)
+        # A test run of the platform holds the workspace and the engine too; the dashboard says Testing for it.
+        testing = hasattr(store, "qa_holding") and store.qa_holding()
+        self.busy.set(2 if testing else 1 if busy else 0)
 
     def update_cleanup(self, cleanup) -> None:
         self.cleanup_ok.clear()

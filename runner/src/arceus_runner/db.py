@@ -570,6 +570,35 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 19: test runs of the whole platform (qa.py), queued by `arceus-runner qa run` or qa.schedule. One row per run,
+    # also the engine task that does it (`id`, qa-<n>). While it is preparing, running or restoring, it holds the
+    # shared workspace. `slot` is the scheduled time a run was queued for, so a restart never queues it twice;
+    # `stop_requested` is set by `arceus-runner qa stop` and acted on by the runner.
+    """
+    CREATE TABLE qa_runs (
+        id               TEXT PRIMARY KEY,
+        n                INTEGER NOT NULL UNIQUE,
+        source           TEXT NOT NULL CHECK (source IN ('command', 'schedule')),
+        requested_by     TEXT NOT NULL,
+        slot             TEXT UNIQUE,
+        state            TEXT NOT NULL CHECK (state IN ('pending', 'preparing', 'running', 'restoring', 'publishing',
+                                                        'done')),
+        stop_requested   INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)),
+        snapshot         TEXT NOT NULL DEFAULT '{}',
+        result           TEXT,
+        outcome          TEXT,
+        reason           TEXT,
+        started_at       TEXT,
+        finished_at      TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE INDEX qa_runs_state ON qa_runs (state);
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -914,6 +943,31 @@ class ReviewRequest:
     updated_at: str = ""
 
 
+# A test run in these states has the shared workspace switched to the code it reads (qa.py).
+QA_HOLDS = ("preparing", "running", "restoring")
+QA_UNDER_WAY = ("pending", *QA_HOLDS, "publishing")
+QA_FIELDS = ("state", "stop_requested", "snapshot", "result", "outcome", "reason", "started_at", "finished_at")
+
+
+@dataclass(frozen=True)
+class QaRun:
+    id: str              # also the engine task's id: qa-<n>
+    n: int
+    source: str          # command | schedule
+    requested_by: str
+    slot: str | None     # the scheduled time it was queued for
+    state: str
+    stop_requested: int
+    snapshot: str        # JSON: the instructions, the commits read, how to put the workspace back
+    result: str | None   # JSON: what the run found, as the runner read it
+    outcome: str | None  # passed | found | blocked | unfinished | stopped
+    reason: str | None
+    started_at: str | None
+    finished_at: str | None
+    created_at: str = ""
+    updated_at: str = ""
+
+
 class ReviewStore(TaskStore):
     """The review loop's records, next to the tasks."""
 
@@ -965,6 +1019,49 @@ class ReviewStore(TaskStore):
     def review_holding(self) -> ReviewRequest | None:
         """The review that has the shared workspace now, if any."""
         found = self.reviews(*REVIEW_HOLDS)
+        return found[0] if found else None
+
+    # -- test runs of the platform (qa.py) --
+
+    def add_qa_run(self, source: str, requested_by: str, slot: str | None = None) -> QaRun | None:
+        """A new run, numbered after the earlier ones. None when a run for this scheduled slot exists already."""
+        with contextlib.nullcontext() if self.conn.in_transaction else self.transaction():
+            if slot and self.conn.execute("SELECT 1 FROM qa_runs WHERE slot = ?", (slot,)).fetchone():
+                return None
+            n = self.conn.execute("SELECT COALESCE(MAX(n), 0) FROM qa_runs").fetchone()[0] + 1
+            self.conn.execute("INSERT INTO qa_runs (id, n, source, requested_by, slot, state) VALUES (?, ?, ?, ?, ?, ?)",
+                              (f"qa-{n}", n, source, requested_by, slot, "pending"))
+        return self.qa_run(f"qa-{n}")
+
+    def qa_run(self, run_id: str) -> QaRun | None:
+        r = self.conn.execute("SELECT * FROM qa_runs WHERE id = ?", (run_id,)).fetchone()
+        return QaRun(**dict(r)) if r else None
+
+    def qa_runs(self, *states: str, limit: int | None = None) -> list[QaRun]:
+        """Oldest first; with `limit`, the newest ones."""
+        q, args = "SELECT * FROM qa_runs", list(states)
+        if states:
+            q += f" WHERE state IN ({', '.join('?' * len(states))})"
+        if limit:
+            rows = self.conn.execute(q + " ORDER BY n DESC LIMIT ?", (*args, limit)).fetchall()[::-1]
+        else:
+            rows = self.conn.execute(q + " ORDER BY n", args).fetchall()
+        return [QaRun(**dict(r)) for r in rows]
+
+    def update_qa_run(self, run_id: str, **fields) -> QaRun:
+        unknown = set(fields) - set(QA_FIELDS)
+        if unknown:
+            raise ValueError(f"cannot update {unknown}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(f"UPDATE qa_runs SET {sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                          " WHERE id = ?", (*fields.values(), run_id))
+        run = self.qa_run(run_id)
+        assert run is not None
+        return run
+
+    def qa_holding(self) -> QaRun | None:
+        """The test run that has the shared workspace now, if any."""
+        found = self.qa_runs(*QA_HOLDS)
         return found[0] if found else None
 
     def task_mrs(self, task_id: str) -> list[TaskMR]:

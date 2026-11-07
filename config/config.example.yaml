@@ -189,6 +189,21 @@ review_agent:
   # matches the file name anywhere; ** crosses folders.
   #   attention_paths: ["**/migrations/**", "*auth*", ".gitlab-ci.yml"]
 
+# Optional. The agent tests the whole platform by your instructions and writes a report per run (qa.py).
+# `arceus-runner qa run` queues a run; `schedule` queues one by itself. A run is a Bulava task of its own: it holds
+# the workspace like a ticket (a queued run goes before new tickets), reads the code at each repository's default
+# branch to explain what it finds, and changes nothing. Reports: http://localhost:3300/ through the SSH tunnel
+# (ssh -L 3300:127.0.0.1:3300 …). Slack hears when a run starts and how it ended, with the agent's short summary.
+qa:
+  enabled: false
+  # The URL, test accounts and what to test, in any shape. setup.sh creates it once from
+  # config/qa-instructions.example.md, as comments only: a run needs them written first.
+  instructions: ~/arceus/data/qa/instructions.md
+  reports: ~/arceus/data/qa/runs                   # a folder per run: report.html, result.json, media/
+  # schedule: { days: [mon, tue, wed, thu, fri], at: "02:00" }   # schedule.timezone; none: only by the command
+  timeout: 8h                                      # past it the run is stopped and reported as unfinished
+  port: 3300                                       # 127.0.0.1 only (qa.address)
+
 # What agents leave behind: containers, test volumes, dev servers, files in the repositories, old media.
 # A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than
 # limits.continue_window): by the label arceus.task=<KEY> the agent puts on it, by its place

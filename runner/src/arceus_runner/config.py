@@ -537,6 +537,27 @@ class ReviewAgentConfig(Strict):
         return v
 
 
+class QaSchedule(Strict):
+    """When a test run of the platform is queued by itself: these days, at this time of `schedule.timezone`."""
+    days: list[Weekday] = Field(min_length=1)
+    at: time
+
+
+class QaConfig(Strict):
+    """The agent tests the whole platform (qa.py): `arceus-runner qa run`, or `schedule`, queues a run; a Bulava
+    task of its own tests the platform by `instructions` with the workspace's code at hand; each run gets a report
+    of its own under `reports`, served on `address:port` (an SSH tunnel, like Grafana)."""
+    enabled: bool = False
+    # The operator's file: the platform's URL, its test accounts and what to test, in any shape. Read when a run
+    # starts and kept with the run, so a later edit never changes what a run was asked.
+    instructions: ExpandedPath = Path("~/arceus/data/qa/instructions.md").expanduser()
+    reports: ExpandedPath = Path("~/arceus/data/qa/runs").expanduser()
+    schedule: QaSchedule | None = None    # none: runs start only by the command
+    timeout: Duration = timedelta(hours=8)  # the run's own; past it the run is stopped and reported as unfinished
+    address: str = "127.0.0.1"            # the reports page; never open it outside
+    port: int = Field(default=3300, ge=0, le=65535)  # 0: any free port (tests). Loki has 3100, Grafana 3000
+
+
 class CleanupProtect(Strict):
     """What cleanup never touches, besides the observability stack and anything labelled arceus.keep=true."""
     compose_projects: list[str] = []  # e.g. the project's dev stack: [acme-dev]
@@ -646,6 +667,7 @@ class Config(Strict):
     bulava: BulavaConfig = BulavaConfig()
     security: SecurityConfig = SecurityConfig()
     review_agent: ReviewAgentConfig = ReviewAgentConfig()
+    qa: QaConfig = QaConfig()
     cleanup: CleanupConfig = CleanupConfig()
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
