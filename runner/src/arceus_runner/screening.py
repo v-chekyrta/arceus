@@ -24,7 +24,7 @@ before `dispatch.sh` or `worker-send.sh` is called with it, never in parallel wi
 - events.jsonl gets the digest, the verdict and its categories, never the text.
 
 The screen lowers the risk; it does not remove it. What the agent may read, run and reach on the
-server is what protects the data when a message gets past it (setup/README.md, "Security screen").
+server is what protects the data when a message gets past it (docs/security.md).
 """
 
 from __future__ import annotations

@@ -9,8 +9,8 @@ project: acme-shop                     # name for logs, metrics and dashboards (
 mode: observe
 
 # Where tasks come from. `type` picks the implementation: youtrack ships with Arceus; another tracker
-# is a module of your own (see "Adding a tracker or a code host" in README.md). The keys up to
-# `states` mean the same for every tracker; the rest belong to the type.
+# is a module of your own (see docs/integrations.md). The keys up to `states` mean the same for
+# every tracker; the rest belong to the type.
 tracker:
   type: youtrack
   bot_user: agent-runner               # the bot's login: the runner ignores this user's comments

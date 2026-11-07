@@ -29,6 +29,12 @@ When (all of it inside the runner's tick, so nothing else switches the workspace
 - low disk: a pass every `retry_after`; after a pass with errors, the next one waits `retry_after`, doubling.
 
 A full pass also needs the engine quiet: a task the runner sees as waiting may still have a live session.
+
+Every removal is checked again right before it is made: still there, still stopped, not protected since, a volume
+still the same one (creation time, labels) and mounted by no container, the same branch head, a folder not moved
+behind a link and with nothing mounted on or inside it. A folder is emptied through the handle it was checked by
+(`machine.remove_tree`), never by a path that could be swapped meanwhile. A command cut at the deadline leaves the
+rest `skipped` and the pass `partial`; a pass cut short by a crash is marked `interrupted` at the next start.
 """
 
 from __future__ import annotations
