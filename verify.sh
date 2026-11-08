@@ -37,6 +37,10 @@ step "setup: the agent's Google MCP server is read-only and acts as the service 
   bash setup/tests/test-google-mcp.sh
 step "setup: the console sees the data folder without its secrets; nginx trusts only the given proxies" \
   bash setup/tests/test-console.sh
+if [ -n "$live" ]; then  # the base image and PyPI: the network, so not in --offline
+  step "console: the image builds from console/Dockerfile and runs without root, sudo or secrets" \
+    bash setup/tests/test-console-image.sh
+fi
 step "setup: the engine's source survives a rewritten upstream${live:+, the pinned commit installs}" \
   bash setup/tests/test-bulava-source.sh $live
 

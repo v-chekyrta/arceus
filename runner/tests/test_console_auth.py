@@ -287,3 +287,21 @@ def test_the_console_section_needs_its_address_when_on(setup):
     setup.config_path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ConfigError, match="not an address"):
         load_config(setup.config_path)
+
+
+def test_wrong_current_passwords_on_the_account_page_are_throttled_with_a_message_not_an_error(setup):
+    make_admin(setup)
+    admin = signed_in(setup, "owner@example.com")
+    form = {"what": "password", "current": "not my password", "password": "a brand new password",
+            "password2": "a brand new password"}
+    for _ in range(5):
+        r = post(admin, "/account/", form)
+        assert r.status_code == 400 and "The current password is wrong." in r.text
+    r = post(admin, "/account/", {**form, "current": PASSWORD})
+    assert r.status_code == 429 and "Too many failed attempts" in r.text
+    assert "<form" in r.text  # the page itself, still signed in
+    assert admin.get("/account/").status_code == 200
+    with ConsoleStore(setup.db_path) as s:  # the password did not change (signing in waits too, by design)
+        from arceus_runner.console.store import check_password
+        row = s.conn.execute("SELECT password FROM users WHERE email = 'owner@example.com'").fetchone()
+        assert check_password(PASSWORD, row["password"])

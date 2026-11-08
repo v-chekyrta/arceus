@@ -95,7 +95,12 @@ def account(ctx: Ctx) -> Response:
         what = ctx.field("what")
         if what == "password":
             current, new, again = ctx.field("current"), ctx.field("password"), ctx.field("password2")
-            if ctx.store.authenticate(user.email, current, ctx.ip) is None:
+            try:
+                known = ctx.store.authenticate(user.email, current, ctx.ip) is not None
+            except ConsoleError as e:  # too many wrong ones lately: the same wait as on the sign-in page
+                return ctx.render("account.html", status=429, error=str(e), notice="",
+                                  sessions=ctx.store.session_count(user.id))
+            if not known:
                 error = "The current password is wrong."
             elif new != again:
                 error = "The two new passwords are not the same."
