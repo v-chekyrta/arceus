@@ -10,6 +10,7 @@ from __future__ import annotations
 from arceus_runner import arch_report, qa_report
 
 CONSOLE_CSS = """
+[hidden] { display: none !important; }
 body { min-height: 100vh; display: flex; flex-direction: column; }
 main { width: 100%; max-width: 1040px; flex: 1 0 auto; }
 .bar { background: var(--surface); border-bottom: 1px solid var(--line); }
@@ -187,9 +188,28 @@ pre.diff { margin: 0 0 20px; padding: 12px 0; background: var(--surface); border
 pre.diff span { display: block; padding: 0 14px; white-space: pre; }
 pre.diff .add { background: var(--good-soft); } pre.diff .del { background: var(--bad-soft); }
 pre.diff .ctx { color: var(--muted); }
+
+/* settings */
+.settings-groups { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.settings-groups .count-note { color: var(--quiet); font-size: 0.8rem; margin-top: 4px; }
+.settings-form .group { border: 0; border-top: 1px solid var(--line); margin: 18px 0 0; padding: 14px 0 0; min-width: 0; }
+.settings-form .group legend { padding: 0 8px 0 0; font-weight: 600; }
+.settings-form .group .group { margin-left: 12px; }
+.settings-form > .setting:first-of-type { margin-top: 0; }
+.setting { margin: 14px 0 0; min-width: 0; }
+.setting > label { display: block; font-size: 0.9rem; margin: 0 0 4px; }
+.setting .kind { color: var(--quiet); font-size: 0.8rem; margin-left: 6px; }
+.setting .hint, .group > .hint { display: block; color: var(--muted); font-size: 0.85rem; margin: 4px 0 0; overflow-wrap: anywhere; }
+.setting.default input, .setting.default select, .setting.default textarea { color: var(--muted); }
+.check { display: inline-flex; gap: 8px; align-items: center; }
+textarea.code.small { min-height: 0; }
+.form-end { padding: 14px 0 0; margin-top: 20px; border-top: 1px solid var(--line); align-items: center; }
+pre.diff .hunk { color: var(--blue); }
+.spaced-top { margin-top: 14px; }
 @media (max-width: 760px) {
   .split { grid-template-columns: 1fr; }
   .roles-help li { grid-template-columns: 1fr; gap: 2px; }
+  .settings-groups { grid-template-columns: 1fr; }
   .bar-in { gap: 0 12px; }
   .sections { order: 3; flex-basis: 100%; }
   .nav { margin: 0 -10px 6px; }

@@ -351,11 +351,11 @@ async def healthz(_request: Request) -> Response:
 
 
 def create_app(settings: Settings | None = None) -> Starlette:
-    from arceus_runner.console import views_arch, views_auth, views_home, views_qa, views_users
+    from arceus_runner.console import views_arch, views_auth, views_home, views_qa, views_settings, views_users
     settings = settings or Settings.from_env()
     console = ConsoleApp(settings)
     routes = [Route("/static/{name}", static), Route("/healthz", healthz)]
-    for module in (views_auth, views_home, views_qa, views_arch, views_users):
+    for module in (views_auth, views_home, views_qa, views_arch, views_settings, views_users):
         routes += module.routes()
         console.sections.update(getattr(module, "SECTIONS", ()))
     app = Starlette(routes=routes)

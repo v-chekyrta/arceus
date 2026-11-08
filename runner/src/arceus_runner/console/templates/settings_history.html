@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block body %}
+<p class="crumb"><a href="/settings/">Settings</a></p>
+<h1>Settings history</h1>
+<p class="lede">Every config.yaml saved from the console, newest first, with who saved it and why. Edits made on the server are not here; the file as it is now always is.</p>
+{% include "settings_loaded.html" %}
+{% if versions %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Saved</th><th>By</th><th class="hide-narrow">Why</th><th></th></tr></thead>
+  <tbody>
+  {% for v in versions %}
+  <tr>
+    <td class="nowrap">{{ v.at|when }}{% if v.after_sha == current_sha %} <span class="tag ok">Now in the file</span>{% endif %}{% if loaded.sha and v.after_sha == loaded.sha %} <span class="tag busy">Runner runs it</span>{% endif %}</td>
+    <td>{{ v.actor }}</td>
+    <td class="hide-narrow">{{ v.note }}</td>
+    <td class="nowrap"><a href="/settings/history/{{ v.id }}/">See the change</a></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">Nothing saved from the console yet.</p>
+{% endif %}
+{% endblock %}

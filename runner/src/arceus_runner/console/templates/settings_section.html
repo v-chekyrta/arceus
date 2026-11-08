@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% macro field_row(f, disabled) %}
+{% if f.kind == "group" %}
+<fieldset class="group">
+  <legend><code class="lit">{{ f.label }}</code></legend>
+  {% if f.hint %}<p class="hint">{{ f.hint }}</p>{% endif %}
+  {% for c in f.children %}{{ field_row(c, disabled) }}{% endfor %}
+</fieldset>
+{% else %}
+<div class="setting{% if not f.in_file %} default{% endif %}">
+  {% if f.kind == "bool" %}
+  <label class="check"><input type="checkbox" name="{{ f.name }}"{% if f.shown %} checked{% endif %}{% if disabled %} disabled{% endif %}> <code class="lit">{{ f.label }}</code></label>
+  {% elif f.kind == "multi" %}
+  <fieldset class="checks-row"><legend><code class="lit">{{ f.label }}</code></legend>
+    {% for o in f.options %}<label><input type="checkbox" name="{{ f.name }}" value="{{ o }}"{% if o in f.shown %} checked{% endif %}{% if disabled %} disabled{% endif %}> {{ o }}</label>{% endfor %}
+  </fieldset>
+  {% else %}
+  <label for="f-{{ f.name }}"><code class="lit">{{ f.label }}</code>
+    <span class="kind">{% if f.kind == "duration" %}a duration: 30s, 15m, 6h, 5d{% elif f.kind == "time" %}a time: 09:00{% elif f.kind == "lines" %}one per line{% elif f.kind == "yaml" %}YAML{% elif f.kind == "path" %}a path; ~ is the run user's home{% endif %}{% if f.nullable %}{{ ", " if f.kind in ("duration", "time", "path", "yaml") else "" }}empty: not set{% endif %}</span></label>
+  {% if f.kind == "choice" %}
+  <select id="f-{{ f.name }}" name="{{ f.name }}"{% if disabled %} disabled{% endif %}>{% if f.nullable %}<option value=""{% if not f.shown %} selected{% endif %}>not set</option>{% endif %}{% for o in f.options %}<option{% if o == f.shown %} selected{% endif %}>{{ o }}</option>{% endfor %}</select>
+  {% elif f.kind in ("lines", "yaml") %}
+  <textarea class="code small" id="f-{{ f.name }}" name="{{ f.name }}" rows="{{ [[((f.shown|join('\n')) if f.kind == 'lines' else f.shown).count('\n') + 2, 3]|max, 14]|min }}" spellcheck="false"{% if disabled %} readonly{% endif %}>{% if f.kind == "lines" %}{{ f.shown|join("\n") }}{% else %}{{ f.shown }}{% endif %}</textarea>
+  {% else %}
+  <input id="f-{{ f.name }}" name="{{ f.name }}" type="{{ 'number' if f.kind == 'int' else 'text' }}"{% if f.kind == "float" %} inputmode="decimal"{% endif %} value="{{ f.shown }}"{% if disabled %} readonly{% endif %}>
+  {% endif %}
+  {% endif %}
+  <span class="hint">{% if f.hint %}{{ f.hint }}{% endif %}{% if not f.in_file %}{{ " · " if f.hint else "" }}the default: not written in the file{% endif %}{% if f.needs_setup %} · applied by setup.sh{% endif %}</span>
+</div>
+{% endif %}
+{% endmacro %}
+{% block body %}
+<p class="crumb"><a href="/settings/">Settings</a></p>
+<h1>{{ title }}</h1>
+<p class="lede">{{ what }}</p>
+{{ flash(notice, error) }}
+<form class="card settings-form" method="post">
+  {{ csrf_field(csrf) }}
+  <input type="hidden" name="sha" value="{{ sha }}">
+  {% for f in fields %}{{ field_row(f, not can_edit) }}{% endfor %}
+  {% if can_edit %}
+  <div class="actions form-end"><button class="btn primary" type="submit">Check the change</button><span class="meta">Nothing is saved until you see the difference and save it.</span></div>
+  {% endif %}
+</form>
+{% endblock %}

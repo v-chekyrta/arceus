@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% block body %}
+<p class="crumb"><a href="/settings/">Settings</a></p>
+<h1>config.yaml</h1>
+<p class="lede"><code class="lit">{{ path }}</code>. The same check, difference and conflict rules as the form.</p>
+{{ flash(error=error) }}
+{% if restoring %}
+<p class="notice warn">The editor holds {{ "what was there before" if restoring.which == "before" else "the text saved" }} {{ restoring.at|when }} by {{ restoring.actor }}. Nothing is saved yet: check the change, then save it to put it back.</p>
+{% endif %}
+{% if problems %}
+<div class="alert"><p><strong>config.yaml as it is now does not load:</strong></p><ul>{% for p in problems %}<li><code class="lit">{{ p }}</code></li>{% endfor %}</ul></div>
+{% endif %}
+<form class="card" method="post">
+  {{ csrf_field(csrf) }}
+  <input type="hidden" name="sha" value="{{ sha }}">
+  <label class="sr" for="text">config.yaml</label>
+  <textarea class="code" id="text" name="text" spellcheck="false"{% if not can_edit %} readonly{% endif %}>{{ text }}</textarea>
+  {% if can_edit %}
+  <div class="form-row spaced-top"><label for="note">Why <span class="hint">Optional, for the history.</span></label><input id="note" name="note" type="text" maxlength="300"></div>
+  <button class="btn primary" type="submit">Check the change</button>
+  {% endif %}
+</form>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field, diff_block %}
+{% block body %}
+<p class="crumb"><a href="{{ origin }}">Back to editing</a></p>
+<h1>Check the change</h1>
+{{ flash(error=error) }}
+{% if same %}
+<p class="notice">Nothing would change: this is config.yaml as it is.</p>
+{% else %}
+<p class="lede">{% if changed %}Changed: {% for c in changed %}<code class="lit">{{ c }}</code>{{ ", " if not loop.last }}{% endfor %}. {% endif %}Only these lines of config.yaml change; everything else, comments included, stays as it is.</p>
+{{ diff_block(diff) }}
+{% if problems %}
+<div class="alert"><p><strong>The runner would refuse this config.yaml</strong>, so it cannot be saved:</p><ul>{% for p in problems %}<li><code class="lit">{{ p }}</code></li>{% endfor %}</ul></div>
+<p><a href="{{ origin }}">Back to editing</a></p>
+{% else %}
+<div class="card">
+  <h2>Before it takes effect</h2>
+  {% if setup %}
+  <p>This change is read by <strong>setup.sh</strong> (the console, paths, metrics or the engine's checks): run setup, then restart the runner.</p>
+  {% else %}
+  <p>The runner reads config.yaml when it starts: <strong>restart the runner</strong> after saving. A task already running keeps going and is picked up again.</p>
+  {% endif %}
+  <p class="meta">Saving restarts nothing.</p>
+  <form method="post" action="/settings/save">
+    {{ csrf_field(csrf) }}
+    <input type="hidden" name="sha" value="{{ sha }}">
+    <input type="hidden" name="origin" value="{{ origin }}">
+    <textarea name="text" hidden>{{ text }}</textarea>
+    <div class="form-row"><label for="note">Why <span class="hint">Optional, for the history.</span></label><input id="note" name="note" type="text" maxlength="300" value="{{ note }}"></div>
+    <button class="btn primary" type="submit">Save config.yaml</button>
+  </form>
+</div>
+{% endif %}
+{% endif %}
+{% endblock %}

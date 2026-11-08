@@ -97,6 +97,31 @@ decision is refused and the page says what stands now. The next review gets the 
 screen cleared it, quoted as data ([architect.md](architect.md)). Architects also start and stop a review and edit
 the review instructions, the same way as test runs.
 
+## Settings
+
+**Settings** is `config.yaml` as a form, a page per section (tracker, code host, schedule, models, test runs and
+so on). Every setting of the runner's schema is there with its current value: what the file says, as written, or
+the default when the file does not say it. A setting the form cannot hold as a field (a map such as
+`review_agent.repos` or `slack.people`, or an optional block such as `qa.schedule`) is edited as YAML in place.
+The whole file can also be edited as YAML.
+
+Admins change it in two steps. **Check the change** shows the exact difference in `config.yaml` and what it needs
+to take effect: a runner restart, or for `console`, `paths`, `metrics` and the engine's checks, `setup.sh` and
+then a restart. The result is checked by the runner's own code (`parse_config`): a value it would refuse shows its
+error and cannot be saved. **Save** writes only the lines that changed. Comments, order, quoting and every other
+line stay byte for byte. A text value YAML would read as something else (`off`, `09:00`) is written quoted. The
+write is atomic and keeps the file's mode. If `config.yaml` changed since the page was opened (another admin, an
+edit over SSH), the save is refused and the difference against the file as it is now is shown. Saving restarts
+nothing.
+
+**History** lists every version saved from the console, with who saved it and why, and shows which one is in the
+file now and which one the runner runs with. Any version, or what was there before it, opens in the YAML editor
+and goes back through the same check. The runner records which `config.yaml` it started with (`runner_state` in
+`runner.db`), so Settings says when the file has changed since the runner started and needs a restart to apply.
+
+Operators see all of it read-only. Nobody else opens it. Secrets are not in `config.yaml` (only the names of
+the variables in `secrets.env`), and the console never reads `secrets.env`.
+
 ## Grafana
 
 **Monitoring** opens Grafana at `/grafana/` on the console's address. nginx asks the console who the visitor is

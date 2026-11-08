@@ -18,12 +18,14 @@ never knows which.
 from __future__ import annotations
 
 import contextlib
+import os
 import signal
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner import arch_report
 from arceus_runner import architect as architect_mod
@@ -410,7 +412,7 @@ def make_cleanup(cfg: Config, store: TaskStore, events: EventLog, engine: Engine
     return Cleanup(cfg, store, events, docker=Docker(), git=git, engine=engine, advise=advise)
 
 
-def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
+def run(cfg: Config, secrets: Secrets, once: bool = False, config_sha: str | None = None) -> int:
     probe = bulava_mod.probe(cfg.paths.bulava)
     require_mode_ready(cfg, probe)
     stop = threading.Event()
@@ -420,6 +422,9 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         stack.callback(lock.release)
         store = ReviewStore(cfg.paths.db)
         stack.callback(store.close)
+        # Which config.yaml this process runs with: the console shows settings saved but not applied yet.
+        store.set_state("config", {"sha256": config_sha, "loaded_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                                   "pid": os.getpid(), "version": __version__})
         events = EventLog(cfg.paths.events, cfg.project, redact=secrets.values())
         stack.callback(events.close)
         tracker = build_tracker(cfg, secrets)

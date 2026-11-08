@@ -797,9 +797,17 @@ def _format(err: ValidationError) -> list[str]:
 def load_config(path: Path) -> Config:
     path = path.expanduser()
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise ConfigError([f"{path}: file not found"]) from None
+    return parse_config(text, path)
+
+
+def parse_config(text: str, path: Path | str = "config.yaml") -> Config:
+    """config.yaml's text as the runner reads it: the same YAML loader, the same checks, the same words for what is
+    wrong. The web console checks an edit with this before it writes the file."""
+    try:
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise ConfigError([f"{path}: not valid YAML: {e}"]) from None
     if not isinstance(raw, dict):

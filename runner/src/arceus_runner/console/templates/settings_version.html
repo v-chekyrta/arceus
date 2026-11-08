@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% from "macros.html" import diff_block %}
+{% block body %}
+<p class="crumb"><a href="/settings/history/">Settings history</a></p>
+<h1>Saved {{ v.at|when }}</h1>
+<p class="lede">By {{ v.actor }}{% if v.note %}: {{ v.note }}{% endif %}.{% if v.after_sha == current_sha %} This is config.yaml as it is now.{% endif %}</p>
+{% if can_edit %}
+<div class="toolbar">
+  <a class="btn" href="/settings/yaml/?version={{ v.id }}">Open this version in the editor</a>
+  {% if v.before_text is not none %}<a class="btn" href="/settings/yaml/?version={{ v.id }}&amp;which=before">Open what was there before it</a>{% endif %}
+</div>
+{% endif %}
+<h2>What this save changed</h2>
+{{ diff_block(diff) }}
+{% if v.after_sha != current_sha %}
+<h2>This version against config.yaml now</h2>
+{{ diff_block(against_now) }}
+{% endif %}
+{% endblock %}

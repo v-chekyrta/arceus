@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash %}
+{% block body %}
+<h1>Settings</h1>
+<p class="lede">config.yaml, the runner's settings: <code class="lit">{{ path }}</code>. {% if can(user, "settings.edit") %}Every change is checked as the runner would check it and shown as a difference before it is saved.{% else %}You see them read-only: admins change them.{% endif %} Secrets are not here: they live in secrets.env, which the console never reads.</p>
+{{ flash(notice) }}
+{% include "settings_loaded.html" %}
+{% if problems %}
+<div class="alert"><p><strong>config.yaml does not load:</strong> the runner would refuse to start.</p><ul>{% for p in problems %}<li><code class="lit">{{ p }}</code></li>{% endfor %}</ul></div>
+<p><a class="btn primary" href="/settings/yaml/">{{ "Fix it as YAML" if can(user, "settings.edit") else "See it as YAML" }}</a></p>
+{% elif legacy %}
+<p class="notice warn">This config.yaml has the older layout (youtrack: and gitlab: sections): the form cannot change it. Edit it as YAML, or move it to tracker: and code_host: (config.example.yaml shows how).</p>
+{% endif %}
+<div class="toolbar">
+  <a class="btn" href="/settings/yaml/">The whole file as YAML</a>
+  <a class="btn" href="/settings/history/">History</a>
+</div>
+{% if groups %}
+<ul class="links settings-groups">
+  {% for g in groups %}
+  <li><a href="/settings/{{ g.name }}/">{{ g.title }}</a><span class="note">{{ g.what }}</span><span class="note count-note">{{ g.count }} setting{{ "s" if g.count != 1 }}, {{ g.in_file }} written in the file</span></li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if versions %}
+<h2>Saved lately</h2>
+<div class="card"><ul class="journal">
+  {% for v in versions %}<li><span class="at">{{ v.at|when }}</span>{{ v.actor }}{% if v.note %}: {{ v.note }}{% endif %} <a href="/settings/history/{{ v.id }}/">See the change</a></li>{% endfor %}
+</ul></div>
+{% endif %}
+{% endblock %}

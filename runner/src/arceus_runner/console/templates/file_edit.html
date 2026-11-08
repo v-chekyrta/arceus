@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros.html" import flash, csrf_field %}
+{% from "macros.html" import flash, csrf_field, diff_block %}
 {% block body %}
 <p class="crumb"><a href="{{ back[0] }}">{{ back[1] }}</a></p>
 <h1>{{ title }}</h1>
@@ -11,8 +11,7 @@
 {% endif %}
 {% if conflict %}
 <h2>What changed</h2>
-<pre class="diff">{% for line in conflict.splitlines() %}<span class="{{ 'add' if line.startswith('+') and not line.startswith('+++') else 'del' if line.startswith('-') and not line.startswith('---') else 'ctx' }}">{{ line }}</span>
-{% endfor %}</pre>
+{{ diff_block(conflict) }}
 {% endif %}
 <div class="split file-split">
   <form class="card" method="post">

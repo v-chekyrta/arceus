@@ -34,3 +34,7 @@
 </div>
 {% endif %}
 {% endmacro %}
+
+{% macro diff_block(text) %}
+<pre class="diff">{% for line in text.splitlines() %}<span class="{{ 'add' if line.startswith('+') and not line.startswith('+++') else 'del' if line.startswith('-') and not line.startswith('---') else 'hunk' if line.startswith('@@') else 'ctx' }}">{{ line or " " }}</span>{% endfor %}</pre>
+{% endmacro %}

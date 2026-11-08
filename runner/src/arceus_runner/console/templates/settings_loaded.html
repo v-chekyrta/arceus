@@ -1,0 +1,7 @@
+{% if loaded.state == "differs" %}
+<p class="notice warn">config.yaml has changed since the runner started ({{ loaded.at|when }}): it still runs with the earlier settings. {% if restart %}<a href="{{ restart }}">Restart it</a>{% else %}Restart it on the server (sudo systemctl restart runner){% endif %} to apply them.</p>
+{% elif loaded.state == "same" %}
+<p class="notice">The runner runs with this config.yaml (started {{ loaded.at|when }}).</p>
+{% else %}
+<p class="notice warn">Not known whether the runner runs with this config.yaml: {{ loaded.why }}.</p>
+{% endif %}

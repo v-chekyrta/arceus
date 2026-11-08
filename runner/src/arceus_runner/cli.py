@@ -207,6 +207,10 @@ def cmd_probe(args) -> int:
 
 
 def cmd_run(args) -> int:
+    import hashlib
+    path = _config_path(args.config)
+    # The bytes it was loaded from, read first: the console compares them with the file saved since.
+    config_sha = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
     cfg, secrets = _load(args)
     require_mode_ready(cfg, bulava_mod.probe(cfg.paths.bulava))
     if not args.skip_checks:
@@ -217,7 +221,7 @@ def cmd_run(args) -> int:
             _print_checks(failed, False)
             print("runner not started: fix the checks above", file=sys.stderr)
             return EXIT_CHECK_FAILED
-    return run(cfg, secrets, once=args.once)
+    return run(cfg, secrets, once=args.once, config_sha=config_sha)
 
 
 def cmd_rebind(args) -> int:
