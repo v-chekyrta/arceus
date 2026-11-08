@@ -36,7 +36,7 @@
       {% elif agent_why %}
       <p class="value-line {{ 'bad' if required else 'unknown' }}"><span aria-hidden="true">{{ "✕" if required else "?" }}</span> {{ agent_why }}{% if required %}: a run would stop at once{% endif %}.</p>
       {% else %}
-      <p class="value-line unknown"><span aria-hidden="true">?</span> Nothing: the file has comments only. The runner's own criteria stand alone.</p>
+      <p class="value-line unknown"><span aria-hidden="true">?</span> Nothing: {{ "the file has comments only" if exists else "the file does not exist" }}. The runner's own criteria stand alone.</p>
       {% endif %}
       <p class="note">Text inside &lt;!-- --&gt; is guidance for whoever edits the file; the agent never sees it.</p>
     </section>

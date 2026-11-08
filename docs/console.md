@@ -83,6 +83,20 @@ version that changed meanwhile (another person, an edit over SSH) is refused wit
 saved version is kept with who saved it and can be opened again in the editor. The page also says what the agent
 would get: an instructions file that is empty without its comments, or too large, would stop a run at once.
 
+## Architecture
+
+**Architecture** lists the reviews and a count of open, decided and fixed findings; **All findings** shows every
+finding kept. A review opens as its report, built from `runner.db` on every visit. Each finding shows Codex's
+second check apart from the person's decision.
+
+People with the architect role and admins decide: **Accept the risk** or **False positive**, each with a reason,
+or **Take the decision back**. Everyone else sees the decisions without the buttons, and a direct POST from them
+is refused. The finding shows who decided, when and why, and **Decisions on it** lists every decision before.
+The form carries the version of the finding the page showed. If someone else decided in the meantime, the second
+decision is refused and the page says what stands now. The next review gets the reason only after the security
+screen cleared it, quoted as data ([architect.md](architect.md)). Architects also start and stop a review and edit
+the review instructions, the same way as test runs.
+
 ## Grafana
 
 **Monitoring** opens Grafana at `/grafana/` on the console's address. nginx asks the console who the visitor is

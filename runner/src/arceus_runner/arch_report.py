@@ -23,6 +23,7 @@ import secrets
 import threading
 import urllib.parse
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -86,6 +87,12 @@ details { margin: 12px 0 0; }
 details summary { cursor: pointer; color: var(--blue); }
 .criteria { margin: 8px 0 0; padding-left: 20px; } .criteria li { margin: 0 0 8px; }
 .alert .objections { margin: 8px 0 0; white-space: pre-line; }
+.who-decided { display: block; margin: -4px 0 10px; color: var(--muted); font-size: 0.875rem; }
+.history { margin: 12px 0 0; } .history .journal { margin: 6px 0 0; }
+.history .journal li { padding: 6px 0; border-top: 1px solid var(--line); font-size: 0.9rem; overflow-wrap: anywhere; }
+.history .journal li:first-child { border-top: 0; }
+.history .at { display: block; color: var(--muted); font-size: 0.8rem; }
+.history .note { display: block; color: var(--muted); }
 """
 
 
@@ -117,33 +124,76 @@ def _criteria(text: str) -> str:
     return f'<ol class="criteria">{"".join(items)}</ol>{tail}'
 
 
-def _decision(n: int, row: dict | None, token: str, back: str) -> str:
-    """What a person decided on finding n, and the form to decide or take it back. Only on the live pages."""
+@dataclass(frozen=True)
+class Forms:
+    """How the live pages' decision forms post: on the runner's own page behind the SSH tunnel, or in the web
+    console (console/views_arch.py), where only some people may decide."""
+    token: str                # the form's token
+    field: str = "token"      # its field's name
+    prefix: str = ""          # before /findings/<n>: "" on the tunnel's page, "/architecture" in the console
+    can_decide: bool = True   # False: the decision and its history are shown, the buttons are not
+    when: Callable[[str | None], str] | None = None  # a stored time in words (the console's own)
+
+
+DECIDED_BY = {"accepted": "Risk accepted", "false_positive": "False positive", "open": "Taken back"}
+
+
+def _history(row: dict, forms: Forms) -> str:
+    """Every decision on the finding, newest first: who, when, what, why."""
+    items = row.get("history") or []
+    if not items:
+        return ""
+    when = forms.when or (lambda s: s or "")
+    lines = []
+    for d in reversed(items):
+        why = f' <span class="note">{rich(d["note"])}</span>' if d.get("note") else ""
+        lines.append(f'<li><span class="at">{e(when(d["at"]))}</span>{e(d["decided_by"])}: '
+                     f'{e(DECIDED_BY.get(d["decision"], d["decision"]))}{why}</li>')
+    return (f'<details class="history"><summary>Decisions on it ({len(items)})</summary>'
+            f'<ul class="journal">{"".join(lines)}</ul></details>')
+
+
+def _decision(n: int, row: dict | None, forms: Forms, back: str) -> str:
+    """What a person decided on finding n, who and when, its history, and the form to decide or take it back.
+    Only on the live pages; the buttons only for whoever may decide."""
     if row is None:
         return ""
     if row["status"] == "fixed":
         return (f'<div class="decision"><p><span class="tag fixed">Fixed</span> A later review found it gone '
-                f'(run {e(row["fixed_run"])}).</p></div>')
-    hidden = (f'<input type="hidden" name="token" value="{e(token)}">'
-              f'<input type="hidden" name="back" value="{e(back)}#f{n}">')
-    action = f"/findings/{n}"
+                f'(run {e(row["fixed_run"])}).</p>{_history(row, forms)}</div>')
+    # The version the page shows: a decision sent from an older page than the finding is refused (conflicts).
+    hidden = (f'<input type="hidden" name="{e(forms.field)}" value="{e(forms.token)}">'
+              f'<input type="hidden" name="back" value="{e(back)}#f{n}">'
+              f'<input type="hidden" name="version" value="{e(row.get("updated_at"))}">')
+    action = f"{forms.prefix}/findings/{n}"
+    when = forms.when or (lambda s: s or "")
     if row.get("decision"):
         word = DECISION_WORDS.get(row["decision"], e(row["decision"]))
+        who = ""
+        if row.get("decided_by") or row.get("decided_at"):
+            who = (f'<span class="who-decided">{e(row.get("decided_by") or "Someone")}'
+                   f'{", " + e(when(row.get("decided_at"))) if row.get("decided_at") else ""}</span>')
         note = f" {rich(row['decision_note'])}" if row.get("decision_note") else ""
+        form = ""
+        if forms.can_decide:
+            form = (f'<form method="post" action="{action}">{hidden}<input type="hidden" name="decision" value="open">'
+                    f'<button class="btn" type="submit">Take the decision back</button></form>')
         return (f'<div class="decision"><p><span class="tag {e(row["decision"])}">{word}</span>{note}</p>'
-                f'<form method="post" action="{action}">{hidden}<input type="hidden" name="decision" value="open">'
-                f'<button class="btn" type="submit">Take the decision back</button></form></div>')
+                f'{who}{form}{_history(row, forms)}</div>')
+    if not forms.can_decide:
+        return (f'<div class="decision"><p><span class="tag still">Open</span> Nobody has decided on it yet.</p>'
+                f'{_history(row, forms)}</div>')
     return (f'<form class="decision" method="post" action="{action}">{hidden}'
             f'<label for="why{n}">Why, for whoever reads this later (the next review gets it too)</label>'
             f'<textarea id="why{n}" name="note" maxlength="{MAX_NOTE}" required></textarea>'
             '<div class="actions">'
             '<button class="btn" type="submit" name="decision" value="accepted">Accept the risk</button>'
             '<button class="btn" type="submit" name="decision" value="false_positive">False positive</button>'
-            "</div></form>")
+            f"</div>{_history(row, forms)}</form>")
 
 
 def _finding(f: dict, n: int | None, standing: str | None, verdict: dict | None, row: dict | None,
-             token: str = "", back: str = "", seen: str = "") -> str:
+             forms: Forms | None = None, back: str = "", seen: str = "") -> str:
     """One finding: its tags, what is wrong and what it risks, the rule, the way out, the code, its second check,
     and on the live pages the decision."""
     sev = f.get("severity") or "medium"
@@ -177,8 +227,8 @@ def _finding(f: dict, n: int | None, standing: str | None, verdict: dict | None,
         v = verdict.get("verdict")
         parts.append(f'<div class="opinion {e(v)}"><strong>{VERDICT_WORDS.get(v, e(v))}</strong>'
                      f'<p>{rich(verdict.get("reason"))}</p></div>')
-    if n and token:
-        parts.append(_decision(n, row, token, back))
+    if n and forms:
+        parts.append(_decision(n, row, forms, back))
     parts.append("</article>")
     return "\n".join(parts)
 
@@ -200,9 +250,15 @@ def second_check(so: dict | None, findings: int) -> str:
 
 def render_run(view: dict, ledger: dict[int, dict], project: str, tz: ZoneInfo, token: str = "",
                criteria: str = "") -> str:
-    """One run's report: the verdict and the facts, the summary, its findings (new and still open, each with
-    its second check), what it found fixed and what it did not check again, then what it read. With a `token` (the
-    live server) every kept finding has its decision and the buttons; without, the page is the run as it was."""
+    """One run's report as a page of its own (report.html; with a `token`, the runner's live page)."""
+    return _page(*run_body(view, ledger, project, tz, Forms(token) if token else None, criteria), STYLE)
+
+
+def run_body(view: dict, ledger: dict[int, dict], project: str, tz: ZoneInfo, forms: Forms | None = None,
+             criteria: str = "") -> tuple[str, str]:
+    """One run's report, its title and body: the verdict and the facts, the summary, its findings (new and still
+    open, each with its second check), what it found fixed and what it did not check again, then what it read. With
+    `forms` (a live page) every kept finding has its decision; without, the page is the run as it was."""
     findings = view.get("findings") or []
     outcome = view.get("outcome")
     # Who typed the command on the server is the runner's own user: only the schedule says something.
@@ -240,14 +296,15 @@ def render_run(view: dict, ledger: dict[int, dict], project: str, tz: ZoneInfo, 
     numbers = led.get("findings") or []
     new = set(led.get("new") or [])
     verdicts = (view.get("second_opinion") or {}).get("verdicts") or {}
-    back = f"/{view['n']}/"
+    prefix = forms.prefix if forms else ""
+    back = f"{prefix}/{view['n']}/"
     if outcome != "unchanged":
         body.append("<h2>Findings</h2>")
         if findings:
             for i, f in enumerate(findings, 1):
                 n = numbers[i - 1] if i <= len(numbers) else None
                 standing = None if n is None else "new" if n in new else "still"
-                body.append(_finding(f, n, standing, verdicts.get(str(i)), ledger.get(n) if n else None, token, back))
+                body.append(_finding(f, n, standing, verdicts.get(str(i)), ledger.get(n) if n else None, forms, back))
         else:
             body.append('<p class="empty">None raised.</p>')
     notes = {p["id"]: p.get("note") or "" for p in view.get("previous") or []}
@@ -262,7 +319,7 @@ def render_run(view: dict, ledger: dict[int, dict], project: str, tz: ZoneInfo, 
         for n in shown:
             row = ledger.get(n) or {}
             title_n = row.get("title") or f"Finding {n}"
-            link = f'<a href="/findings/#f{e(n)}">#{e(n)}</a>' if token else f"#{e(n)}"
+            link = f'<a href="{prefix}/findings/#f{e(n)}">#{e(n)}</a>' if forms else f"#{e(n)}"
             note = f'<span class="note">{rich(notes[n])}</span>' if notes.get(n) else ""
             items.append(f"<li>{link} {rich(title_n)}{note}</li>")
         body.append(f"<h2>{title}</h2><p>{lead}</p><ul class=\"brief\">{''.join(items)}</ul>")
@@ -293,10 +350,11 @@ def render_run(view: dict, ledger: dict[int, dict], project: str, tz: ZoneInfo, 
         body.append('<div class="alert note"><p><strong>Left out of this report</strong> (the agent\'s report did not '
                     'hold up there):</p><ul>' + "".join(f"<li>{e(p)}</li>" for p in problems) + "</ul></div>")
     if criteria:
-        body.append(f"<footer><details><summary>The criteria this review used (the runner's, version "
-                    f"{e(view.get('criteria'))})</summary>{_criteria(criteria)}</details></footer>")
+        version = f", version {e(view.get('criteria'))}" if view.get("criteria") else ""
+        body.append(f"<footer><details><summary>The criteria this review used (the runner's{version})</summary>"
+                    f"{_criteria(criteria)}</details></footer>")
     title = f"Review {view['n']}: {head_of(outcome, len(findings), view.get('since_run'))}"
-    return _page(title, "\n".join(body), STYLE)
+    return title, "\n".join(body)
 
 
 def _ledger_counts(rows: list[dict]) -> tuple[int, int, int]:
@@ -346,6 +404,11 @@ def render_index(runs: list[dict], ledger: list[dict], project: str, tz: ZoneInf
 
 
 def render_findings(ledger: list[dict], project: str, token: str) -> str:
+    """Every finding kept, as the runner's own live page."""
+    return _page(*findings_body(ledger, project, Forms(token)), STYLE)
+
+
+def findings_body(ledger: list[dict], project: str, forms: Forms) -> tuple[str, str]:
     """Every finding kept: the open ones first, then the ones a person decided on, then the fixed ones."""
     body = [f'<p class="crumb"><a href="../">All reviews of {e(project)}</a></p>', f"<h1>Findings of {e(project)}</h1>"]
     open_, decided, fixed = _ledger_counts(ledger)
@@ -366,8 +429,8 @@ def render_findings(ledger: list[dict], project: str, token: str) -> str:
             f = r["body"]
             seen = f"Raised in run {r['first_run']}" + (f", last seen in run {r['last_run']}"
                                                          if r["last_run"] != r["first_run"] else "")
-            body.append(_finding(f, r["n"], None, f.get("verdict"), r, token, "/findings/", seen))
-    return _page(f"Findings of {project}", "\n".join(body), STYLE)
+            body.append(_finding(f, r["n"], None, f.get("verdict"), r, forms, f"{forms.prefix}/findings/", seen))
+    return f"Findings of {project}", "\n".join(body)
 
 
 # -- the server -----------------------------------------------------------------------------------------------------
@@ -379,7 +442,7 @@ _BACK = re.compile(r"^/(?:\d{1,9}/|findings/)?(?:#f\d{1,9})?$")
 
 class _Handler(qa_report._Handler):
     pages: Callable[[str, str], str | None]
-    decide: Callable[[int, str, str], str | None]
+    decide: Callable[[int, str, str, str | None], str | None]
     token = ""
     server_version = "arceus-arch"
     csp = ("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; "
@@ -428,7 +491,8 @@ class _Handler(qa_report._Handler):
         if decision != "open" and not note:
             self.send_error(400, "Say why: the next review and whoever reads this later get the reason")
             return
-        problem = self.decide(int(m.group(1)), decision, note[:MAX_NOTE])
+        version = (form.get("version") or [""])[0] or None
+        problem = self.decide(int(m.group(1)), decision, note[:MAX_NOTE], version)
         if problem:
             self.send_error(404 if "no finding" in problem else 409, problem)
             return

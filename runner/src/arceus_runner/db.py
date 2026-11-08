@@ -119,6 +119,14 @@ class AlreadyRunning(Exception):
     pass
 
 
+class FindingChanged(Exception):
+    """A decision taken on a page older than the finding: someone decided, or a review saw it, meanwhile."""
+
+    def __init__(self, finding):
+        self.finding = finding
+        super().__init__(f"finding {finding.n} changed at {finding.updated_at}")
+
+
 class InstanceLock:
     """One runner per state directory. Held for the whole life of the process."""
 
@@ -684,6 +692,26 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 22: who decided on an architecture finding, and every decision on it in order (the web console). A decision
+    # taken back is a row too: what stood before stays readable after the next person changes it.
+    """
+    ALTER TABLE arch_findings ADD COLUMN decided_by TEXT;
+    CREATE TABLE arch_decisions (
+        id               INTEGER PRIMARY KEY,
+        finding          INTEGER NOT NULL REFERENCES arch_findings (n),
+        decision         TEXT NOT NULL CHECK (decision IN ('accepted', 'false_positive', 'open')),
+        note             TEXT NOT NULL DEFAULT '',
+        decided_by       TEXT NOT NULL,
+        at               TEXT NOT NULL,
+        before_decision  TEXT,
+        before_note      TEXT
+    );
+    CREATE INDEX arch_decisions_finding ON arch_decisions (finding, id);
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -1034,7 +1062,8 @@ RUN_HOLDS = ("preparing", "running", "reviewing", "restoring")
 RUN_UNDER_WAY = ("pending", *RUN_HOLDS, "publishing")
 RUN_FIELDS = ("state", "stop_requested", "snapshot", "result", "outcome", "reason", "started_at", "finished_at")
 RUN_KINDS = ("qa", "arch")
-FINDING_FIELDS = ("title", "body", "last_run", "status", "fixed_run", "decision", "decision_note", "decided_at")
+FINDING_FIELDS = ("title", "body", "last_run", "status", "fixed_run", "decision", "decision_note", "decided_at",
+                  "decided_by")
 
 
 @dataclass(frozen=True)
@@ -1071,6 +1100,7 @@ class ArchFinding:
     decided_at: str | None
     created_at: str = ""
     updated_at: str = ""
+    decided_by: str | None = None  # who: a console account's email, or "the reports page" (the SSH tunnel's)
 
 
 class ReviewStore(TaskStore):
@@ -1218,6 +1248,31 @@ class ReviewStore(TaskStore):
         found = self.finding(n)
         assert found is not None
         return found
+
+    def decide_finding(self, n: int, decision: str, note: str, by: str, at: str,
+                       expected: str | None = None) -> ArchFinding:
+        """A person's decision on finding n (accepted, false_positive, or open: taken back), kept in its history.
+        With `expected` (the finding's updated_at the person's page showed), a finding changed since is refused:
+        FindingChanged names what is there now."""
+        with contextlib.nullcontext() if self.conn.in_transaction else self.transaction():
+            found = self.finding(n)
+            if found is None:
+                raise LookupError(f"no finding {n}")
+            if expected is not None and found.updated_at != expected:
+                raise FindingChanged(found)
+            self.conn.execute("INSERT INTO arch_decisions (finding, decision, note, decided_by, at, before_decision,"
+                              " before_note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                              (n, decision, note, by, at, found.decision, found.decision_note))
+            if decision == "open":
+                return self.update_finding(n, decision=None, decision_note=None, decided_at=None, decided_by=None)
+            return self.update_finding(n, decision=decision, decision_note=note, decided_at=at, decided_by=by)
+
+    def decisions(self, n: int | None = None) -> list[dict]:
+        """The decisions on finding n (on every finding with None), oldest first."""
+        q, args = "SELECT * FROM arch_decisions", ()
+        if n is not None:
+            q, args = q + " WHERE finding = ?", (n,)
+        return [dict(r) for r in self.conn.execute(q + " ORDER BY id", args).fetchall()]
 
     def task_mrs(self, task_id: str) -> list[TaskMR]:
         rows = self.conn.execute("SELECT * FROM task_mrs WHERE task_id = ? ORDER BY repo", (task_id,)).fetchall()

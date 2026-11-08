@@ -1,0 +1,8 @@
+{% extends "runs.html" %}
+{% block extra_tools %}<a class="btn" href="/architecture/findings/">All findings</a>{% endblock %}
+{% block before_list %}
+{% set open_, decided, fixed = counts %}
+{% if open_ or decided or fixed %}
+<p class="strip"><a href="/architecture/findings/">{{ open_ }} open finding{{ "s" if open_ != 1 }}</a><span>{{ decided }} decided</span><span>{{ fixed }} fixed</span></p>
+{% endif %}
+{% endblock %}
