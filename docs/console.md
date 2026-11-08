@@ -67,6 +67,22 @@ answering, a runner that answers but has not finished its first pass ("starting"
 pass that ended more than 15 minutes ago ("stuck"), a check without a recorded reason, a `config.yaml` that does
 not load.
 
+## Test runs
+
+**Test runs** lists every run of the platform test, newest first, queued and running ones included, and opens a
+finished one as its report: the verdict, what was checked, each problem with its steps, its screenshots and videos
+at the step they show, expected against actual and the suspected cause with links into the code. The list stays
+when `qa.enabled` is false; it says that none start. Only the report's own files are served: a run's media by its
+exact name, never the copy of the instructions a run keeps (it holds the test accounts), `result.json` or any other
+path.
+
+People with the QA role and admins start a run (one at a time, as `arceus-runner qa run` does; the run records
+their email as who asked) and stop one under way. They also edit the **test instructions**, which nobody else can
+open, since the file holds the test accounts. The editor saves atomically and keeps the file's mode. A save over a
+version that changed meanwhile (another person, an edit over SSH) is refused with the difference shown. Every
+saved version is kept with who saved it and can be opened again in the editor. The page also says what the agent
+would get: an instructions file that is empty without its comments, or too large, would stop a run at once.
+
 ## Grafana
 
 **Monitoring** opens Grafana at `/grafana/` on the console's address. nginx asks the console who the visitor is

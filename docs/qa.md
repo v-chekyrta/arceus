@@ -15,6 +15,6 @@ Off by default (`qa.enabled: false`). With it on, the agent tests the whole plat
 - could not test (the site down, the login refused);
 - did not finish: nothing checked, everything skipped, a problem without a description, or a report the runner could not read; the report and Slack say why.
 
-Reports are served on `127.0.0.1:3300` (`qa.port`): `ssh -L 3300:127.0.0.1:3300 <user>@<vm>`, then `http://localhost:3300/`. The list is read from the database on every visit, so queued and running runs show at once. Only reports and their screenshots are served, never the instructions.
+With the web console on, the reports are its **Test runs** ([console.md](console.md)): people with the QA role (or admins) start and stop runs there and edit the instructions, and everyone signed in reads the reports. Without it, reports are served on `127.0.0.1:3300` (`qa.port`): `ssh -L 3300:127.0.0.1:3300 <user>@<vm>`, then `http://localhost:3300/`. Either way the list is read from the database on every visit, so queued and running runs show at once, and only reports and their screenshots are served, never the instructions.
 
 **Slack and Grafana.** The channel hears when a run starts (and whether the schedule started it) and how it ended, with the agent's two or three lines and the report's link. On **Arceus · now** the agent shows as Testing, and the run is listed as `qa-<n>`.

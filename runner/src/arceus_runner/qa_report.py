@@ -229,8 +229,14 @@ def _finding(i: int, f: dict) -> str:
 
 
 def render_run(view: dict, project: str, tz: ZoneInfo) -> str:
-    """One run's report: the verdict and the facts, the agent's summary, what it checked, then each problem with
-    its steps, its screenshots at the step they show, expected against actual, and the suspected cause."""
+    """One run's report as a page of its own (report.html in the run's folder)."""
+    return _page(*run_body(view, project, tz))
+
+
+def run_body(view: dict, project: str, tz: ZoneInfo) -> tuple[str, str]:
+    """One run's report, its title and body: the verdict and the facts, the agent's summary, what it checked, then
+    each problem with its steps, its screenshots at the step they show, expected against actual, and the suspected
+    cause. The web console shows the body inside its own page."""
     findings = view.get("findings") or []
     outcome = view.get("outcome")
     # Who typed the command on the server is the runner's own user: only the schedule says something.
@@ -287,7 +293,7 @@ def render_run(view: dict, project: str, tz: ZoneInfo) -> str:
                 lines.append(f"<li><code>{e(r['repo'])}</code> {e(r['default'])} at <code>{e(r['sha'][:12])}</code>"
                              f"{note}</li>")
         body.append("<footer><p>Code the agent read to explain problems:</p><ul>" + "".join(lines) + "</ul></footer>")
-    return _page(f"Run {view['n']}: {head_of(outcome, len(findings))}", "\n".join(body))
+    return f"Run {view['n']}: {head_of(outcome, len(findings))}", "\n".join(body)
 
 
 def render_index(rows: list[dict], project: str, tz: ZoneInfo) -> str:

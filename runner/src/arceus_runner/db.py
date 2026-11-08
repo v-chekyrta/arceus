@@ -183,6 +183,26 @@ class Store:
                                "version of the runner once first")
         return self
 
+    @classmethod
+    def existing(cls, path: Path):
+        """The runner's database for writing what a person asked for in the web console (a run, a decision): never
+        created, never migrated. A database of another schema than this code knows is refused, so a console of
+        another version than the runner writes nothing into it."""
+        if not path.exists():
+            raise FileNotFoundError(f"{path}: no runner database yet")
+        self = cls.__new__(cls)
+        self.path = path
+        self.conn = sqlite3.connect(path, isolation_level=None, timeout=30, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA synchronous=FULL")
+        if self.version != len(MIGRATIONS):
+            v = self.version
+            self.conn.close()
+            raise RuntimeError(f"{path} is schema v{v}, this console knows v{len(MIGRATIONS)}: the runner and the "
+                               "console are of different versions; run setup.sh so both are the same")
+        return self
+
     def close(self) -> None:
         self.conn.close()
 

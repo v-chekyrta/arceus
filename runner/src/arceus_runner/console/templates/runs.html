@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% set base = "/qa/" if kind == "qa" else "/architecture/" %}
+{% block body %}
+<h1>{{ title }}</h1>
+<p class="lede">{% if kind == "qa" %}The agent tests the whole platform in a browser by the test instructions and writes a report with steps, screenshots and the suspected cause in the code.{% else %}The agent reads what changed since the last review and how it fits with the rest; Codex checks each finding before the report goes out.{% endif %}{% if schedule %} On schedule: {{ schedule.days|join(", ") }} at {{ schedule.at.strftime("%H:%M") }}.{% endif %}</p>
+{{ flash(notice, error) }}
+{% if not enabled %}
+<p class="notice warn">{% if kind == "qa" %}Test runs{% else %}Architecture reviews{% endif %} are off in config.yaml ({{ "qa" if kind == "qa" else "architect" }}.enabled: false): none start. The earlier reports are still here.</p>
+{% elif mode != "live" %}
+<p class="notice warn">The runner is in mode: {{ mode }}, which starts nothing: a queued run waits until it is live.</p>
+{% endif %}
+
+<div class="toolbar">
+  {% if can_run and enabled %}
+  <form method="post" action="{{ base }}">{{ csrf_field(csrf) }}<button class="btn primary" type="submit">{% if kind == "qa" %}Start a test run{% else %}Start a review{% endif %}</button></form>
+  {% endif %}
+  {% if can_edit %}<a class="btn" href="{{ base }}instructions/">{% if kind == "qa" %}Test instructions{% else %}Review instructions{% endif %}</a>{% endif %}
+  {% block extra_tools %}{% endblock %}
+</div>
+
+{% block before_list %}{% endblock %}
+
+{% if rows %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Run</th><th>Result</th><th class="hide-narrow">Started</th><th class="hide-narrow">Asked by</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+  {% set under_way = r.state != "done" %}
+  <tr>
+    <td class="nowrap">{% if (kind == "qa" and r.has_report) or (kind != "qa" and r.state == "done") %}<a href="{{ base }}{{ r.n }}/">Run {{ r.n }}</a>{% else %}Run {{ r.n }}{% endif %}</td>
+    <td>
+      {% if under_way %}
+      <span class="tag {{ 'quiet' if r.state == 'pending' else 'busy' }}">{{ r.state_text }}</span>{% if r.stop_requested %} <span class="tag wait">Stop asked</span>{% endif %}
+      {% if can_run and not r.stop_requested %}
+      <form class="inline-stop" method="post" action="{{ base }}{{ r.n }}/stop">{{ csrf_field(csrf) }}<button class="btn small danger" type="submit" data-confirm="Stop run {{ r.n }}? Its report says what it found so far.">Stop</button></form>
+      {% endif %}
+      {% else %}
+      <span class="{{ r.result_class }}">{{ r.result_text }}</span>
+      {% endif %}
+      {% if r.summary %}<span class="run-summary">{{ r.summary }}</span>{% endif %}
+    </td>
+    <td class="hide-narrow nowrap">{{ (r.started_at or r.created_at)|when }}</td>
+    <td class="hide-narrow">{{ "Schedule" if r.source == "schedule" else r.requested_by }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No runs yet.{% if can_run and enabled %} Start one above.{% endif %}</p>
+{% endif %}
+{% endblock %}

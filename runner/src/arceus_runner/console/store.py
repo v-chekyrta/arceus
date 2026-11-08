@@ -89,6 +89,24 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX audit_at ON audit (at);
     """,
+    # 2: every version of a file saved from the console (instructions, the project's notes, config.yaml): what was
+    # there before, what was saved, who saved it. A version is a step back the page can offer.
+    """
+    CREATE TABLE file_versions (
+        id               INTEGER PRIMARY KEY,
+        kind             TEXT NOT NULL,
+        path             TEXT NOT NULL,
+        before_sha       TEXT NOT NULL,
+        before_text      TEXT,
+        after_sha        TEXT NOT NULL,
+        after_text       TEXT NOT NULL,
+        actor_id         INTEGER REFERENCES users (id),
+        actor            TEXT NOT NULL,
+        note             TEXT NOT NULL DEFAULT '',
+        at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE INDEX file_versions_kind ON file_versions (kind, id);
+    """,
 ]
 
 
@@ -573,6 +591,23 @@ class ConsoleStore:
         self.conn.execute("INSERT INTO audit (actor_id, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
                           (by.id if by else None, actor, action, target,
                            json.dumps(detail or {}, ensure_ascii=False, default=str)))
+
+    def add_version(self, kind: str, path: Path, before_sha: str, before_text: str | None, after_sha: str,
+                    after_text: str, by: User, note: str = "") -> int:
+        cur = self.conn.execute(
+            "INSERT INTO file_versions (kind, path, before_sha, before_text, after_sha, after_text, actor_id, actor, "
+            "note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, str(path), before_sha, before_text, after_sha, after_text, by.id, by.label, note[:300]))
+        return cur.lastrowid
+
+    def versions(self, kind: str, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM file_versions WHERE kind = ? ORDER BY id DESC LIMIT ?",
+                                 (kind, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def version_of(self, kind: str, version_id: int) -> dict | None:
+        row = self.conn.execute("SELECT * FROM file_versions WHERE kind = ? AND id = ?", (kind, version_id)).fetchone()
+        return dict(row) if row else None
 
     def journal(self, limit: int = 200, target: str | None = None) -> list[dict]:
         q, args = "SELECT * FROM audit", []

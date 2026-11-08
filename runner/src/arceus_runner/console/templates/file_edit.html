@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% block body %}
+<p class="crumb"><a href="{{ back[0] }}">{{ back[1] }}</a></p>
+<h1>{{ title }}</h1>
+<p class="lede">{{ lede }}</p>
+{{ flash(notice, error) }}
+{% if sensitive %}<p class="meta">Only the people who may edit it see this file: it holds what the agent needs to sign in.</p>{% endif %}
+{% if restoring %}
+<p class="notice warn">The editor holds the version saved {{ restoring.at|when }} by {{ restoring.actor }}. It is not saved yet: save to bring it back.</p>
+{% endif %}
+{% if conflict %}
+<h2>What changed</h2>
+<pre class="diff">{% for line in conflict.splitlines() %}<span class="{{ 'add' if line.startswith('+') and not line.startswith('+++') else 'del' if line.startswith('-') and not line.startswith('---') else 'ctx' }}">{{ line }}</span>
+{% endfor %}</pre>
+{% endif %}
+<div class="split file-split">
+  <form class="card" method="post">
+    {{ csrf_field(csrf) }}
+    <input type="hidden" name="sha" value="{{ sha }}">
+    <div class="form-row">
+      <label for="text"><code class="lit">{{ path }}</code>{% if not exists %} <span class="hint">does not exist yet: saving makes it</span>{% endif %}</label>
+      <textarea class="code" id="text" name="text" spellcheck="false"{% if readonly %} readonly{% endif %}>{{ text }}</textarea>
+    </div>
+    <div class="form-row">
+      <label for="note">What changed <span class="hint">Optional, for the history.</span></label>
+      <input id="note" name="note" type="text" maxlength="300">
+    </div>
+    <button class="btn primary" type="submit"{% if readonly %} disabled{% endif %}>Save</button>
+  </form>
+  <div>
+    <section class="card">
+      <h2>What the agent gets</h2>
+      {% if agent_ok %}
+      <p class="value-line good"><span aria-hidden="true">✓</span> {{ agent_bytes }} bytes of instructions, HTML comments left out (limit {{ limit // 1024 }} KB).</p>
+      {% elif agent_why %}
+      <p class="value-line {{ 'bad' if required else 'unknown' }}"><span aria-hidden="true">{{ "✕" if required else "?" }}</span> {{ agent_why }}{% if required %}: a run would stop at once{% endif %}.</p>
+      {% else %}
+      <p class="value-line unknown"><span aria-hidden="true">?</span> Nothing: the file has comments only. The runner's own criteria stand alone.</p>
+      {% endif %}
+      <p class="note">Text inside &lt;!-- --&gt; is guidance for whoever edits the file; the agent never sees it.</p>
+    </section>
+    <section class="card">
+      <h2>Saved versions</h2>
+      {% if versions %}
+      <ul class="journal">
+        {% for v in versions %}
+        <li><span class="at">{{ v.at|when }}</span>{{ v.actor }}{% if v.note %}: {{ v.note }}{% endif %}
+          <a href="?version={{ v.id }}">Open in the editor</a></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="meta">None saved from the console yet.</p>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

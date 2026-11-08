@@ -310,6 +310,8 @@ def page(handler: Callable[[Ctx], Response], *, signed_in: bool = True, api: boo
                 except Gone:
                     response = ctx.render("message.html", status=404, title="Not found",
                                           message="There is nothing at this address.")
+                except ConsoleError as e:
+                    response = ctx.render("message.html", status=503, title="Not available now", message=str(e))
                 for name, (value, age) in ctx.cookies_out.items():
                     _cookie(response, name, value, age, app.settings.secure)
                 return _finish(app, response, session)
@@ -349,11 +351,11 @@ async def healthz(_request: Request) -> Response:
 
 
 def create_app(settings: Settings | None = None) -> Starlette:
-    from arceus_runner.console import views_auth, views_home, views_users
+    from arceus_runner.console import views_auth, views_home, views_qa, views_users
     settings = settings or Settings.from_env()
     console = ConsoleApp(settings)
     routes = [Route("/static/{name}", static), Route("/healthz", healthz)]
-    for module in (views_auth, views_home, views_users):
+    for module in (views_auth, views_home, views_qa, views_users):
         routes += module.routes()
         console.sections.update(getattr(module, "SECTIONS", ()))
     app = Starlette(routes=routes)
