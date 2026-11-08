@@ -638,6 +638,9 @@ class ConsoleConfig(Strict):
     enabled: bool = False
     public_url: str | None = Field(default=None, pattern=r"^https?://[^/\s?#]+$")  # https://console.example.com
     port: int = Field(default=80, ge=1, le=65535)
+    # nginx speaks TLS on `port`, with a certificate setup.sh makes for it: for a load balancer that talks HTTPS to
+    # its backends (and, as they usually do, does not check the backend's certificate). Off: plain HTTP.
+    tls: bool = False
     # Who may say who the visitor is (X-Forwarded-For): the proxies in front of nginx. Anything else is the visitor.
     trusted_proxies: list[str] = PRIVATE_NETWORKS
     session_idle: Duration = timedelta(hours=24)   # signed out after this long without a page opened

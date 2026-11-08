@@ -684,6 +684,7 @@ obs_stale_services() {  # services whose container still reads an older copy of 
   done
 }
 check_observability() {
+  load_console_settings 2>/dev/null || true  # Grafana's sign-in follows the console's; unreadable: as without it
   [ "$(cat "$OBS_DIR/.source-sha256" 2>/dev/null)" = "$(obs_source_hash)" ] || return 1
   [ -z "$(obs_stale_services)" ] || return 1
   same_file "$OBS_DIR/.env" "$(obs_env)" 644 root:root || return 1
@@ -691,6 +692,7 @@ check_observability() {
   obs_running && curl -fsS -o /dev/null "$(grafana_health)"
 }
 apply_observability() {
+  load_console_settings || true
   install -d -m 755 -o root -g root "$OBS_DIR"
   rsync -a --delete --exclude build_dashboards.py --exclude .env --exclude .source-sha256 --exclude secrets \
     "$REPO_DIR/observability/" "$OBS_DIR/"
@@ -719,15 +721,17 @@ apply_observability() {
 # user without sudo, capabilities or the secrets of the data folder. Switched on and configured in
 # config.yaml (console:); what this phase needs from there, `arceus-runner console env` prints.
 CONSOLE_SETTINGS=""
-console_settings() {
-  if [ -z "$CONSOLE_SETTINGS" ]; then
-    # As the run user, with its home: config.yaml's ~ means that home, as for the runner.
-    CONSOLE_SETTINGS="$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
-      --config "$DATA_DIR/config.yaml" console env)" \
-      || die "$DATA_DIR/config.yaml is not valid, so the console cannot be set up: run arceus-runner check --offline"
-  fi
-  printf '%s\n' "$CONSOLE_SETTINGS"
+# Read once, in this shell (never in a $( ) of its own: a failure there would only end that subshell, and the
+# console would look switched off). Returns 1 when config.yaml or the installed runner cannot say.
+load_console_settings() {
+  [ -n "$CONSOLE_SETTINGS" ] && return 0
+  [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] || return 1
+  # As the run user, with its home: config.yaml's ~ means that home, as for the runner.
+  CONSOLE_SETTINGS="$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
+    --config "$DATA_DIR/config.yaml" console env 2>&1)" \
+    || { printf '  %s\n' "$CONSOLE_SETTINGS" | head -5 >&2; CONSOLE_SETTINGS=""; return 1; }
 }
+console_settings() { printf '%s\n' "$CONSOLE_SETTINGS"; }
 console_get() { console_settings | sed -n "s/^$1=//p"; }
 console_enabled() { [ "$(console_get CONSOLE_ENABLED)" = 1 ]; }
 console_compose() {
@@ -774,6 +778,23 @@ console_mounts() {
       printf '      - {type: bind, source: /dev/null, target: %s, read_only: true}\n' "$(yaml_str "$p")"
     fi
   done <<< "$(console_secret_paths)"
+  if [ "$(console_get CONSOLE_TLS)" = 1 ]; then
+    printf '%s\n' "  nginx:" "    volumes:" "      - {type: bind, source: ./tls, target: /etc/nginx/tls, read_only: true}"
+  fi
+}
+# console.tls: a certificate of its own for nginx, made once (ten years), for the load balancer's HTTPS to it.
+console_tls_ok() {
+  [ "$(console_get CONSOLE_TLS)" != 1 ] && return 0
+  [ -s "$CONSOLE_DIR/tls/cert.pem" ] && [ -s "$CONSOLE_DIR/tls/key.pem" ]
+}
+apply_console_tls() {
+  console_tls_ok && return 0
+  local host; host="$(console_get CONSOLE_PUBLIC_URL | sed -E 's#^https?://##')"
+  install -d -m 700 -o root -g root "$CONSOLE_DIR/tls"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=${host:-arceus-console}" \
+    -keyout "$CONSOLE_DIR/tls/key.pem" -out "$CONSOLE_DIR/tls/cert.pem" >/dev/null 2>&1
+  chmod 600 "$CONSOLE_DIR/tls/key.pem"; chmod 644 "$CONSOLE_DIR/tls/cert.pem"
+  say "  nginx: made a certificate of its own for the load balancer's HTTPS ($CONSOLE_DIR/tls)"
 }
 console_nginx_conf() {
   local net
@@ -801,7 +822,14 @@ $(for net in $(console_get CONSOLE_TRUSTED_PROXIES); do printf '  set_real_ip_fr
   real_ip_recursive on;
   map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
   server {
-    listen $(console_get CONSOLE_PORT) default_server;
+$(if [ "$(console_get CONSOLE_TLS)" = 1 ]; then
+    printf '    listen %s ssl default_server;\n' "$(console_get CONSOLE_PORT)"
+    printf '    # The load balancer in front talks HTTPS to this backend; the certificate is setup'"'"'s own.\n'
+    printf '    ssl_certificate /etc/nginx/tls/cert.pem;\n    ssl_certificate_key /etc/nginx/tls/key.pem;\n'
+    printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
+  else
+    printf '    listen %s default_server;\n' "$(console_get CONSOLE_PORT)"
+  fi)
     # Grafana, once the console has said who asks. Its answer's headers replace any X-WEBAUTH-* the browser
     # sent; no session: to the sign-in.
     location = /_console_auth {
@@ -937,6 +965,8 @@ console_port_taken() {  # something that is not the console's nginx listens on t
   ss -Hltnp "sport = :$port" 2>/dev/null | grep -v '"nginx"' | grep -q .
 }
 check_console() {
+  # config.yaml or the runner it needs is not ready: not done (the runner phase, or a fix of config.yaml, first).
+  load_console_settings || return 1
   if ! console_enabled; then
     # Off in config.yaml: nothing of it runs, and nothing on the host takes its requests.
     [ ! -f "$CONSOLE_DIR/compose.yaml" ] || [ -z "$(console_compose ps -q 2>/dev/null)" ] || return 1
@@ -948,10 +978,13 @@ check_console() {
   same_file "$CONSOLE_DIR/.env" "$(console_env)" 644 root:root || return 1
   same_file "$CONSOLE_DIR/nginx.conf" "$(console_nginx_conf)" 644 root:root || return 1
   same_file "$CONSOLE_DIR/mounts.yaml" "$(console_mounts)" 644 root:root || return 1
+  console_tls_ok || return 1
   docker image inspect "arceus-console:$(console_source_hash)" >/dev/null 2>&1 || return 1
   console_running && ! console_stale_nginx && curl -fsS -o /dev/null "http://$CONSOLE_APP/healthz"
 }
 apply_console() {
+  load_console_settings \
+    || die "the console's settings cannot be read from $DATA_DIR/config.yaml: run arceus-runner check --offline"
   if ! console_enabled; then
     if [ -f "$CONSOLE_DIR/compose.yaml" ]; then
       console_compose down 2>&1 | sed 's/^/  /'
@@ -963,7 +996,7 @@ apply_console() {
   console_port_taken && die "port $(console_get CONSOLE_PORT) is taken by something else (ss -ltnp): free it or set console.port"
   install -d -m 755 -o root -g root "$CONSOLE_DIR" "$CONSOLE_DIR/build"
   rsync -a --delete --exclude .env --exclude nginx.conf --exclude mounts.yaml --exclude .source-sha256 \
-    --exclude build "$REPO_DIR/console/" "$CONSOLE_DIR/"
+    --exclude build --exclude tls "$REPO_DIR/console/" "$CONSOLE_DIR/"
   install -d -m 755 -o root -g root "$CONSOLE_DIR/build/runner"
   rsync -a --delete --exclude __pycache__ --exclude '*.egg-info' --exclude build \
     "$REPO_DIR/runner/pyproject.toml" "$REPO_DIR/runner/src" "$CONSOLE_DIR/build/runner/"
@@ -977,6 +1010,7 @@ apply_console() {
   # console.db and the operations' requests: the run user's, in the data folder the container sees.
   install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console"
   apply_ops_units
+  apply_console_tls
   put_file "$CONSOLE_DIR/.env" 644 root:root "$(console_env)" || true
   put_file "$CONSOLE_DIR/mounts.yaml" 644 root:root "$(console_mounts)" || true
   put_file "$CONSOLE_DIR/nginx.conf" 644 root:root "$(console_nginx_conf)" || true
@@ -987,8 +1021,9 @@ apply_console() {
   fi
   local _; for _ in $(seq 1 30); do curl -fs -o /dev/null "http://$CONSOLE_APP/healthz" && break; sleep 2; done
   # Older images of the console: nothing runs them any more.
-  docker image ls arceus-console --format '{{.Tag}}' | grep -vx "$tag" | while IFS= read -r old; do
-    docker image rm -f "arceus-console:$old" >/dev/null 2>&1 || true
+  local old
+  for old in $(docker image ls arceus-console --format '{{.Tag}}'); do
+    [ "$old" = "$tag" ] || docker image rm -f "arceus-console:$old" >/dev/null 2>&1 || true
   done
   console_source_hash > "$CONSOLE_DIR/.source-sha256"
   if [ -z "$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \

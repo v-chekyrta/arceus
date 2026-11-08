@@ -32,6 +32,7 @@ console_get() {
     CONSOLE_SECRET_FILE) printf '%s\n' "$DATA_DIR/secrets.env" "$DATA_DIR/bulava.env" ;;
     CONSOLE_TRUSTED_PROXIES) echo "10.0.0.0/8 192.168.0.0/16" ;;
     CONSOLE_PORT) echo 8081 ;;
+    CONSOLE_TLS) echo "${TLS:-0}" ;;
     CONSOLE_PUBLIC_URL) echo https://console.example.com ;;
     CONSOLE_SESSION_IDLE) echo 86400s ;;
     CONSOLE_SESSION_MAX) echo 1209600s ;;
@@ -53,7 +54,14 @@ check "a reports folder outside the data folder is mounted read-only at its own 
 check "the data folder itself is not mounted twice" "! grep -qF 'source: \"$DATA_DIR\"' <<< \"\$mounts\""
 
 conf="$(console_nginx_conf)"
-check "nginx listens on console.port" "grep -q 'listen 8081 default_server;' <<< \"\$conf\""
+check "nginx listens on console.port" "grep -q 'listen 8081 default_server;' <<< \"\$conf\" && ! grep -q ssl_certificate <<< \"\$conf\""
+TLS=1
+conf_tls="$(console_nginx_conf)"; mounts_tls="$(console_mounts)"
+check "with console.tls, nginx speaks TLS on the port with setup's own certificate" \
+  "grep -q 'listen 8081 ssl default_server;' <<< \"\$conf_tls\" && grep -q 'ssl_certificate /etc/nginx/tls/cert.pem;' <<< \"\$conf_tls\""
+check "and the certificate's folder is mounted into nginx only, read-only" \
+  "grep -A2 '^  nginx:' <<< \"\$mounts_tls\" | grep -qF '{type: bind, source: ./tls, target: /etc/nginx/tls, read_only: true}'"
+TLS=0
 check "and believes X-Forwarded-For only from the trusted proxies" \
   "grep -q 'set_real_ip_from 10.0.0.0/8;' <<< \"\$conf\" && grep -q 'set_real_ip_from 192.168.0.0/16;' <<< \"\$conf\" && grep -q 'real_ip_recursive on;' <<< \"\$conf\""
 check "and passes everything to the console on localhost" "grep -q 'proxy_pass http://127.0.0.1:8180;' <<< \"\$conf\""

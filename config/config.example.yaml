@@ -245,6 +245,14 @@ cleanup:
   protect:                             # never touched, besides arceus-observability and arceus.keep=true
     compose_projects: []               # e.g. the dev stack's compose project, if it lives in the workspace
 
+# The web console (docs/console.md): one address with a sign-in for the status, the reports, Grafana, the
+# settings and the operations, instead of SSH tunnels. setup.sh installs it once this is on.
+console:
+  enabled: false
+  # public_url: https://console.example.com   # required when on: the address people open
+  port: 80                                  # nginx on this machine; the load balancer forwards public_url here
+  tls: false                                # true when the load balancer talks HTTPS to its backends
+
 paths:
   workspace: ~/arceus/workspace
   bulava: /opt/bulava/engine           # the engine folder (bin/dispatch.sh is in it)

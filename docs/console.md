@@ -39,8 +39,15 @@ console:
   enabled: true
   public_url: https://console.example.com   # the address people open
   port: 80                                  # what nginx listens on; the load balancer forwards public_url here
+  tls: false                                # true: the load balancer talks HTTPS to nginx (see below)
   trusted_proxies: [10.0.0.0/8]             # who may say who the visitor is (X-Forwarded-For)
 ```
+
+Some load balancers talk HTTPS to their backends even on port 80. A Kubernetes ingress with
+`backend-protocol: HTTPS` does: nginx then sees a TLS handshake where it expects HTTP, answers 400, and the
+visitor gets a 502. `tls: true` makes nginx speak TLS on `port` with a certificate setup makes for it once
+(`/opt/arceus-console/tls`, ten years). Such load balancers do not check the backend's certificate. The other way
+out is to have the load balancer talk plain HTTP to the backend.
 
 Then `sudo ./setup.sh` (or `--phase console`). The first admin comes from the server:
 
