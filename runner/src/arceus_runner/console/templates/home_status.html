@@ -88,21 +88,27 @@
       <h2>Health</h2>
       {% if not s.metrics.answered %}
       <p class="value-line unknown"><span aria-hidden="true">?</span> Unknown: the runner does not answer</p>
+      {% elif not s.known %}
+      <p class="value-line unknown"><span aria-hidden="true">?</span> Unknown until the runner's first pass ends</p>
       {% elif s.failing %}
       <ul class="checklist">
         {% for c in s.failing %}
-        <li><span class="tag {{ 'bad' if c.status == 'fail' else 'wait' }}">{{ "✕ Failing" if c.status == "fail" else "! Warning" }}</span> <code class="lit">{{ c.check }}</code>{% if c.detail %}<span class="note">{{ c.detail }}</span>{% endif %}</li>
+        <li><span class="tag {{ 'bad' if c.status == 'fail' else 'wait' }}">{{ "✕ Failing" if c.status == "fail" else "! Warning" }}</span> <code class="lit">{{ c.check }}</code><span class="note">{% if c.detail %}{{ c.detail }}{% else %}The runner has not recorded why.{% endif %}{% if c.since %} Since {{ c.since|when }}.{% endif %}</span></li>
         {% endfor %}
       </ul>
       {% if s.can_take is false %}<p class="note">While a check fails the runner takes no new work; tasks already started go on.</p>{% endif %}
+      {% elif not s.metrics.health %}
+      <p class="value-line unknown"><span aria-hidden="true">?</span> Unknown: the runner reported no checks</p>
       {% else %}
-      <p class="value-line good"><span aria-hidden="true">✓</span> Every check passes</p>
+      <p class="value-line good"><span aria-hidden="true">✓</span> Every check passes ({{ s.metrics.health|length }})</p>
       {% endif %}
     </section>
     <section class="card">
       <h2>Subscription usage</h2>
       {% if not s.metrics.answered %}
       <p class="value-line unknown"><span aria-hidden="true">?</span> Unknown: the runner does not answer</p>
+      {% elif not s.known %}
+      <p class="value-line unknown"><span aria-hidden="true">?</span> Unknown until the runner's first pass ends</p>
       {% else %}
       <ul class="meters">
         {% for u in s.usage %}

@@ -10,7 +10,7 @@ browser ──https──▶ load balancer (ends TLS) ──http──▶ nginx 
                                                           │
                                                           └─ /grafana/ ─▶ Grafana 127.0.0.1:3000, once the console says who asks
 console ──reads/writes──▶ ~/arceus/data: runner.db, config.yaml, console/console.db
-console ──reads──▶ the runner's metrics (127.0.0.1:9464) and events.jsonl
+console ──reads──▶ the runner's metrics (127.0.0.1:9464)
 ```
 
 - **The console** (`runner/src/arceus_runner/console`) is part of the runner's package and is built into an image
@@ -57,12 +57,15 @@ What the factory does now, in one line at the top: working on a ticket (and whic
 an architecture review, idle, waiting on people, held by a failing health check, observing, or that the runner
 does not answer. Under it: whether the runner answers and when it last finished a pass, the queue, the tickets
 waiting on people, those in code review, what runs now, the latest test run and architecture review, the health
-checks that fail with their reason (from `events.jsonl`), and Claude's and Codex's subscription usage. The part
+checks that fail with their reason, and Claude's and Codex's subscription usage. The part
 refreshes itself every 15 seconds.
 
-It comes from `runner.db` (read-only), the runner's metrics and the tail of `events.jsonl`. Whatever of these
-cannot be read is said as such, never shown as fine: no database yet, metrics off or not answering, a pass that
-ended more than 15 minutes ago ("stuck"), a `config.yaml` that does not load.
+It comes from `runner.db` (read-only) and the runner's metrics. The runner writes its health checks with their
+detail into `runner.db` (`runner_state`) whenever one changes, so a failure that began a week ago still shows
+why. Whatever cannot be read is said as such, never shown as fine: no database yet, metrics off or not
+answering, a runner that answers but has not finished its first pass ("starting": health and usage unknown), a
+pass that ended more than 15 minutes ago ("stuck"), a check without a recorded reason, a `config.yaml` that does
+not load.
 
 ## Grafana
 

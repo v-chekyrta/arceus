@@ -1,20 +1,18 @@
 """What the home page shows: the factory now, from what the runner leaves behind.
 
-Three sources, each of which can be missing, and each missing one is said, never shown as fine:
-- runner.db, read-only: the tickets in work, waiting on people, the queue, the background runs, the findings;
-- the runner's metrics on localhost (metrics.py): whether it answers, when it last finished a pass, health,
-  subscription usage;
-- events.jsonl, its tail: why a health check is failing (the `health_changed` events carry the detail).
+Two sources, each of which can be missing, and each missing one is said, never shown as fine:
+- runner.db, read-only: the tickets in work, waiting on people, the queue, the background runs, the findings, and
+  the health checks with their detail as the runner last wrote them (runner_state `health`);
+- the runner's metrics on localhost (metrics.py): whether it answers, when it last finished a pass, the checks'
+  status now, subscription usage. Until its first pass ends, a runner that answers knows none of these yet.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 
 import httpx
 from prometheus_client.parser import text_string_to_metric_families
@@ -24,7 +22,6 @@ from arceus_runner.db import ACTIVE_STATES, RUN_HOLDS, RUN_UNDER_WAY, ReviewStor
 
 # A pass ends at least every poll interval; this long without one means the loop is stuck in a call.
 STUCK_AFTER = 15 * 60
-EVENTS_TAIL = 512 * 1024
 RUN_WORDS = {"qa": ("Platform test", "Testing the platform"), "arch": ("Architecture review", "Reviewing the architecture")}
 STATE_WORDS = {"claimed": "Starting", "dispatched": "Agent working", "publishing": "Opening merge requests",
                "needs_input": "Question for people", "security_hold": "Held by the security screen",
@@ -75,28 +72,6 @@ def read_metrics(cfg: Config, timeout: float = 2.0) -> Metrics:
     return m
 
 
-def health_reasons(path: Path) -> dict[str, dict]:
-    """The latest `health_changed` of each check in the tail of events.jsonl: its status, detail and when."""
-    out: dict[str, dict] = {}
-    try:
-        with path.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - EVENTS_TAIL))
-            data = f.read()
-    except OSError:
-        return out
-    for line in data.splitlines():
-        if b'"health_changed"' not in line:
-            continue
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue  # the first line of the tail is usually cut
-        if e.get("event") == "health_changed" and e.get("check"):
-            out[e["check"]] = {"status": e.get("status_to"), "detail": e.get("detail") or "", "at": e.get("ts")}
-    return out
-
 
 def _task(t, issue_url) -> dict:
     return {"key": t.task_id, "summary": t.summary, "state": t.state, "words": STATE_WORDS.get(t.state, t.state),
@@ -129,7 +104,9 @@ def read_store(cfg: Config, issue_url=None) -> dict:
                 latest[kind] = {"n": r.n, "outcome": r.outcome, "finished_at": r.finished_at,
                                 "findings": len(result.get("findings") or []), "summary": result.get("summary") or ""}
         findings = store.findings("open")
+        health = store.state("health")
         return {
+            "health": health[0] if health else {},
             "active": [_task(t, issue_url) for t in active],
             "waiting": [_task(t, issue_url) for t in waiting],
             "review": [_task(t, issue_url) for t in review],
@@ -164,13 +141,16 @@ def snapshot(cfg: Config, issue_url=None, now: float | None = None) -> dict:
     now = now or time.time()
     m = read_metrics(cfg)
     db = read_store(cfg, issue_url)
-    reasons = health_reasons(cfg.paths.events)
     stuck = bool(m.answered and m.last_tick and now - m.last_tick > STUCK_AFTER)
-    failing = [{"check": k, "status": "fail" if v == 2 else "warn", "detail": (reasons.get(k) or {}).get("detail", ""),
-                "since": (reasons.get(k) or {}).get("at")} for k, v in sorted(m.health.items()) if v]
+    starting = m.answered and not m.last_tick
+    recorded = db.get("health") or {}
+    failing = [{"check": k, "status": "fail" if v == 2 else "warn", "detail": (recorded.get(k) or {}).get("detail", ""),
+                "since": (recorded.get(k) or {}).get("since")} for k, v in sorted(m.health.items()) if v]
     failing.sort(key=lambda c: c["status"] != "fail")
     if not m.answered:
         runner = {"tone": "bad", "words": "Not answering", "detail": m.error}
+    elif starting:
+        runner = {"tone": "unknown", "words": "Starting", "detail": "its first pass has not finished yet"}
     elif stuck:
         runner = {"tone": "bad", "words": "Stuck", "detail": f"its last pass ended {ago(m.last_tick, now)}"}
     else:
@@ -197,6 +177,8 @@ def snapshot(cfg: Config, issue_url=None, now: float | None = None) -> dict:
         tone, words = "wait", "Observing: the runner takes no work (mode: observe)"
     if runner["tone"] == "bad":
         tone, words = "bad", "The runner is not answering" if not m.answered else "The runner is stuck"
+    elif starting:
+        tone, words = "unknown", "The runner is starting: its health and usage are not known until its first pass ends"
 
     usage = []
     for provider, title in (("claude", "Claude"), ("codex", "Codex")):
@@ -207,5 +189,7 @@ def snapshot(cfg: Config, issue_url=None, now: float | None = None) -> dict:
                           "level": None if pct is None else "bad" if pct >= 90 else "warn" if pct >= 70 else "ok",
                           "resets": datetime.fromtimestamp(resets, cfg.schedule.tz).strftime("%a %H:%M")
                           if resets else ""})
-    return {"tone": tone, "words": words, "runner": runner, "mode": mode, "version": m.version,
+    # Health and usage are known once the runner answers and has finished a pass; before that they are not.
+    known = m.answered and not starting
+    return {"tone": tone, "words": words, "runner": runner, "mode": mode, "version": m.version, "known": known,
             "metrics": m, "failing": failing, "db": db, "usage": usage, "can_take": m.can_take}

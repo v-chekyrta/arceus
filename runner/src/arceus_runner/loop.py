@@ -143,6 +143,8 @@ class Runner:
         self.cleanup = cleanup
         self.engine = engine
         self.health: dict[str, str] = {}
+        self.health_detail: dict[str, tuple[str, str]] = {}  # check -> (status, detail), as last written
+        self.health_since: dict[str, str] = {}               # check -> when its status last changed
         self.next_due: dict[str, float] = {"local": 0.0, "tracker": 0.0, "code_host": 0.0, "doctor": 0.0,
                                            "token": 0.0, "progress": 0.0}
         self._unknown_trigger: set[str] = set()
@@ -150,14 +152,25 @@ class Runner:
     # -- health -------------------------------------------------------------
 
     def _record_health(self, checks: list[Check]) -> None:
+        changed = False
         for c in checks:
             before = self.health.get(c.name)
             if before != c.status:
                 self.events.emit("health_changed", check=c.name, status_from=before, status_to=c.status,
                                  detail=c.detail)
             self.health[c.name] = c.status
+            if self.health_detail.get(c.name) != (c.status, c.detail):
+                if c.name not in self.health_detail or self.health_detail[c.name][0] != c.status:
+                    self.health_since[c.name] = self.now().isoformat(timespec="seconds")
+                self.health_detail[c.name] = (c.status, c.detail)
+                changed = True
             if self.notifier:
                 self.notifier.health(c)
+        if changed:
+            # The checks as they stand, with why: the console's home page shows a failure's reason however long
+            # ago it began (health_changed in events.jsonl is written once, when the status changes).
+            self.store.set_state("health", {name: {"status": s, "detail": d, "since": self.health_since.get(name)}
+                                            for name, (s, d) in self.health_detail.items()})
 
     def _service_failed(self, client: ServiceClient, err: ServiceError) -> None:
         if isinstance(err, AuthError):

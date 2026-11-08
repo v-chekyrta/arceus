@@ -651,6 +651,19 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 21: what the runner says about itself for the web console (console/), one value per key, JSON: the health
+    # checks as they stand now with their detail (`health`), so a failure that has lasted a week still shows why.
+    """
+    CREATE TABLE runner_state (
+        key              TEXT PRIMARY KEY,
+        value            TEXT NOT NULL,
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -1042,6 +1055,18 @@ class ArchFinding:
 
 class ReviewStore(TaskStore):
     """The review loop's records, next to the tasks."""
+
+    # -- what the runner says about itself (the console reads it) --
+
+    def set_state(self, key: str, value: object) -> None:
+        self.conn.execute("INSERT INTO runner_state (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET "
+                          "value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                          (key, json.dumps(value, ensure_ascii=False, default=str)))
+
+    def state(self, key: str) -> tuple[object, str] | None:
+        """The value and when it was written, or None."""
+        row = self.conn.execute("SELECT value, updated_at FROM runner_state WHERE key = ?", (key,)).fetchone()
+        return (json.loads(row["value"]), row["updated_at"]) if row else None
 
     # -- the review agent (code_review.py) --
 

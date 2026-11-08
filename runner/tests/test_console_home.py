@@ -54,7 +54,7 @@ def metrics(last_tick: float | None = None, health: dict | None = None, can_take
     m = Metrics()
     m.info.labels("0.1.0", mode, "abc").set(1)
     m.last_tick.set(last_tick if last_tick is not None else time.time() - 20)
-    for check, value in (health or {"disk_free": 0}).items():
+    for check, value in (health if health is not None else {"disk_free": 0}).items():
         m.health.labels(check).set(value)
     m.can_take.set(1 if can_take else 0)
     for (provider, window), pct in (usage or {}).items():
@@ -93,20 +93,52 @@ def test_working_on_a_ticket_says_so_with_the_queue_people_and_usage(world):
     assert "Every check passes" in page
 
 
-def test_a_failing_check_shows_its_reason_and_that_new_work_is_held(world):
-    world.metrics_text = metrics(health={"disk_free": 2, "service.youtrack": 0}, can_take=False)
-    world.events.write_text("\n".join(json.dumps(e) for e in [
-        {"ts": "2026-11-08T10:00:00Z", "event": "health_changed", "check": "disk_free", "status_to": "warn",
-         "detail": "24% free"},
-        {"ts": "2026-11-08T11:00:00Z", "event": "health_changed", "check": "disk_free", "status_to": "fail",
-         "detail": "8% free on /"}]) + "\n")
+def test_a_failing_check_shows_its_reason_however_long_ago_it_began(world):
+    """The reason comes from what the runner itself recorded (runner_state), not from the tail of events.jsonl: a
+    failure a week old is still explained after megabytes of other events."""
+    world.metrics_text = metrics(health={"disk_free": 2, "service.youtrack": 0, "devstack": 1}, can_take=False)
+    world.events.write_text("".join(json.dumps({"ts": "2026-11-08T12:00:00Z", "event": "engine_step", "n": i}) + "\n"
+                                    for i in range(40000)))  # several MB of ordinary events, no health_changed
     s = ReviewStore(world.db)
     s.record_trigger("ACME-20", "tag-1", "ivan", True, 1)
+    s.set_state("health", {"disk_free": {"status": "fail", "detail": "8% free on /", "since": "2026-11-01T09:00:00"},
+                           "service.youtrack": {"status": "ok", "detail": "3 queued", "since": None}})
     s.close()
+    assert world.events.stat().st_size > 2_000_000
     page = home(world)
     assert "1 queued, but new work is held while a health check fails" in page
-    assert "disk_free" in page and "8% free on /" in page and "24% free" not in page
+    assert "disk_free" in page and "8% free on /" in page and "Since 01 Nov 2026" in page
     assert "takes no new work" in page
+    # A check whose reason nobody recorded says so instead of showing nothing.
+    assert "devstack" in page and "The runner has not recorded why." in page
+
+
+def test_the_runner_records_each_checks_status_and_detail_for_the_console(cfg, secrets):
+    from arceus_runner.checks import Check
+    from tests.test_loop import World
+    runner = World(cfg, secrets).runner
+    runner._record_health([Check("disk_free", "warn", "22% free"), Check("service.youtrack", "ok", "2 queued")])
+    first, _ = runner.store.state("health")
+    assert first["disk_free"]["status"] == "warn" and first["disk_free"]["detail"] == "22% free"
+    since = first["disk_free"]["since"]
+    runner._record_health([Check("disk_free", "warn", "21% free")])
+    again, _ = runner.store.state("health")
+    assert again["disk_free"]["detail"] == "21% free" and again["disk_free"]["since"] == since  # same status
+    runner._record_health([Check("disk_free", "fail", "8% free")])
+    assert runner.store.state("health")[0]["disk_free"]["status"] == "fail"
+
+
+def test_a_runner_that_answers_but_has_not_finished_a_pass_is_unknown_not_fine(world):
+    """Its metrics answer from the start, with no pass and no checks yet: nothing about health is known."""
+    world.metrics_text = generate_latest(Metrics().registry).decode()  # a fresh runner's metrics, nothing set
+    ReviewStore(world.db).close()
+    page = home(world)
+    assert "The runner is starting" in page and "Starting" in page
+    assert "Running" not in page and "Every check passes" not in page and "Idle" not in page
+    assert page.count("Unknown until the runner's first pass ends") == 2
+    world.metrics_text = metrics(health={})
+    page = home(world)
+    assert "Unknown: the runner reported no checks" in page and "Every check passes" not in page
 
 
 def test_a_runner_that_does_not_answer_is_never_shown_as_fine(world):

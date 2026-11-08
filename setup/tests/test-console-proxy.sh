@@ -1,18 +1,23 @@
 #!/bin/bash
-# nginx in front of the console, as setup.sh writes it, with a stand-in for Grafana that answers with the headers it
-# got. The three share one network namespace, as network_mode: host gives them on the VM, so 127.0.0.1 is the same
-# for all of them. Proves: /grafana/ needs a console session; Grafana is told who it is (Viewer, Admin for admins);
-# an X-WEBAUTH-USER sent from outside never reaches it; everything else goes to the console.
-# Needs Docker and the network. Exits 77 (skipped) without Docker.
+# nginx in front of the console, as setup.sh writes it, and the real Grafana from observability/compose.yaml with
+# the settings setup.sh gives it while the console is on. The three share one network namespace, as
+# network_mode: host gives them on the VM, so 127.0.0.1 is the same for all of them. Proves: /grafana/ needs a
+# console session; Grafana signs in the person the console names, as Viewer (Admin for admins), whatever
+# X-WEBAUTH-* the browser sent; Grafana lets nobody in anonymously; everything else goes to the console.
+# Needs Docker and the network (the images). Exits 77 (skipped) without Docker.
 #   bash setup/tests/test-console-proxy.sh
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || { echo "skip: no docker here"; exit 77; }
 T="$(mktemp -d)"; P="arceus-proxy-test-$$"; TAG="arceus-console:proxy-test-$$"; PORT=18$((RANDOM % 900 + 100))
-cleanup() { docker rm -f "$P-console" "$P-grafana" "$P-nginx" >/dev/null 2>&1; docker image rm -f "$TAG" >/dev/null 2>&1
-            rm -rf "$T"; }
+OBS=(docker compose -p "$P-obs" --project-directory "$ROOT/observability" -f "$ROOT/observability/compose.yaml"
+     -f "$T/grafana-here.yaml")
+cleanup() { "${OBS[@]}" down -v >/dev/null 2>&1; docker rm -f "$P-console" "$P-nginx" >/dev/null 2>&1
+            docker image rm -f "$TAG" >/dev/null 2>&1; rm -rf "$T"; }
 trap cleanup EXIT
+# KEEP=1 leaves it running to look at; the last line says where and how to remove it.
+[ -n "${KEEP:-}" ] && trap 'echo "kept: http://127.0.0.1:$PORT  (admin@example.com / correct horse battery); remove: docker rm -f $P-console $P-nginx; ${OBS[*]} down -v"' EXIT
 fails=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); fi; }
 
@@ -32,25 +37,32 @@ rsync -a --exclude __pycache__ --exclude '*.egg-info' --exclude build \
   "$ROOT/runner/pyproject.toml" "$ROOT/runner/src" "$T/build/runner/"
 docker build --quiet -t "$TAG" -f "$ROOT/console/Dockerfile" "$T/build" >/dev/null || { echo "FAIL image build"; exit 1; }
 chmod -R a+rwX "$T/data"
-cat > "$T/grafana.py" <<'PY'
-import http.server, json
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = json.dumps({"path": self.path, **{k.lower(): v for k, v in self.headers.items()}}).encode()
-        self.send_response(200); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-    def log_message(self, *a): pass
-http.server.ThreadingHTTPServer(("127.0.0.1", 3000), H).serve_forever()
-PY
-chmod a+r "$T/grafana.py"
+
 
 # The console publishes the namespace's port 80 (nginx) to this machine.
 docker run -d --name "$P-console" -p "127.0.0.1:$PORT:80" --read-only --cap-drop ALL \
   --security-opt no-new-privileges:true --tmpfs /tmp --user 1000:1000 -e HOME=/tmp \
   -e ARCEUS_RUNNER_CONFIG="$T/data/config.yaml" -e ARCEUS_CONSOLE_PUBLIC_URL="http://127.0.0.1:$PORT" \
   -v "$T/data:$T/data" "$TAG" console serve --host 127.0.0.1 --port 8180 >/dev/null
-docker run -d --name "$P-grafana" --network "container:$P-console" --user 1000:1000 -v "$T/grafana.py:/g.py:ro" \
-  --entrypoint /opt/console/bin/python "$TAG" /g.py >/dev/null
+# Grafana as observability/compose.yaml has it, with what setup.sh's obs_env writes while the console is on;
+# only its network is the console's namespace here instead of the host's.
+printf 'services:\n  grafana:\n    network_mode: "container:%s"\n' "$P-console" > "$T/grafana-here.yaml"
+echo "grafana-admin-$$" > "$T/grafana-admin"; chmod 644 "$T/grafana-admin"
+mkdir -p "$T/state"
+GRAFANA_ADMIN_FILE="$T/grafana-admin" ARCEUS_DATA="$T/data" BULAVA_STATE="$T/state" GRAFANA_ANONYMOUS=false \
+  GRAFANA_AUTH_PROXY=true GRAFANA_SUB_PATH=true GRAFANA_ROOT_URL="http://127.0.0.1:$PORT/grafana/" \
+  "${OBS[@]}" up -d --quiet-pull grafana >/dev/null 2>&1 || { echo "FAIL grafana did not start"; exit 1; }
+inside() {  # a GET from inside the namespace, past nginx: what Grafana itself answers
+  docker exec "$P-console" /opt/console/bin/python -c "
+import sys, urllib.request, urllib.error
+try:
+    r = urllib.request.urlopen(sys.argv[1], timeout=5); print(r.status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print(0)" "$1"
+}
+for _ in $(seq 1 90); do [ "$(inside http://127.0.0.1:3000/grafana/api/health)" = 200 ] && break; sleep 2; done
 docker run -d --name "$P-nginx" --network "container:$P-console" --read-only --cap-drop ALL \
   --cap-add CHOWN --cap-add SETUID --cap-add SETGID --cap-add NET_BIND_SERVICE \
   --security-opt no-new-privileges:true --tmpfs /var/cache/nginx --tmpfs /var/run --tmpfs /tmp \
@@ -83,15 +95,27 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -H 'X-WEBAUTH-USER: admin@example
   "$URL/grafana/")"
 check "a Grafana user named by the browser itself does not get in" "[ '$code' = 302 ]"
 
-got="$(curl -s -b "$T/viewer.jar" -H 'X-WEBAUTH-USER: admin@example.com' -H 'X-WEBAUTH-ROLE: Admin' "$URL/grafana/d/x")"
-check "signed in, Grafana gets the person the console names" "grep -q '\"x-webauth-user\": \"viewer@example.com\"' <<< '$got'"
-check "with no role, as a Viewer: the browser's Admin is overwritten" "grep -q '\"x-webauth-role\": \"Viewer\"' <<< '$got'"
-check "Grafana sees the path under /grafana/" "grep -q '\"path\": \"/grafana/d/x\"' <<< '$got'"
-got="$(curl -s -b "$T/admin.jar" "$URL/grafana/")"
-check "an admin is Grafana's Admin" "grep -q '\"x-webauth-user\": \"admin@example.com\"' <<< '$got' && grep -q '\"x-webauth-role\": \"Admin\"' <<< '$got'"
+check "Grafana is up, serving under /grafana/" "[ \"\$(inside http://127.0.0.1:3000/grafana/api/health)\" = 200 ]"
+check "Grafana itself lets nobody in anonymously" \
+  "[ \"\$(inside http://127.0.0.1:3000/grafana/api/dashboards/uid/arceus-now)\" = 401 ]"
+spoof=(-H 'X-WEBAUTH-USER: admin@example.com' -H 'X-WEBAUTH-ROLE: Admin' -H 'X-WEBAUTH-NAME: Mallory')
+user="$(curl -s -b "$T/viewer.jar" "${spoof[@]}" "$URL/grafana/api/user")"
+orgs="$(curl -s -b "$T/viewer.jar" "${spoof[@]}" "$URL/grafana/api/user/orgs")"
+check "signed in, Grafana's user is the person the console names, not the browser's header" \
+  "grep -q '\"login\":\"viewer@example.com\"' <<< '$user'"
+check "with no role in the console, a Grafana Viewer (the browser's Admin is overwritten)" \
+  "grep -q '\"role\":\"Viewer\"' <<< '$orgs' && ! grep -q '\"role\":\"Admin\"' <<< '$orgs'"
+code="$(curl -s -o /dev/null -w '%{http_code}' -b "$T/viewer.jar" "$URL/grafana/api/dashboards/uid/arceus-now")"
+check "a Viewer sees the provisioned dashboards" "[ '$code' = 200 ]"
+code="$(curl -s -o /dev/null -w '%{http_code}' -b "$T/viewer.jar" "$URL/grafana/d/arceus-now")"
+check "and Grafana's own page opens for them" "[ '$code' = 200 ]"
+orgs="$(curl -s -b "$T/admin.jar" "$URL/grafana/api/user/orgs")"
+user="$(curl -s -b "$T/admin.jar" "$URL/grafana/api/user")"
+check "a console admin is Grafana's Admin" \
+  "grep -q '\"login\":\"admin@example.com\"' <<< '$user' && grep -q '\"role\":\"Admin\"' <<< '$orgs'"
 code="$(curl -s -o /dev/null -w '%{http_code}' -b "$T/viewer.jar" "$URL/")"
 check "the console's own pages go to the console" "[ '$code' = 200 ]"
 
 [ "$fails" = 0 ] && { echo "all passed"; exit 0; }
-docker logs "$P-nginx" 2>&1 | tail -5
+docker logs "$P-nginx" 2>&1 | tail -5; "${OBS[@]}" logs grafana 2>&1 | tail -15
 echo "$fails failed"; exit 1
