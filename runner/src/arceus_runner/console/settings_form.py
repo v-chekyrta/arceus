@@ -183,6 +183,14 @@ def _node(doc, path: tuple[str, ...]):
     return node
 
 
+def _exists(doc, path: tuple[str, ...]) -> bool:
+    """The key is in the document, whatever its value (null included)."""
+    if not path:
+        return True
+    parent = _node(doc, path[:-1]) if path[:-1] else doc
+    return isinstance(parent, dict) and path[-1] in parent
+
+
 def _on_own_line(doc, path: tuple[str, ...]) -> bool:
     """The entry at `path` starts a line of its own: its parent is a block mapping, not `{ ... }`."""
     parent = _node(doc, path[:-1]) if path[:-1] else doc
@@ -214,18 +222,18 @@ def write(text: str, edits: list[tuple[tuple[str, ...], Any]]) -> str:
         # The entry to rewrite: the deepest one on a line of its own in both texts (a value inside `{ }` is its
         # whole line); a key the original lacks goes in under its nearest ancestor that is there.
         anchor = path
-        while len(anchor) > 1 and not (_node(before, anchor) is not None and _on_own_line(before, anchor)
-                                       and (_node(after, anchor) is None or _on_own_line(after, anchor))):
-            if _node(before, anchor[:-1]) is not None and _node(before, anchor) is None \
-                    and isinstance(_node(before, anchor[:-1]), CommentedMap) \
-                    and not _node(before, anchor[:-1]).fa.flow_style():
+        while len(anchor) > 1 and not (_exists(before, anchor) and _on_own_line(before, anchor)
+                                       and (not _exists(after, anchor) or _on_own_line(after, anchor))):
+            parent = _node(before, anchor[:-1])
+            if not _exists(before, anchor) and isinstance(parent, CommentedMap) and not parent.fa.flow_style():
                 break  # a new key under a block mapping that is there: inserted below
             anchor = anchor[:-1]
-        if _node(before, anchor) is not None or (len(anchor) == 1 and anchor[0] in before):
+        if _exists(before, anchor):
+            # The entry is there (with a value, or null): its lines are replaced, never added to.
             line, col = _key_at(before, anchor)
             old = _span(a, line, col)
             new_lines: list[str] = []
-            if _node(after, anchor) is not None or (anchor[:-1] and anchor[-1] in (_node(after, anchor[:-1]) or {})):
+            if _exists(after, anchor):
                 nline, ncol = _key_at(after, anchor)
                 s, e = _span(b, nline, ncol)
                 new_lines = [(" " * (col - ncol) + x if col >= ncol else x[ncol - col:]) for x in b[s:e]]
@@ -540,7 +548,16 @@ def apply(text: str, fields: list[Field], form, data_dir: Path | None = None) ->
 
 
 def check(text: str) -> list[str]:
-    """What the runner would say about this config.yaml: nothing when it loads."""
+    """What the runner would say about this config.yaml: nothing when it loads. A key written twice in one mapping is
+    refused too: PyYAML would quietly take the last one, and the form could not show which one counts."""
+    try:
+        YAML(typ="rt").load(text)
+    except Exception as e:  # ruamel's DuplicateKeyError; any other parse error parse_config words below
+        if "duplicate key" in str(e):
+            found = re.search(r'found duplicate key "([^"]+)"', str(e))
+            where = re.search(r"line (\d+)", str(e).split("found duplicate key", 1)[-1])
+            return [f"config.yaml: the key {found.group(1) if found else '?'} is written twice in the same place"
+                    + (f" (line {where.group(1)})" if where else "") + ": keep one"]
     try:
         parse_config(text)
     except ConfigError as e:

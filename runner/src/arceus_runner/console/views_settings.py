@@ -63,7 +63,9 @@ def overview(ctx: Ctx) -> Response:
     current = files.read(_path(ctx))
     cfg, problems = ctx.config()
     groups = []
-    if cfg is not None:
+    if cfg is not None and not problems:
+        problems = sf.check(current.text)  # what PyYAML lets through and the form cannot hold (a key twice)
+    if cfg is not None and not problems:
         for name, fields in sf.sections(cfg, current.text):
             title, what = sf.TITLES.get(name, (name, ""))
             flat = sf.flatten(fields)
@@ -83,8 +85,10 @@ def section(ctx: Ctx) -> Response:
         return ctx.render("message.html", status=503, title="Settings", message=current.problem)
     try:
         cfg = parse_config(current.text, _path(ctx))
-    except Exception:
-        return ctx.redirect("/settings/", "config.yaml does not load: fix it as YAML first.")
+    except ConfigError:
+        cfg = None
+    if cfg is None or sf.check(current.text):
+        return ctx.redirect("/settings/", "config.yaml does not load as it is: fix it as YAML first.")
     found = dict(sf.sections(cfg, current.text)).get(name)
     if found is None:
         raise Gone()

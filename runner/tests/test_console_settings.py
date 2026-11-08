@@ -418,3 +418,38 @@ def test_moving_a_reports_folder_out_of_what_the_console_sees_needs_setup(w, whe
     assert ("restart the runner</strong> after saving" in r.text) is (not setup)
     page = admin.get("/settings/qa/").text
     assert "outside the data folder, setup.sh has to run first" in page
+
+
+def test_clearing_an_optional_setting_and_filling_it_again_keeps_one_key(w):
+    """bulava.mcp_config emptied (null in the file), saved, then given a path again, saved: the same line is
+    replaced each time, never a second key; the pages still open; every other line is the original's."""
+    original = w.config.read_text()
+    admin = signed_in(w.settings, "owner@example.com")
+    r = change(admin, "bulava", **{"bulava.mcp_config": ""})
+    assert save_preview(admin, r.text).status_code == 303
+    cleared = w.config.read_text()
+    assert yaml.safe_load(cleared)["bulava"]["mcp_config"] is None
+    r = change(admin, "bulava", **{"bulava.mcp_config": "/opt/new.json"})
+    assert "Save config.yaml" in r.text
+    assert save_preview(admin, r.text).status_code == 303
+    filled = w.config.read_text()
+    assert len(re.findall(r"^\s+mcp_config:", filled, re.M)) == 1
+    assert yaml.safe_load(filled)["bulava"]["mcp_config"] == "/opt/new.json"
+    assert changed_lines(original, filled) == [x for x in changed_lines(original, filled) if "mcp_config" in x]
+    assert len(changed_lines(original, filled)) == 2
+    for path in ("/settings/", "/settings/bulava/", "/settings/yaml/", "/settings/history/"):
+        assert admin.get(path).status_code == 200, path
+    assert 'value="/opt/new.json"' in admin.get("/settings/bulava/").text
+
+
+def test_a_key_written_twice_is_refused_and_the_pages_say_so(w):
+    admin = signed_in(w.settings, "owner@example.com")
+    text = w.config.read_text().replace("  poll_working: 2m\n", "  poll_working: 2m\n  poll_working: 3m\n")
+    page = admin.get("/settings/yaml/").text
+    r = admin.post("/settings/yaml/", data={"csrf": csrf_of(page), "text": text,
+                                            "sha": re.search(r'name="sha" value="([^"]+)"', page).group(1)})
+    assert "poll_working is written twice" in r.text and "Save config.yaml" not in r.text
+    w.config.write_text(text)  # written so over SSH
+    page = admin.get("/settings/")
+    assert page.status_code == 200 and "poll_working is written twice" in page.text
+    assert admin.get("/settings/schedule/").status_code == 303
