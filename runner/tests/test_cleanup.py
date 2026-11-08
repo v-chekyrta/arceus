@@ -259,6 +259,8 @@ def test_only_containers_of_finished_tasks_go(world):
     d.add("moved-on-exited", created=old, finished=old, labels={"arceus.task": "ACME-7"})
     d.add("never-ours", created=old, finished=old, labels={"arceus.task": "ACME-99"})
     d.add("grafana", status="running", created=old, labels={"com.docker.compose.project": "arceus-observability"})
+    d.add("console-nginx", status="exited", created=old, finished=old,
+          labels={"com.docker.compose.project": "arceus-console"})
     d.add("kept", created=old, finished=old, labels={"arceus.task": "ACME-1", "arceus.keep": "true"})
     d.add("other-project", created=old, finished=old, binds=("/srv/other",))
 
@@ -271,7 +273,7 @@ def test_only_containers_of_finished_tasks_go(world):
     # Everything nobody owns is listed for the person who cleans by hand; a waiting task's things are not.
     assert world.unknown(result) == {"never-ours", "other-project"}
     assert set(d.cs) == {"done-just-exited", "review-exited", "resumable-exited", "closed-exited", "never-ours",
-                         "grafana", "kept", "other-project"}
+                         "grafana", "console-nginx", "kept", "other-project"}
 
 
 def test_a_container_is_put_down_to_the_task_that_held_the_workspace_when_it_was_made(world):

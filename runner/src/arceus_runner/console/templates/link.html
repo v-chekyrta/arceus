@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field, role_chips %}
+{% block title %}{% if link.kind == "invite" %}Create your account{% else %}Choose a new password{% endif %}{% endblock %}
+{% block body %}
+<div class="narrow">
+  {% if link.kind == "invite" %}
+  <h1>Create your account</h1>
+  <p class="lede">For <strong>{{ link.email }}</strong>, with the roles {{ role_chips(link.roles) }}</p>
+  {% else %}
+  <h1>Choose a new password</h1>
+  <p class="lede">For <strong>{{ link.email }}</strong>. Every session of the account is signed out.</p>
+  {% endif %}
+  {{ flash(error=error) }}
+  <form class="card" method="post">
+    {{ csrf_field(csrf) }}
+    <input type="text" name="username" value="{{ link.email }}" autocomplete="username" hidden>
+    {% if link.kind == "invite" %}
+    <div class="form-row">
+      <label for="name">Name</label>
+      <input id="name" name="name" type="text" autocomplete="name" required maxlength="120" value="{{ values.name }}">
+    </div>
+    {% endif %}
+    <div class="form-row">
+      <label for="password">Password <span class="hint">At least 10 characters.</span></label>
+      <input id="password" name="password" type="password" autocomplete="new-password" required minlength="10" autofocus>
+    </div>
+    <div class="form-row">
+      <label for="password2">The same password again</label>
+      <input id="password2" name="password2" type="password" autocomplete="new-password" required minlength="10">
+    </div>
+    <button class="btn primary block" type="submit">{% if link.kind == "invite" %}Create the account{% else %}Set the password{% endif %}</button>
+  </form>
+  <p class="after">The link works once and expires {{ link.expires_at|when }}.</p>
+</div>
+{% endblock %}

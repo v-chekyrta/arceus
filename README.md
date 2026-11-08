@@ -21,7 +21,8 @@ runner metrics, VM ──▶ Prometheus ┴──▶ Grafana
 - **Runner** (`runner/`, Python, a systemd service). The deterministic bridge: it takes tickets tagged `agent` by someone on the project's allowlist, prepares the repositories, starts the task in Bulava, and once Codex has passed the work pushes exactly the reviewed commit, opens the merge request and moves the ticket to Code Review. Review comments that mention the bot, red CI and conflicts go back to the agent until the MRs are merged. It also screens every text before the agent sees it and cleans up what finished tasks left behind. State is in SQLite; every external step can be repeated after a crash without doing anything twice. How a ticket travels: [docs/task-lifecycle.md](docs/task-lifecycle.md).
 - **Bulava** ([Stepanokdev/bulava](https://github.com/Stepanokdev/bulava) at a pinned commit, `BULAVA_REF` in [setup/setup.conf.example](setup/setup.conf.example); `engine/SERVER.md` is the contract). The engine that runs the agent: a Claude Code session in tmux, Claude code and security checks before Codex ([docs/reviews.md](docs/reviews.md)), Codex as reviewer, the task record that outlives sessions, usage limits, the server profile that keeps the agent away from credentials.
 - **Setup** (`setup/`). One idempotent script that prepares the VM; `--check` reports what is not done without changing anything. [setup/README.md](setup/README.md) is the operator's guide.
-- **Observability** (`observability/`). Grafana with Prometheus and Loki on the VM, reached through an SSH tunnel.
+- **Observability** (`observability/`). Grafana with Prometheus and Loki on the VM.
+- **Console** (`console/`, `runner/src/arceus_runner/console`). One web address with a sign-in and roles, instead of SSH tunnels: [docs/console.md](docs/console.md).
 
 Tickets do not say which repository to change. The session starts in a workspace folder with every repository of the project's group; the agent works out which ones the ticket needs, and merge requests are opened only where it changed something.
 
@@ -51,12 +52,13 @@ Not there yet: the agent pushing its own branch (Bulava's server profile refuses
 | [`docs/`](docs) | how the parts work: the [task lifecycle](docs/task-lifecycle.md), [reviews](docs/reviews.md), [testing the platform](docs/qa.md), [architecture reviews](docs/architect.md), [cleanup](docs/cleanup.md), the [security screen](docs/security.md), [what the agent is told](docs/agent-instructions.md), [trackers and code hosts](docs/integrations.md) |
 | [`config/`](config) | example `config.yaml`, `secrets.env`, `bulava.env`, project notes and QA instructions; `agent-notes.md`, the agent's server rules |
 | [`observability/`](observability) | Docker Compose stack and the generator of the Grafana dashboards |
+| [`console/`](console) | the web console's image and Docker Compose project (the code is `runner/src/arceus_runner/console`) |
 | `sandbox/` | local only, git-ignored: the server in a Docker container on a Mac, for the tests that need no model and the review cycles with the real Claude and Codex; `sandbox/README.md` beside it says how |
 
 Running the tests locally:
 
 ```bash
-cd runner && uv venv && uv pip install -e '.[test]' && .venv/bin/pytest -q -n auto   # in parallel: about 35 s on Linux, 75 s on a Mac
+cd runner && uv venv && uv pip install -e '.[test,console]' && .venv/bin/pytest -q -n auto   # in parallel: about 35 s on Linux, 75 s on a Mac
 ARCEUS_REAL_ENGINE=/opt/bulava/engine .venv/bin/pytest -q   # on a machine with Bulava installed
 ```
 

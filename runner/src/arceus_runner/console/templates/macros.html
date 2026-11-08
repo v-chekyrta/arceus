@@ -1,0 +1,36 @@
+{% macro flash(notice="", error="", warn="") %}
+{% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+{% if warn %}<p class="notice warn" role="status">{{ warn }}</p>{% endif %}
+{% if error %}<p class="notice err" role="alert">{{ error }}</p>{% endif %}
+{% endmacro %}
+
+{% macro csrf_field(csrf) %}<input type="hidden" name="csrf" value="{{ csrf }}">{% endmacro %}
+
+{% macro role_chips(roles) %}
+{% set shown = [] %}
+{% for r in ["admin", "operator", "architect", "qa"] if r in roles %}<span class="role {{ r }}">{{ role_words[r][0] }}</span> {% endfor %}
+{% if not roles %}<span class="role none">Viewer</span>{% endif %}
+{% endmacro %}
+
+{% macro role_boxes(roles, chosen, legend="Roles") %}
+<fieldset class="checks-row">
+  <legend>{{ legend }}</legend>
+  {% for r in roles %}
+  <label><input type="checkbox" name="role" value="{{ r }}"{% if r in chosen %} checked{% endif %}> {{ role_words[r][0] }}</label>
+  {% endfor %}
+</fieldset>
+{% endmacro %}
+
+{% macro made_link(made) %}
+{% if made %}
+<div class="made" role="status">
+  <p><strong>{% if made.kind == "invite" %}Invitation for {{ made.email }}{% else %}Password reset link for {{ made.email }}{% endif %}.</strong>
+  Send it to them yourself: it works once, for 48 hours. It is not shown again.</p>
+  <div class="inline-form">
+    <label class="sr" for="made-link">Link</label>
+    <input class="grow" id="made-link" type="text" readonly value="{{ made.url }}">
+    <button class="btn" type="button" data-copy="made-link">Copy</button>
+  </div>
+</div>
+{% endif %}
+{% endmacro %}

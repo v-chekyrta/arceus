@@ -35,6 +35,8 @@ step "setup: claude and codex are only the pinned ones, the sign-ins stay" \
   bash setup/tests/test-agent-tools.sh
 step "setup: the agent's Google MCP server is read-only and acts as the service account" \
   bash setup/tests/test-google-mcp.sh
+step "setup: the console sees the data folder without its secrets; nginx trusts only the given proxies" \
+  bash setup/tests/test-console.sh
 step "setup: the engine's source survives a rewritten upstream${live:+, the pinned commit installs}" \
   bash setup/tests/test-bulava-source.sh $live
 

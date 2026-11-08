@@ -505,6 +505,9 @@ def build_parser() -> argparse.ArgumentParser:
         qx.add_argument("n", nargs="?", type=int, help="the run's number (default: the one under way)")
         q.set_defaults(fn=cmd_runs, kind=kind)
 
+    from arceus_runner.console import cli as console_cli
+    console_cli.add_parser(sub)
+
     b = sub.add_parser("probe-bulava", help="which agreed contracts the installed engine advertises")
     b.add_argument("--root", help="engine directory (default: paths.bulava from config)")
     b.add_argument("--json", action="store_true")

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% block title %}Ask for an account{% endblock %}
+{% block body %}
+<div class="narrow">
+  <h1>Ask for an account</h1>
+  <p class="lede">An admin approves it and decides what you can do. Until then you cannot sign in.</p>
+  {{ flash(error=error) }}
+  <form class="card" method="post" action="/register">
+    {{ csrf_field(csrf) }}
+    <div class="form-row">
+      <label for="name">Name</label>
+      <input id="name" name="name" type="text" autocomplete="name" required maxlength="120" value="{{ values.name }}">
+    </div>
+    <div class="form-row">
+      <label for="email">Work email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required value="{{ values.email }}">
+    </div>
+    <div class="form-row">
+      <label for="password">Password <span class="hint">At least 10 characters.</span></label>
+      <input id="password" name="password" type="password" autocomplete="new-password" required minlength="10">
+    </div>
+    <div class="form-row">
+      <label for="password2">The same password again</label>
+      <input id="password2" name="password2" type="password" autocomplete="new-password" required minlength="10">
+    </div>
+    <div class="form-row">
+      <label for="note">What you need it for <span class="hint">Optional. The admin reads it: for example "QA on the project".</span></label>
+      <input id="note" name="note" type="text" maxlength="500" value="{{ values.note }}">
+    </div>
+    <button class="btn primary block" type="submit">Send the request</button>
+  </form>
+  <p class="after">Have an account? <a href="/login">Sign in</a>.</p>
+</div>
+{% endblock %}

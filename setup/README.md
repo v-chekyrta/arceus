@@ -27,7 +27,7 @@ sudo ./setup.sh --check              # only checks, changes nothing
 sudo ./setup.sh                      # does whatever is not done yet
 ```
 
-The script runs in phases: `packages legacy docker chrome agent_tools mcp_config dirs bulava bulava_install agent_reports agent_notes runner systemd observability`. Each phase checks the machine first, acts only if the check fails, and checks again afterwards. A second run therefore changes nothing, and `--check` after an interrupted run shows which phases are unfinished (`todo`). One phase can be run alone: `--phase docker`.
+The script runs in phases: `packages legacy docker chrome agent_tools mcp_config dirs bulava bulava_install agent_reports agent_notes runner systemd observability console`. Each phase checks the machine first, acts only if the check fails, and checks again afterwards. A second run therefore changes nothing, and `--check` after an interrupted run shows which phases are unfinished (`todo`). One phase can be run alone: `--phase docker`.
 
 Setup never overwrites `data/config.yaml`, `secrets.env`, `bulava.env` or `project-notes.md`: the examples are copied there once, only while the files do not exist. It never touches `runner.db` or the workspace either. If an older layout left `~/runner` and an empty `~/workspace`, the `legacy` phase moves them into `~/arceus` without overwriting anything.
 
@@ -41,6 +41,7 @@ Setup never overwrites `data/config.yaml`, `secrets.env`, `bulava.env` or `proje
 | `/var/lib/arceus/bulava.git` | root | a mirror of the Bulava repository that keeps every commit setup installed (`refs/arceus/<commit>`), so a pinned commit stays installable after Bulava rewrites its branches |
 | `/opt/bulava-local/mcp.json` | root | the MCP servers of the agent's sessions (`SUPERVISOR_AUTOMATION_MCP_CONFIG`): the headless browser without `npx`, and `google` once a service account's key is in place |
 | `/opt/arceus-observability` | root | the Docker Compose stack for Grafana, Prometheus, Loki, Alloy and node_exporter |
+| `/opt/arceus-console` | root | the web console's Docker Compose project (the console and nginx), its `.env`, `nginx.conf` and `mounts.yaml` written from `config.yaml`, and the image's build folder. Only while `console.enabled` is true ([docs/console.md](../docs/console.md)) |
 | `/etc/systemd/system/bulava-engine.service` | root | the tmux server the workers run in (`tmux -L bulava`). Installed; the operator starts it, and setup keeps a running one enabled for reboots |
 | `/etc/systemd/system/runner.service` | root | the runner. `KillMode=process`: restarting it does not kill the engine's watchdogs. Installed; the operator starts it, and setup keeps a running one enabled for reboots |
 | `~/arceus/data/` | the user, 700 | `config.yaml`, `secrets.env` (600), `runner.db`, `events.jsonl`, `grafana-admin-password`; `google/` (700): the Google service account's key |
@@ -194,6 +195,7 @@ The parts the operator configures but rarely reads end to end:
 - [docs/reviews.md](../docs/reviews.md): Claude checks before Codex (`bulava.claude_checks`) and code review on request (`review_agent`);
 - [docs/qa.md](../docs/qa.md): testing the platform (`qa`);
 - [docs/architect.md](../docs/architect.md): architecture reviews (`architect`);
+- [docs/console.md](../docs/console.md): the web console, its people and roles (`console`);
 - [docs/cleanup.md](../docs/cleanup.md): what the runner removes between tasks and how to switch it on (`cleanup`);
 - [docs/security.md](../docs/security.md): the security screen (`security`) and the trust boundary;
 - [docs/agent-instructions.md](../docs/agent-instructions.md): the server notes, the project's notes and how they reach the agent;

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field, role_chips %}
+{% block title %}Your account{% endblock %}
+{% block body %}
+<h1>Your account</h1>
+<p class="lede">{{ user.name }} · {{ user.email }}</p>
+{{ flash(notice, error) }}
+<div class="split">
+  <div>
+    <form class="card" method="post" action="/account/">
+      {{ csrf_field(csrf) }}
+      <input type="hidden" name="what" value="password">
+      <input type="text" name="username" value="{{ user.email }}" autocomplete="username" hidden>
+      <h2>Change the password</h2>
+      <div class="form-row">
+        <label for="current">Current password</label>
+        <input id="current" name="current" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="form-row">
+        <label for="password">New password <span class="hint">At least 10 characters.</span></label>
+        <input id="password" name="password" type="password" autocomplete="new-password" required minlength="10">
+      </div>
+      <div class="form-row">
+        <label for="password2">The new password again</label>
+        <input id="password2" name="password2" type="password" autocomplete="new-password" required minlength="10">
+      </div>
+      <button class="btn primary" type="submit">Change the password</button>
+    </form>
+  </div>
+  <div>
+    <section class="card">
+      <h2>What you can do</h2>
+      <p>{{ role_chips(user.roles) }}</p>
+      <ul class="roles-help">
+        {% for r in ["admin", "operator", "architect", "qa"] if r in user.roles %}
+        <li><strong>{{ role_words[r][0] }}</strong><span>{{ role_words[r][1] }}</span></li>
+        {% endfor %}
+        <li class="everyone"><strong>Everyone</strong><span>Sees the status, the reports, the findings and the monitoring.</span></li>
+      </ul>
+    </section>
+    <form class="card" method="post" action="/account/">
+      {{ csrf_field(csrf) }}
+      <input type="hidden" name="what" value="sessions">
+      <h2>Sessions</h2>
+      <p>Signed in on {{ sessions }} device{{ "s" if sessions != 1 }} or browser{{ "s" if sessions != 1 }}, this one included.</p>
+      <button class="btn" type="submit"{% if sessions < 2 %} disabled{% endif %}>Sign out everywhere else</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

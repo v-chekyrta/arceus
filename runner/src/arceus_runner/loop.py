@@ -426,13 +426,14 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
         if cfg.metrics.enabled:
             metrics = Metrics()
             stack.callback(metrics.serve(cfg.metrics.address, cfg.metrics.port))
-        if cfg.qa.enabled:
+        # With the console on, it shows the reports and takes the decisions, behind its sign-in (docs/console.md).
+        if cfg.qa.enabled and not cfg.console.enabled:
             # The test runs' reports, on localhost like the metrics: an SSH tunnel shows them (qa_report.py).
             port, stop_reports = qa_report.serve(cfg.qa.reports, cfg.qa.address, cfg.qa.port,
                                                  index=lambda: qa_mod.index_page(cfg))
             stack.callback(stop_reports)
             events.emit("qa_reports_served", address=cfg.qa.address, port=port, folder=str(cfg.qa.reports))
-        if cfg.architect.enabled:
+        if cfg.architect.enabled and not cfg.console.enabled:
             # The architecture reviews' pages, built from runner.db on every visit; decisions are taken there.
             a = cfg.architect
             port, stop_reports = arch_report.serve(a.reports, a.address, a.port, architect_mod.pages(cfg, host),

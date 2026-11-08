@@ -35,7 +35,7 @@ jobs:
       - name: Install the runner with its test dependencies
         run: |
           python -m venv runner/.venv
-          runner/.venv/bin/pip install -q -e 'runner[test]'
+          runner/.venv/bin/pip install -q -e 'runner[test,console]'
       - name: ./verify.sh --offline
         env:
           # Why each skipped test skipped, and where the time went.

@@ -16,12 +16,23 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-xdist>=3"]
+# The web console (arceus_runner.console): its container installs these; the runner itself does not need them.
+console = [
+  "starlette>=1.10,<2",
+  "uvicorn>=0.54,<0.55",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.33,<0.1",
+  "ruamel.yaml>=0.19,<0.20",
+]
 
 [project.scripts]
 arceus-runner = "arceus_runner.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+arceus_runner = ["console/templates/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -61,6 +61,7 @@ from arceus_runner.gitops import Git, GitError
 from arceus_runner.machine import OUT_OF_TIME, Proc, inside, kill_process, remove_tree, scan_processes, tree_size
 
 OBSERVABILITY = "arceus-observability"  # observability/compose.yaml
+CONSOLE = "arceus-console"  # console/compose.yaml
 TASK_LABEL, KEEP_LABEL = "arceus.task", "arceus.keep"
 PROJECT_LABEL = "com.docker.compose.project"
 WORKDIR_LABEL = "com.docker.compose.project.working_dir"
@@ -409,7 +410,7 @@ class Cleanup:
     # -- Docker -------------------------------------------------------------------------------
 
     def _protected_projects(self) -> set[str]:
-        return {OBSERVABILITY, *self.c.protect.compose_projects}
+        return {OBSERVABILITY, CONSOLE, *self.c.protect.compose_projects}
 
     def _plan_docker(self, owners: Owners) -> list[Item]:
         if not self.docker.available():

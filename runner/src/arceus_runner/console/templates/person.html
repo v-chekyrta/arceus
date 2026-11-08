@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field, role_chips, role_boxes, made_link %}
+{% block title %}{{ person.name }}{% endblock %}
+{% block body %}
+<p class="crumb"><a href="/users/">People</a></p>
+<h1>{{ person.name }}{% if person.id == user.id %} (you){% endif %}</h1>
+<p class="lede">{{ person.email }}
+  {% if person.status == "pending" %}· <span class="status-pending">Waiting for approval</span>
+  {% elif person.status == "disabled" %}· <span class="status-disabled">Disabled</span>{% endif %}</p>
+{{ flash(notice, error) }}
+{{ made_link(made) }}
+<div class="split">
+  <div>
+    {% if person.status == "pending" %}
+    <form class="card" method="post">
+      {{ csrf_field(csrf) }}
+      <h2>Approve</h2>
+      {% if person.note %}<p>“{{ person.note }}”</p>{% endif %}
+      {{ role_boxes(roles, [], "Roles to give") }}
+      <div class="actions">
+        <button class="btn primary" type="submit" name="what" value="approve">Approve</button>
+        <button class="btn danger" type="submit" name="what" value="decline" data-confirm="Decline the request of {{ person.name }}?">Decline</button>
+      </div>
+    </form>
+    {% else %}
+    <form class="card" method="post">
+      {{ csrf_field(csrf) }}
+      <input type="hidden" name="what" value="roles">
+      <h2>Roles</h2>
+      <p>{{ role_chips(person.roles) }}</p>
+      {{ role_boxes(roles, person.roles, "Change to") }}
+      <button class="btn primary" type="submit">Save the roles</button>
+    </form>
+    <section class="card">
+      <h2>Access</h2>
+      <dl class="facts">
+        <dt>Approved</dt><dd>{% if person.approved_at %}{{ person.approved_at|when }}{% if approver %} by {{ approver.name }}{% endif %}{% else %}by the server's command{% endif %}</dd>
+        <dt>Last sign-in</dt><dd>{{ (person.last_login_at|when) or "Never" }}</dd>
+        <dt>Sessions</dt><dd>{{ sessions }}</dd>
+      </dl>
+      <form method="post" class="actions">
+        {{ csrf_field(csrf) }}
+        {% if person.status == "active" %}
+        <button class="btn" type="submit" name="what" value="reset">Make a password reset link</button>
+        <button class="btn" type="submit" name="what" value="signout"{% if not sessions %} disabled{% endif %}>Sign out everywhere</button>
+        <button class="btn danger" type="submit" name="what" value="disable" data-confirm="Disable {{ person.name }}? They are signed out at once and cannot sign in until enabled again.">Disable</button>
+        {% else %}
+        <button class="btn" type="submit" name="what" value="enable">Enable again</button>
+        {% endif %}
+      </form>
+    </section>
+    {% endif %}
+  </div>
+  <section class="card">
+    <h2>History</h2>
+    {% if journal %}
+    <ul class="journal">
+      {% for j in journal %}
+      <li><span class="at">{{ j.at|when }}</span>{{ j.actor }}: {{ j.action|replace("_", " ") }}{% if j.detail.roles is defined and j.detail.roles %} ({{ j.detail.roles|join(", ") }}){% endif %}{% if j.detail.to is defined %} ({{ j.detail.from|join(", ") or "no role" }} → {{ j.detail.to|join(", ") or "no role" }}){% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="meta">Nothing yet.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

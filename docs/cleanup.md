@@ -10,7 +10,7 @@ Agents leave things behind: stopped containers and their test databases, dev ser
 
 | Kind | Removed | Never |
 |---|---|---|
-| containers | stopped ones of a finished task, after `stopped_after`, with their anonymous volumes unless something else uses or protects one; running ones and compose services only with the task's label | foreign projects, `arceus-observability`, `protect`, `arceus.keep=true`, a running container or compose service tied by time only, a container holding a protected volume |
+| containers | stopped ones of a finished task, after `stopped_after`, with their anonymous volumes unless something else uses or protects one; running ones and compose services only with the task's label | foreign projects, `arceus-observability`, `arceus-console`, `protect`, `arceus.keep=true`, a running container or compose service tied by time only, a container holding a protected volume |
 | volumes | with a finished task's label, when no container uses them | named volumes without a label: dependency caches and the dev stack's data |
 | networks | empty ones labelled for a finished task or belonging to its compose project | networks made by hand (compose `external:`); empty ones nobody can be tied to (reported) |
 | images | built with a finished task's label, when no container uses them | everything else; untagged images are only counted |

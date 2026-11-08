@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field, role_chips, role_boxes, made_link %}
+{% block title %}People{% endblock %}
+{% block body %}
+<h1>People</h1>
+<p class="lede">Who can sign in and what each of them can do. {{ admins }} active admin{{ "s" if admins != 1 }}: the last one cannot be removed, so make a second one before you hand the factory over. <a href="/users/journal/">What people did</a></p>
+{{ flash(notice, error) }}
+{{ made_link(made) }}
+
+{% set waiting = users | selectattr("status", "equalto", "pending") | list %}
+{% if waiting %}
+<h2>Waiting for approval</h2>
+{% for p in waiting %}
+<form class="card" method="post" action="/users/{{ p.id }}/">
+  {{ csrf_field(csrf) }}
+  <h3>{{ p.name }}</h3>
+  <p class="meta">{{ p.email }} · asked {{ p.created_at|when }}</p>
+  {% if p.note %}<p>“{{ p.note }}”</p>{% endif %}
+  {{ role_boxes(roles, [], "Roles to give") }}
+  <div class="actions">
+    <button class="btn primary" type="submit" name="what" value="approve">Approve</button>
+    <button class="btn danger" type="submit" name="what" value="decline" data-confirm="Decline the request of {{ p.name }}? They can ask again.">Decline</button>
+  </div>
+</form>
+{% endfor %}
+{% endif %}
+
+<h2>Accounts</h2>
+{% set others = users | rejectattr("status", "equalto", "pending") | list %}
+{% if others %}
+<div class="table-wrap">
+<table class="people">
+  <thead><tr><th>Person</th><th>Roles</th><th class="hide-narrow">Last sign-in</th></tr></thead>
+  <tbody>
+  {% for p in others %}
+  <tr>
+    <td><a href="/users/{{ p.id }}/">{{ p.name }}</a>{% if p.id == user.id %} (you){% endif %}<span class="note">{{ p.email }}</span>{% if p.status == "disabled" %}<span class="status-disabled">Disabled</span>{% endif %}</td>
+    <td>{{ role_chips(p.roles) }}</td>
+    <td class="hide-narrow nowrap">{{ (p.last_login_at|when) or "Never" }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">Nobody yet.</p>
+{% endif %}
+
+<div class="split spaced">
+  <form class="card" method="post" action="/users/">
+    {{ csrf_field(csrf) }}
+    <h2>Invite someone</h2>
+    <p class="meta">Makes a one-time link you send them. Their account is active with these roles as soon as they choose a password; no approval needed.</p>
+    <div class="form-row">
+      <label for="invite-email">Email</label>
+      <input id="invite-email" name="email" type="email" required>
+    </div>
+    {{ role_boxes(roles, []) }}
+    <button class="btn primary" type="submit">Make the invitation</button>
+  </form>
+  <section class="card">
+    <h2>What the roles allow</h2>
+    <ul class="roles-help">
+      {% for r in ["admin", "operator", "architect", "qa"] %}
+      <li><strong>{{ role_words[r][0] }}</strong><span>{{ role_words[r][1] }}</span></li>
+      {% endfor %}
+      <li class="everyone"><strong>No role</strong><span>Sees the status, the reports, the findings and the monitoring; changes nothing.</span></li>
+    </ul>
+  </section>
+</div>
+{% endblock %}

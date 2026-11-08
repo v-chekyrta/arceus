@@ -1,0 +1,52 @@
+# The web console: the console itself and nginx in front of it. setup.sh installs this folder to
+# /opt/arceus-console, writes .env, nginx.conf and mounts.yaml beside it, and builds the image.
+#
+# - nginx listens on CONSOLE_PORT on every address of the machine: what is in front of it (a load balancer that
+#   ends TLS) sends the console's address there. It passes everything to the console, and /grafana/ to Grafana
+#   once the console has said who is asking.
+# - The console runs as the run user, without sudo, capabilities or a writable root; it sees the data folder
+#   (runner.db, config.yaml, console.db) at the same path as on the machine, the secrets in it replaced by empty
+#   files (mounts.yaml). What needs root, it asks the host for (arceus-ops.service).
+name: arceus-console
+
+services:
+  console:
+    image: arceus-console:${CONSOLE_IMAGE_TAG:?}
+    network_mode: host
+    restart: unless-stopped
+    user: "${RUN_UID:?}:${RUN_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    environment:
+      HOME: ${RUN_HOME:?}
+      ARCEUS_RUNNER_CONFIG: ${DATA_DIR:?}/config.yaml
+      ARCEUS_CONSOLE_PUBLIC_URL: ${CONSOLE_PUBLIC_URL:-}
+      ARCEUS_CONSOLE_SESSION_IDLE: ${CONSOLE_SESSION_IDLE:-24h}
+      ARCEUS_CONSOLE_SESSION_MAX: ${CONSOLE_SESSION_MAX:-14d}
+    volumes:
+      - ${DATA_DIR}:${DATA_DIR}
+    labels:
+      arceus.keep: "true"
+    healthcheck:
+      test: ["CMD", "/opt/console/bin/python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8180/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+
+  nginx:
+    image: nginx:1.30.2-alpine
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/var/cache/nginx, /var/run, /tmp]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    labels:
+      arceus.keep: "true"
+    depends_on: [console]

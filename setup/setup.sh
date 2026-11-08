@@ -15,7 +15,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SELF_DIR/.." && pwd)"
 CONF="${ARCEUS_SETUP_CONF:-$SELF_DIR/setup.conf}"
 FACTS_DIR=/var/lib/arceus
-PHASES=(packages legacy docker chrome agent_tools mcp_config dirs bulava bulava_install agent_reports agent_notes runner systemd observability)
+PHASES=(packages legacy docker chrome agent_tools mcp_config dirs bulava bulava_install agent_reports agent_notes runner systemd observability console)
 
 c_ok=$'\e[32m'; c_warn=$'\e[33m'; c_fail=$'\e[31m'; c_off=$'\e[0m'
 [ -t 1 ] || { c_ok=; c_warn=; c_fail=; c_off=; }
@@ -82,6 +82,8 @@ ENGINE_UNIT=/etc/systemd/system/bulava-engine.service
 ENGINE="$BULAVA_DIR/engine"
 OBS_DIR=/opt/arceus-observability
 OBS_SERVICES=(grafana prometheus loki alloy node-exporter)
+CONSOLE_DIR=/opt/arceus-console
+CONSOLE_APP=127.0.0.1:8180   # the console's own server; nginx in front of it is what people reach
 # Config files mounted into a container one by one, as service:path-inside:file-in-OBS_DIR. An update
 # replaces the file on disk, but the container keeps reading the one it started with.
 OBS_FILE_MOUNTS=(prometheus:/etc/prometheus/prometheus.yml:prometheus.yml loki:/etc/loki/loki.yaml:loki.yaml
@@ -702,6 +704,177 @@ apply_observability() {
   fi
   obs_source_hash > "$OBS_DIR/.source-sha256"
   local _; for _ in $(seq 1 30); do curl -fs -o /dev/null http://127.0.0.1:3000/api/health && break; sleep 2; done
+}
+
+# The web console (console/ in the repository): the console and nginx in Docker, the console as the run
+# user without sudo, capabilities or the secrets of the data folder. Switched on and configured in
+# config.yaml (console:); what this phase needs from there, `arceus-runner console env` prints.
+CONSOLE_SETTINGS=""
+console_settings() {
+  if [ -z "$CONSOLE_SETTINGS" ]; then
+    # As the run user, with its home: config.yaml's ~ means that home, as for the runner.
+    CONSOLE_SETTINGS="$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
+      --config "$DATA_DIR/config.yaml" console env)" \
+      || die "$DATA_DIR/config.yaml is not valid, so the console cannot be set up: run arceus-runner check --offline"
+  fi
+  printf '%s\n' "$CONSOLE_SETTINGS"
+}
+console_get() { console_settings | sed -n "s/^$1=//p"; }
+console_enabled() { [ "$(console_get CONSOLE_ENABLED)" = 1 ]; }
+console_compose() {
+  docker compose --project-directory "$CONSOLE_DIR" -f "$CONSOLE_DIR/compose.yaml" -f "$CONSOLE_DIR/mounts.yaml" "$@"
+}
+console_source_hash() {   # the image is built from runner/ and console/: its tag is their hash
+  (cd "$REPO_DIR" && find console runner/pyproject.toml runner/src -type f ! -path '*/__pycache__/*' \
+    ! -name '*.pyc' ! -path '*.egg-info*' ! -path 'runner/src/build/*' -print0 | sort -z | xargs -0 sha256sum \
+    | sha256sum | cut -c1-16)
+}
+console_env() {
+  printf '%s\n' "CONSOLE_IMAGE_TAG=$(console_source_hash)" "RUN_UID=$(id -u "$RUN_USER")" \
+    "RUN_GID=$(id -g "$RUN_USER")" "RUN_HOME=$RUN_HOME" "DATA_DIR=$DATA_DIR" \
+    "CONSOLE_PUBLIC_URL=$(console_get CONSOLE_PUBLIC_URL)" "CONSOLE_SESSION_IDLE=$(console_get CONSOLE_SESSION_IDLE)" \
+    "CONSOLE_SESSION_MAX=$(console_get CONSOLE_SESSION_MAX)"
+}
+yaml_str() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
+# What the console sees beyond the data folder (read-only), and what in the data folder it must not: every
+# file or folder there that holds a credential, by name, replaced by an empty one. Symbolic links are left:
+# their targets are outside what the container sees.
+console_secret_paths() {
+  { console_get CONSOLE_SECRET_FILE
+    find "$DATA_DIR" -mindepth 1 -maxdepth 1 \( -type f -o -type d \) \( -iname '*.env' -o -iname 'secrets*' \
+      -o -iname '*password*' -o -iname '*credential*' -o -iname '*.key' -o -iname '*.pem' -o -iname '*token*' \
+      -o -name google \) 2>/dev/null
+  } | while IFS= read -r p; do
+    case "$p" in "$DATA_DIR"/*) [ -e "$p" ] && [ ! -L "$p" ] && printf '%s\n' "$p" ;; esac
+  done | sort -u
+}
+console_mounts() {
+  local p
+  printf '%s\n' "# Written by setup.sh from config.yaml and the data folder. Do not edit." "services:" "  console:" "    volumes:"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p/" in "$DATA_DIR"/*) continue ;; esac
+    [ -d "$p" ] || install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$p"
+    printf '      - {type: bind, source: %s, target: %s, read_only: true}\n' "$(yaml_str "$p")" "$(yaml_str "$p")"
+  done <<< "$(console_get CONSOLE_READ_DIR)"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ -d "$p" ]; then
+      printf '      - {type: tmpfs, target: %s, tmpfs: {size: 4096, mode: 0o500}}\n' "$(yaml_str "$p")"
+    else
+      printf '      - {type: bind, source: /dev/null, target: %s, read_only: true}\n' "$(yaml_str "$p")"
+    fi
+  done <<< "$(console_secret_paths)"
+}
+console_nginx_conf() {
+  local net
+  cat <<CONF
+# Written by setup.sh from config.yaml (console:). Do not edit.
+worker_processes 1;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+events { worker_connections 512; }
+http {
+  include /etc/nginx/mime.types;
+  server_tokens off;
+  access_log off;
+  client_max_body_size 2m;
+  client_body_temp_path /tmp/body;
+  proxy_temp_path /tmp/proxy;
+  fastcgi_temp_path /tmp/fastcgi;
+  uwsgi_temp_path /tmp/uwsgi;
+  scgi_temp_path /tmp/scgi;
+  # The visitor's own address, as the proxies in front of this one (console.trusted_proxies) say.
+$(for net in $(console_get CONSOLE_TRUSTED_PROXIES); do printf '  set_real_ip_from %s;\n' "$net"; done)
+  real_ip_header X-Forwarded-For;
+  real_ip_recursive on;
+  map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+  server {
+    listen $(console_get CONSOLE_PORT) default_server;
+    location / {
+      proxy_pass http://$CONSOLE_APP;
+      proxy_http_version 1.1;
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_set_header X-Forwarded-For \$remote_addr;
+      proxy_read_timeout 120s;
+    }
+  }
+}
+CONF
+}
+console_running() {
+  local running
+  running="$(console_compose ps --status running --format '{{.Service}}' 2>/dev/null)"
+  printf '%s\n' "$running" | grep -qx console && printf '%s\n' "$running" | grep -qx nginx
+}
+console_stale_nginx() {  # nginx still reads an older nginx.conf: an update replaces the file, not the one it opened
+  local id pid
+  id="$(console_compose ps -q nginx 2>/dev/null)"
+  pid="$([ -z "$id" ] || docker inspect -f '{{.State.Pid}}' "$id" 2>/dev/null)"
+  [ -n "$pid" ] && [ "$pid" != 0 ] || return 1
+  [ "$(sha256sum < "/proc/$pid/root/etc/nginx/nginx.conf")" != "$(sha256sum < "$CONSOLE_DIR/nginx.conf")" ]
+}
+console_port_taken() {  # something that is not the console's nginx listens on the port
+  local port; port="$(console_get CONSOLE_PORT)"
+  ss -Hltnp "sport = :$port" 2>/dev/null | grep -v '"nginx"' | grep -q .
+}
+check_console() {
+  if ! console_enabled; then
+    # Off in config.yaml: nothing of it runs.
+    [ ! -f "$CONSOLE_DIR/compose.yaml" ] || [ -z "$(console_compose ps -q 2>/dev/null)" ]
+    return
+  fi
+  [ "$(cat "$CONSOLE_DIR/.source-sha256" 2>/dev/null)" = "$(console_source_hash)" ] || return 1
+  same_file "$CONSOLE_DIR/.env" "$(console_env)" 644 root:root || return 1
+  same_file "$CONSOLE_DIR/nginx.conf" "$(console_nginx_conf)" 644 root:root || return 1
+  same_file "$CONSOLE_DIR/mounts.yaml" "$(console_mounts)" 644 root:root || return 1
+  docker image inspect "arceus-console:$(console_source_hash)" >/dev/null 2>&1 || return 1
+  console_running && ! console_stale_nginx && curl -fsS -o /dev/null "http://$CONSOLE_APP/healthz"
+}
+apply_console() {
+  if ! console_enabled; then
+    if [ -f "$CONSOLE_DIR/compose.yaml" ]; then
+      console_compose down 2>&1 | sed 's/^/  /'
+      say "  console.enabled is false in config.yaml: the console is stopped"
+    fi
+    return 0
+  fi
+  console_port_taken && die "port $(console_get CONSOLE_PORT) is taken by something else (ss -ltnp): free it or set console.port"
+  install -d -m 755 -o root -g root "$CONSOLE_DIR" "$CONSOLE_DIR/build"
+  rsync -a --delete --exclude .env --exclude nginx.conf --exclude mounts.yaml --exclude .source-sha256 \
+    --exclude build "$REPO_DIR/console/" "$CONSOLE_DIR/"
+  install -d -m 755 -o root -g root "$CONSOLE_DIR/build/runner"
+  rsync -a --delete --exclude __pycache__ --exclude '*.egg-info' --exclude build \
+    "$REPO_DIR/runner/pyproject.toml" "$REPO_DIR/runner/src" "$CONSOLE_DIR/build/runner/"
+  chown -R root:root "$CONSOLE_DIR"; chmod -R go-w "$CONSOLE_DIR"
+  local tag; tag="$(console_source_hash)"
+  if ! docker image inspect "arceus-console:$tag" >/dev/null 2>&1; then
+    say "  building the console's image arceus-console:$tag"
+    docker build --quiet --label arceus.keep=true -t "arceus-console:$tag" -f "$CONSOLE_DIR/Dockerfile" \
+      "$CONSOLE_DIR/build" 2>&1 | sed 's/^/  /'
+  fi
+  # console.db and the operations' requests: the run user's, in the data folder the container sees.
+  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console"
+  put_file "$CONSOLE_DIR/.env" 644 root:root "$(console_env)" || true
+  put_file "$CONSOLE_DIR/mounts.yaml" 644 root:root "$(console_mounts)" || true
+  put_file "$CONSOLE_DIR/nginx.conf" 644 root:root "$(console_nginx_conf)" || true
+  console_compose up -d --remove-orphans --quiet-pull 2>&1 | sed 's/^/  /'
+  if console_stale_nginx; then
+    say "  nginx: recreated with the new nginx.conf"
+    console_compose up -d --force-recreate --no-deps nginx 2>&1 | sed 's/^/  /'
+  fi
+  local _; for _ in $(seq 1 30); do curl -fs -o /dev/null "http://$CONSOLE_APP/healthz" && break; sleep 2; done
+  # Older images of the console: nothing runs them any more.
+  docker image ls arceus-console --format '{{.Tag}}' | grep -vx "$tag" | while IFS= read -r old; do
+    docker image rm -f "arceus-console:$old" >/dev/null 2>&1 || true
+  done
+  console_source_hash > "$CONSOLE_DIR/.source-sha256"
+  if [ -z "$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
+        --config "$DATA_DIR/config.yaml" console users 2>/dev/null | grep -v '^No accounts')" ]; then
+    say "  console: nobody can sign in yet. Make the first admin:"
+    say "    $RUNNER_OPT/venv/bin/arceus-runner console invite --admin you@example.com"
+  fi
 }
 
 # --- facts ---------------------------------------------------------------------------------------

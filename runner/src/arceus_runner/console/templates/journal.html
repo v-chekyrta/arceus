@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}What people did{% endblock %}
+{% block body %}
+<p class="crumb"><a href="/users/">People</a></p>
+<h1>What people did</h1>
+<p class="lede">Sign-ins, approvals, roles, decisions, settings and operations, newest first. The last 300.</p>
+{% if entries %}
+<ul class="journal card">
+  {% for j in entries %}
+  <li><span class="at">{{ j.at|when }}</span><strong>{{ j.actor }}</strong>: {{ j.action|replace("_", " ") }}{% if j.target and not j.target.startswith("user:") %} <code class="lit">{{ j.target }}</code>{% endif %}{% if j.detail.email is defined and j.actor.find(j.detail.email) < 0 %} {{ j.detail.email }}{% endif %}</li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">Nothing yet.</p>
+{% endif %}
+{% endblock %}

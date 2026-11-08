@@ -627,6 +627,41 @@ class CleanupConfig(Strict):
     protect: CleanupProtect = CleanupProtect()
 
 
+PRIVATE_NETWORKS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]
+
+
+class ConsoleConfig(Strict):
+    """The web console (console/ beside the runner, setup.sh's `console` phase): one address with a sign-in for the
+    status, the test runs, the architecture reviews, Grafana, the settings and the operations. nginx listens on
+    `port` on every address of the machine; whatever is in front of it (a load balancer that ends TLS) forwards
+    `public_url` there. While it is on, the runner does not serve the old report pages on qa.port and architect.port."""
+    enabled: bool = False
+    public_url: str | None = Field(default=None, pattern=r"^https?://[^/\s?#]+$")  # https://console.example.com
+    port: int = Field(default=80, ge=1, le=65535)
+    # Who may say who the visitor is (X-Forwarded-For): the proxies in front of nginx. Anything else is the visitor.
+    trusted_proxies: list[str] = PRIVATE_NETWORKS
+    session_idle: Duration = timedelta(hours=24)   # signed out after this long without a page opened
+    session_max: Duration = timedelta(days=14)     # and after this long in any case
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _networks(cls, v: list[str]) -> list[str]:
+        import ipaddress
+        for net in v:
+            try:
+                ipaddress.ip_network(net, strict=False)
+            except ValueError:
+                raise ValueError(f"{net!r} is not an address or a network like 10.0.0.0/8") from None
+        return v
+
+    @model_validator(mode="after")
+    def _url(self) -> ConsoleConfig:
+        if self.enabled and not self.public_url:
+            raise ValueError("public_url: required when the console is on: the address people open, "
+                             "like https://console.example.com")
+        return self
+
+
 class MetricsConfig(Strict):
     enabled: bool = True
     address: str = "127.0.0.1"  # Prometheus scrapes it on the same machine; never open it outside
@@ -708,6 +743,7 @@ class Config(Strict):
     qa: QaConfig = QaConfig()
     architect: ArchitectConfig = ArchitectConfig()
     cleanup: CleanupConfig = CleanupConfig()
+    console: ConsoleConfig = ConsoleConfig()
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
 
