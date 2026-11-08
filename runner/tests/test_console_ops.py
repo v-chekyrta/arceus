@@ -62,6 +62,8 @@ class FakeSystem:
         self.config = {"loaded_at": "2000-01-01T00:00:00+00:00"}
         self.engine_running: list[list[str]] = [[]]
         self.ack_on_set = True
+        self.clear_fails = 0   # this many clears fail (the database busy), then they work
+        self.clears = 0
 
     def __call__(self, args, **kw):
         self.calls.append(list(args))
@@ -86,7 +88,13 @@ class FakeSystem:
                 if self.ack_on_set:
                     self.ack = {"token": self.drain["token"]}
             elif what == "clear":
-                self.drain = None
+                if self.clear_fails:
+                    self.clear_fails -= 1
+                    return subprocess.CompletedProcess(args, 1, "", "database is locked")
+                token = args[args.index("--token") + 1] if "--token" in args else ""
+                if self.drain and (not token or self.drain.get("token") == token):  # as the real command
+                    self.drain = None
+                self.clears += 1
         elif args[-3:] == ["task", "list", "--json"]:
             now = self.engine_running.pop(0) if len(self.engine_running) > 1 else self.engine_running[0]
             out = json.dumps([{"task_id": t, "state": "running"} for t in now])
@@ -137,6 +145,17 @@ def test_anything_but_a_listed_operation_runs_nothing(host, name, body):
     hostops.dispatch(host)
     assert not [c for c in host.system.calls if c[0] == "systemd-run"]
     assert list((host.ops_dir / "requests").iterdir()) == []
+
+
+@pytest.mark.parametrize("bad", [{"op": ["setup"]}, {"op": "setup", "requested_by": {"a": 1}},
+                                 {"op": "cancel", "target": 7}, {"op": None, "requested_at": []}])
+def test_a_broken_request_is_dropped_and_the_next_one_is_still_taken(host, bad):
+    (host.ops_dir / "requests" / f"{'0' * 32}.json").write_text(json.dumps({"id": "0" * 32, **bad}))
+    request(host, ID, {"op": "restart-runner", "requested_by": "Olga"})
+    done = hostops.dispatch(host)
+    assert done[-1] == f"{ID}: restart-runner started", done
+    assert list((host.ops_dir / "requests").iterdir()) == []
+    assert [c for c in host.system.calls if c[0] == "systemd-run"][0][-1] == ID
 
 
 def test_a_link_in_the_requests_folder_is_not_followed(host, tmp_path):
@@ -257,6 +276,48 @@ def test_an_engine_restart_cancelled_while_it_waits_restarts_nothing_and_lets_wo
     assert rec["state"] == "cancelled" and "Ivan" in rec["result"]
     assert not [c for c in host.system.calls if c[:3] == ["systemctl", "restart", "bulava-engine"]]
     assert host.system.drain is None
+
+
+def test_a_drain_that_could_not_be_lifted_is_lifted_by_the_next_passes(host):
+    host.system.clear_fails = 2  # the database is busy twice
+    request(host, ID, {"op": "restart-engine", "requested_by": "Olga"})
+    hostops.dispatch(host)
+    hostops.run(host, ID)
+    rec = Ledger(host).get(ID)
+    assert rec["state"] == "succeeded" and rec["drain_owed"] is True and host.system.drain == {"token": ID}
+    assert "keep trying until it is" in (host.ops_dir / "runs" / f"{ID}.log").read_text()
+    host.system.units[f"arceus-op-{ID}"] = {"ActiveState": "inactive"}
+    hostops.tick(host)  # still busy
+    assert host.system.drain == {"token": ID} and Ledger(host).get(ID)["drain_owed"] is True
+    hostops.tick(host)  # now it works
+    assert host.system.drain is None and Ledger(host).get(ID)["drain_owed"] is False
+    clears = host.system.clears
+    hostops.tick(host)
+    assert host.system.clears == clears  # nothing owed any more: no more tries
+
+
+def test_after_a_reboot_the_lost_restarts_drain_is_retried_until_lifted(host):
+    request(host, ID, {"op": "restart-engine", "requested_by": "x"})
+    hostops.dispatch(host)
+    Ledger(host).update(ID, state="waiting", drain_owed=True)
+    host.system.drain = {"token": ID}
+    del host.system.units[f"arceus-op-{ID}"]
+    host.system.clear_fails = 1
+    hostops.tick(host)
+    rec = Ledger(host).get(ID)
+    assert rec["state"] == "interrupted" and rec["drain_owed"] is True and host.system.drain == {"token": ID}
+    hostops.tick(host)
+    assert host.system.drain is None and Ledger(host).get(ID)["drain_owed"] is False
+
+
+def test_lifting_never_touches_another_operations_drain(host):
+    request(host, ID, {"op": "restart-engine", "requested_by": "x"})
+    hostops.dispatch(host)
+    Ledger(host).update(ID, state="failed", drain_owed=True)
+    host.system.drain = {"token": ID2}  # a newer restart's
+    hostops.tick(host)
+    assert host.system.drain == {"token": ID2}
+    assert Ledger(host).get(ID)["drain_owed"] is False  # this one's is not there: nothing owed
 
 
 def test_a_runner_that_never_acknowledges_fails_the_restart_and_lifts_the_drain(host, monkeypatch):

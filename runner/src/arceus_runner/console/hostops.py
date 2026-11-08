@@ -258,8 +258,12 @@ def dispatch(host: Host) -> list[str]:
             return [f"requests folder refused: {e}"]
         try:
             for name in sorted(requests.names()):
-                done.append(_one(host, ledger, requests, name))
-                requests.unlink(name)  # whatever it was: the folder empties, so the path unit rests
+                try:
+                    done.append(_one(host, ledger, requests, name))
+                except Exception as e:  # a request this code did not foresee: dropped, the next ones still taken
+                    done.append(f"{name}: dropped ({type(e).__name__}: {e})")
+                finally:
+                    requests.unlink(name)  # whatever it was: the folder empties, so the path unit rests
         finally:
             requests.close()
     finally:
@@ -279,12 +283,15 @@ def _one(host: Host, ledger: Ledger, requests: SafeDir, name: str) -> str:
         return f"{name}: unreadable ({e}), removed"
     if not isinstance(req, dict) or req.get("id") != op_id:
         return f"{name}: malformed, removed"
+    fields = {k: req.get(k) for k in ("op", "requested_by", "requested_at", "target")}
+    if not all(v is None or isinstance(v, str) for v in fields.values()):
+        return f"{name}: a field that is not text, removed"
     if ledger.get(op_id):
         return f"{op_id}: seen before, ignored"
-    by = str(req.get("requested_by") or "")[:200]
-    op = req.get("op")
+    by = (fields["requested_by"] or "")[:200]
+    op = fields["op"]
     if op == "cancel":
-        target = str(req.get("target") or "")
+        target = fields["target"] or ""
         rec = ledger.get(target) if _ID.match(target) else None
         if rec and rec.get("state") in ACTIVE:
             ledger.update(target, cancel=True, cancelled_by=by)
@@ -296,7 +303,7 @@ def _one(host: Host, ledger: Ledger, requests: SafeDir, name: str) -> str:
                     "result": "not an operation the host runs", "finished_at": now_iso()})
         return f"{op_id}: unknown operation refused"
     rec = {"id": op_id, "op": op, "title": OPS[op][0], "requested_by": by,
-           "requested_at": str(req.get("requested_at") or now_iso())[:40], "state": "accepted", "unit": f"arceus-op-{op_id}"}
+           "requested_at": (fields["requested_at"] or now_iso())[:40], "state": "accepted", "unit": f"arceus-op-{op_id}"}
     busy = [r for r in ledger.all() if r.get("state") in ACTIVE]
     if busy:
         b = busy[0]
@@ -386,6 +393,21 @@ def drain(host: Host, *args: str) -> None:
         raise Failed(f"the drain could not be {args[0]}: {(r.stderr or r.stdout).strip()[-300:]}")
 
 
+def lift(host: Host, ledger: Ledger, op_id: str) -> bool:
+    """Lift this operation's drain and make sure it is gone: then the record no longer owes it. Another
+    operation's drain is never touched (the clear names this one's token). False when it could not be done: the
+    record keeps owing it, and every tick tries again."""
+    try:
+        drain(host, "clear", "--token", op_id)
+        current = (runner_state(host).get("drain") or {}).get("token")
+    except Failed:
+        return False
+    if current == op_id:
+        return False
+    ledger.update(op_id, drain_owed=False)
+    return True
+
+
 def engine_tasks(host: Host) -> list[str] | None:
     """The engine's tasks running now (its own task list), or None when it cannot say."""
     tool = Path(host.run_user.pw_dir) / ".local" / "bin" / "night-shift"
@@ -450,6 +472,7 @@ def op_restart_runner(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str,
 
 def op_restart_engine(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str, str]:
     rec = ledger.get(op_id) or {}
+    ledger.update(op_id, drain_owed=True)  # first: whatever happens next, the drain is lifted in the end
     drain(host, "set", "--token", op_id, "--by", rec.get("requested_by") or "the console")
     say("Asked the runner to start nothing new in the engine.")
     try:
@@ -488,11 +511,10 @@ def op_restart_engine(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str,
             raise Failed(f"systemctl restart bulava-engine failed: {(r.stderr or r.stdout).strip()[-300:]}")
         s = _wait_active(host, "bulava-engine", say, after=before["since"] if before["active"] == "active" else "")
     finally:
-        try:
-            drain(host, "clear", "--token", op_id)
+        if lift(host, ledger, op_id):
             say("Work may start in the engine again.")
-        except Failed as e:
-            say(f"The drain could not be lifted: {e.result}. The executor's next pass lifts it.")
+        else:
+            say("The drain could not be lifted now: the executor's next passes keep trying until it is.")
     return "the engine restarted between tasks", f"bulava-engine active since {s['since']}"
 
 
@@ -539,13 +561,14 @@ def tick(host: Host) -> None:
         if rec.get("state") == "accepted" and _age(rec.get("requested_at")) < 30:
             continue  # systemd-run is still bringing it up
         ledger.log(rec["id"], "Its process is gone without a result (a reboot, or it was killed): interrupted.")
-        ledger.update(rec["id"], state="interrupted", finished_at=now_iso(),
+        owed = rec.get("op") == "restart-engine" or bool(rec.get("drain_owed"))
+        ledger.update(rec["id"], state="interrupted", finished_at=now_iso(), drain_owed=owed,
                       result="interrupted: its process ended without a result. Nothing is retried by itself.")
-        if rec.get("op") == "restart-engine":
-            try:
-                drain(host, "clear", "--token", rec["id"])
-            except Failed:
-                pass
+    # A drain an operation still owes (it ended, or was lost, before lifting it): tried again on every pass.
+    for rec in ledger.all():
+        if rec.get("drain_owed") and rec.get("state") not in ACTIVE:
+            if lift(host, ledger, rec["id"]):
+                ledger.log(rec["id"], "The drain is lifted: work may start in the engine again.")
     services = {name: service(host, name) for name in SERVICES}
     try:
         d = SafeDir(host.ops_dir, owner=host.owner)

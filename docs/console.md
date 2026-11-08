@@ -159,8 +159,10 @@ steps:
    for. A run that waits longer than its own timeout ends as such.
 3. It restarts `bulava-engine` and lifts the request, whatever the outcome.
 
-While it waits, it can be cancelled, which lifts the request as well. An interrupted one is lifted by the next
-tick.
+While it waits, it can be cancelled, which lifts the request as well. The operation's record keeps owing the
+lift until the runner's database confirms it is gone; if lifting fails (the database busy, the machine
+restarted mid-operation), every tick tries again. A lift only ever removes its own operation's request, never a
+newer one.
 
 **Restart the runner** restarts it straight away. A task in work keeps going, since its session belongs to the
 engine. The operation counts as done once `runner.service` is active again and the runner has recorded that it
