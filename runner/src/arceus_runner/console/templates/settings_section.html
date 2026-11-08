@@ -26,7 +26,7 @@
   <input id="f-{{ f.name }}" name="{{ f.name }}" type="{{ 'number' if f.kind == 'int' else 'text' }}"{% if f.kind == "float" %} inputmode="decimal"{% endif %} value="{{ f.shown }}"{% if disabled %} readonly{% endif %}>
   {% endif %}
   {% endif %}
-  <span class="hint">{% if f.hint %}{{ f.hint }}{% endif %}{% if not f.in_file %}{{ " · " if f.hint else "" }}the default: not written in the file{% endif %}{% if f.needs_setup %} · applied by setup.sh{% endif %}</span>
+  <span class="hint">{% if f.hint %}{{ f.hint }}{% endif %}{% if not f.in_file %}{{ " · " if f.hint else "" }}the default: not written in the file{% endif %}{% if f.needs_setup %} · applied by setup.sh{% elif f.mounted %} · outside the data folder, setup.sh has to run first{% endif %}</span>
 </div>
 {% endif %}
 {% endmacro %}
@@ -38,6 +38,7 @@
 <form class="card settings-form" method="post">
   {{ csrf_field(csrf) }}
   <input type="hidden" name="sha" value="{{ sha }}">
+  <input type="hidden" name="base" value="{{ base }}">
   {% for f in fields %}{{ field_row(f, not can_edit) }}{% endfor %}
   {% if can_edit %}
   <div class="actions form-end"><button class="btn primary" type="submit">Check the change</button><span class="meta">Nothing is saved until you see the difference and save it.</span></div>

@@ -56,6 +56,9 @@ TITLES = {
 # setup.sh, which writes them into systemd units, Docker files or nginx, so setup has to run first.
 SETUP_KEYS = ("console", "paths", "bulava.claude_checks", "bulava.mcp_config", "metrics")
 
+# Folders the console reads (cli._read_dirs): moved outside the data folder, setup.sh mounts them for it.
+MOUNTED_KEYS = ("qa.reports", "qa.instructions", "architect.reports", "architect.instructions")
+
 KINDS_SIMPLE = {"bool", "int", "float", "str", "choice", "duration", "time", "path", "lines", "multi"}
 
 
@@ -79,13 +82,34 @@ class Field:
     def needs_setup(self) -> bool:
         return any(self.name == k or self.name.startswith(k + ".") for k in SETUP_KEYS)
 
+    @property
+    def mounted(self) -> bool:
+        """A folder the console reads: outside the data folder, setup.sh has to mount it first."""
+        return self.name in MOUNTED_KEYS
 
-def _yaml() -> YAML:
+
+def _yaml(sequence: int = 4, offset: int = 2) -> YAML:
     y = YAML()  # round trip: comments, order and quoting stay
     y.preserve_quotes = True
     y.width = 4096
-    y.indent(mapping=2, sequence=4, offset=2)
+    y.indent(mapping=2, sequence=sequence, offset=offset)
     return y
+
+
+def indent_style(text: str) -> tuple[int, int]:
+    """How the file indents a list under its key, as ruamel's (sequence, offset): `key:\n    - a` is (4, 2),
+    `key:\n  - a` under a key at the same column is (2, 0). New lines are written the file's way."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines[:-1]):
+        m = re.match(r"^(\s*)[^\s#-][^:#]*:\s*(#.*)?$", line)
+        if not m:
+            continue
+        nxt = next((x for x in lines[i + 1:] if x.strip() and not x.lstrip().startswith("#")), "")
+        d = re.match(r"^(\s*)- ", nxt)
+        if d and len(d.group(1)) >= len(m.group(1)):
+            offset = len(d.group(1)) - len(m.group(1))
+            return offset + 2, offset
+    return 4, 2
 
 
 def load_doc(text: str):
@@ -93,51 +117,151 @@ def load_doc(text: str):
     return doc if doc is not None else CommentedMap()
 
 
-def dump_doc(doc) -> str:
+def dump_doc(doc, style: tuple[int, int] = (4, 2)) -> str:
     buf = io.StringIO()
-    _yaml().dump(doc, buf)
+    _yaml(*style).dump(doc, buf)
     return buf.getvalue()
 
 
-def _norm(line: str) -> str:
-    """A line as ruamel would write it: `{ a: b }` as `{a: b}`, the space before a comment as one."""
-    line = re.sub(r"\{\s+", "{", re.sub(r"\s+\}", "}", line))
-    return re.sub(r"\s+#", " #", line).rstrip()
+def split_comment(line: str) -> tuple[str, str]:
+    """(the YAML on a line, its comment with the spaces before it): a # inside quotes is text, not a comment."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote and not (quote == '"' and line[i - 1] == "\\"):
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            code = line[:i].rstrip()
+            return code, line[len(code):]
+    return line.rstrip(), ""
 
 
 def _restyle(old: str, new: str) -> str:
-    """A changed line in the original's style: spaces inside flow braces as it had them, its comment where it was."""
-    if "{ " in old.split("#")[0]:
-        head, sep, comment = new.partition(" #")
-        head = re.sub(r"\{(?=[^\s}])", "{ ", head)
-        head = re.sub(r"(?<=[^\s{])\}", " }", head)
-        new = head + (sep + comment if sep else "")
-    old_hash, new_hash = old.find(" #"), new.find(" #")
-    if old_hash > 0 and new_hash > 0:
-        col = len(old) - len(old[old_hash:].lstrip())  # where the comment's # stood
-        head = new[:new_hash].rstrip()
-        new = head.ljust(max(col - 1, len(head))) + " " + new[new_hash:].lstrip()
-    return new
+    """A changed line in the original's style: `{ a: b }` with the spaces it had, its comment where it was."""
+    old_code, old_comment = split_comment(old)
+    new_code, new_comment = split_comment(new)
+    m = re.match(r"^(\s*(?:- )?[^\s:#][^:#]*:\s)(\{.*\})$", new_code)
+    if m and re.search(r":\s\{ ", old_code) and not m.group(2).startswith("{ "):
+        new_code = f"{m.group(1)}{{ {m.group(2)[1:-1]} }}"
+    if new_comment and old_comment:
+        col = len(old) - len(old_comment.lstrip())  # where the original's # stood
+        new_code = new_code.ljust(max(col - 1, len(new_code))) + " " + new_comment.lstrip()
+    elif new_comment:
+        new_code += new_comment
+    return new_code
 
 
-def keep_untouched(original: str, dumped: str) -> str:
-    """The dumped text with every line ruamel only reformatted put back as it was: a change shows as its own lines
-    only, and nothing else in the file moves by a byte."""
-    a, b = original.splitlines(keepends=True), dumped.splitlines(keepends=True)
-    out = []
-    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
-        if op == "equal":
-            out += a[i1:i2]
-        elif op == "replace" and i2 - i1 == j2 - j1:
-            for old, new in zip(a[i1:i2], b[j1:j2]):
-                if _norm(old) == _norm(new):
-                    out.append(old)
-                else:
-                    end = "\n" if new.endswith("\n") else ""
-                    out.append(_restyle(old.rstrip("\n"), new.rstrip("\n")) + end)
+def _is_aside(line: str) -> bool:
+    s = line.strip()
+    return not s or s.startswith("#")
+
+
+def _span(lines: list[str], start: int, col: int) -> tuple[int, int]:
+    """The lines of the entry whose key is at (start, col): the key's line and what is indented under it (a list's
+    `- ` lines at the key's own column too), without the blank and comment lines after it, which stay."""
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if not _is_aside(line):
+            indent = len(line) - len(line.lstrip())
+            if indent < col or (indent == col and not line.lstrip().startswith("- ")):
+                break
+        end += 1
+    while end > start + 1 and _is_aside(lines[end - 1]):
+        end -= 1
+    return start, end
+
+
+def _node(doc, path: tuple[str, ...]):
+    node = doc
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+def _on_own_line(doc, path: tuple[str, ...]) -> bool:
+    """The entry at `path` starts a line of its own: its parent is a block mapping, not `{ ... }`."""
+    parent = _node(doc, path[:-1]) if path[:-1] else doc
+    return isinstance(parent, CommentedMap) and path[-1] in parent and not parent.fa.flow_style()
+
+
+def _key_at(doc, path: tuple[str, ...]) -> tuple[int, int]:
+    parent = _node(doc, path[:-1]) if path[:-1] else doc
+    return parent.lc.key(path[-1])
+
+
+def write(text: str, edits: list[tuple[tuple[str, ...], Any]]) -> str:
+    """`text` with each (path, value) set (or removed with _REMOVE), touching only the lines of the entries that
+    change. ruamel writes the changed entries; every other line is the original's, byte for byte."""
+    if not edits:
+        return text
+    style = indent_style(text)
+    doc = load_doc(text)
+    before = load_doc(text)
+    for path, value in edits:
+        _set(doc, path, value)
+    dumped = dump_doc(doc, style)
+    after = load_doc(dumped)
+    a, b = text.splitlines(keepends=True), dumped.splitlines(keepends=True)
+    if a and not a[-1].endswith("\n"):
+        a[-1] += "\n"
+    ops: dict[tuple[int, int], list[str]] = {}
+    for path, _ in edits:
+        # The entry to rewrite: the deepest one on a line of its own in both texts (a value inside `{ }` is its
+        # whole line); a key the original lacks goes in under its nearest ancestor that is there.
+        anchor = path
+        while len(anchor) > 1 and not (_node(before, anchor) is not None and _on_own_line(before, anchor)
+                                       and (_node(after, anchor) is None or _on_own_line(after, anchor))):
+            if _node(before, anchor[:-1]) is not None and _node(before, anchor) is None \
+                    and isinstance(_node(before, anchor[:-1]), CommentedMap) \
+                    and not _node(before, anchor[:-1]).fa.flow_style():
+                break  # a new key under a block mapping that is there: inserted below
+            anchor = anchor[:-1]
+        if _node(before, anchor) is not None or (len(anchor) == 1 and anchor[0] in before):
+            line, col = _key_at(before, anchor)
+            old = _span(a, line, col)
+            new_lines: list[str] = []
+            if _node(after, anchor) is not None or (anchor[:-1] and anchor[-1] in (_node(after, anchor[:-1]) or {})):
+                nline, ncol = _key_at(after, anchor)
+                s, e = _span(b, nline, ncol)
+                new_lines = [(" " * (col - ncol) + x if col >= ncol else x[ncol - col:]) for x in b[s:e]]
+                if len(new_lines) == old[1] - old[0]:
+                    new_lines = [_restyle(o.rstrip("\n"), n.rstrip("\n")) + "\n" for o, n in zip(a[old[0]:old[1]],
+                                                                                         new_lines)]
+            ops[old] = new_lines
         else:
-            out += b[j1:j2]
-    return "".join(out)
+            # A new key: its lines, at the end of its parent's entry (or of the file).
+            parent = anchor[:-1]
+            nline, ncol = _key_at(after, anchor)
+            s, e = _span(b, nline, ncol)
+            if parent:
+                pline, pcol = _key_at(before, parent)
+                _, pend = _span(a, pline, pcol)
+                children = [k for k in _node(before, parent)] if isinstance(_node(before, parent), dict) else []
+                col = _key_at(before, (*parent, children[0]))[1] if children else pcol + 2
+            else:
+                pend = len(a)
+                while pend and _is_aside(a[pend - 1]):
+                    pend -= 1
+                col = 0
+            ops[(pend, pend)] = ops.get((pend, pend), []) + [
+                (" " * (col - ncol) + x if col >= ncol else x[ncol - col:]) for x in b[s:e]]
+    # Outer entries win over entries inside them; then from the bottom up, so line numbers hold.
+    spans = sorted(ops, key=lambda r: (r[0], -r[1]))
+    kept: list[tuple[int, int]] = []
+    for r in spans:
+        if kept and r[0] < kept[-1][1] and r[1] <= kept[-1][1] and r != kept[-1] and r[0] != r[1]:
+            continue
+        kept.append(r)
+    out = list(a)
+    for r in sorted(kept, key=lambda r: (r[0], r[1]), reverse=True):
+        out[r[0]:r[1]] = ops[r]
+    result = "".join(out)
+    return result if text.endswith("\n") or not result.endswith("\n") else result
 
 
 def duration_text(td: timedelta) -> str:
@@ -396,20 +520,23 @@ class Change:
     needs_setup: bool
 
 
-def apply(text: str, fields: list[Field], form) -> Change:
-    """The file's text with the form's changes made, only to the keys that changed."""
-    doc = load_doc(text)
-    changed, setup = [], False
+def edits(fields: list[Field], form) -> list[tuple[tuple[str, ...], Any]]:
+    """What the form changes: (path, new value) for each field whose value differs from what the page showed."""
+    out = []
     for f in flatten(fields):
         did, value = _parse(f, form)
-        if not did:
-            continue
-        _set(doc, f.path, value)
-        changed.append(f.name)
-        setup = setup or f.needs_setup
-    if not changed:
+        if did:
+            out.append((f.path, value))
+    return out
+
+
+def apply(text: str, fields: list[Field], form, data_dir: Path | None = None) -> Change:
+    """The file's text with the form's changes made, only to the lines of the keys that changed."""
+    changes = edits(fields, form)
+    if not changes:
         return Change(text, [], False)
-    return Change(keep_untouched(text, dump_doc(doc)), changed, setup)
+    new = write(text, changes)
+    return Change(new, [".".join(p) for p, _ in changes], needs_setup(text, new, data_dir))
 
 
 def check(text: str) -> list[str]:
@@ -421,8 +548,21 @@ def check(text: str) -> list[str]:
     return []
 
 
-def needs_setup(before: str, after: str) -> bool:
-    """Whether the change between two texts touches what setup.sh reads."""
+def outside_mounts(text: str, data_dir: Path | None) -> set[Path] | None:
+    """The folders the console reads that are outside the data folder (setup.sh mounts them into its container), or
+    None when the text does not load."""
+    from arceus_runner.console.cli import _read_dirs
+    try:
+        cfg = parse_config(text)
+    except ConfigError:
+        return None
+    data = data_dir.resolve() if data_dir else None
+    return {d for d in _read_dirs(cfg) if not (data and (d == data or data in d.parents))}
+
+
+def needs_setup(before: str, after: str, data_dir: Path | None = None) -> bool:
+    """Whether the change between two texts touches what setup.sh reads: its own keys, or a folder the console
+    reads moving out of what its container already sees."""
     try:
         a, b = pyyaml.safe_load(before) or {}, pyyaml.safe_load(after) or {}
     except pyyaml.YAMLError:
@@ -433,7 +573,10 @@ def needs_setup(before: str, after: str) -> bool:
         for k in key.split("."):
             node = node.get(k) if isinstance(node, dict) else None
         return node
-    return any(pick(a, k) != pick(b, k) for k in SETUP_KEYS)
+    if any(pick(a, k) != pick(b, k) for k in SETUP_KEYS):
+        return True
+    new = outside_mounts(after, data_dir)
+    return new is not None and not new <= (outside_mounts(before, data_dir) or set())
 
 
 def legacy(text: str) -> bool:

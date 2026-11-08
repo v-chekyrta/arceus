@@ -295,3 +295,126 @@ def test_a_value_inside_a_flow_mapping_changes_that_line_only_in_its_style():
     assert diff == [('  git_author: { name: "ACME Agent", email: "acme-agent-bot@example.com" }',
                      '  git_author: { name: "ACME Bot", email: "acme-agent-bot@example.com" }')]
     assert len(text.splitlines()) == len(out.text.splitlines())
+
+
+# -- writing only what changed -------------------------------------------------------------------------------------
+
+def _apply(text: str, section: str, values: dict) -> str:
+    """A section's form sent with these values changed, as the page would send it."""
+    from starlette.datastructures import FormData
+    cfg = Config.model_validate(yaml.safe_load(text))
+    fields = dict(sf.sections(cfg, text))[section]
+    items = []
+    for f in sf.flatten(fields):
+        v = values.get(f.name, f.shown)
+        if f.kind == "bool":
+            if v:
+                items.append((f.name, "on"))
+        elif f.kind == "multi":
+            items += [(f.name, o) for o in v]
+        elif f.kind == "lines":
+            items.append((f.name, v if isinstance(v, str) else "\n".join(v)))
+        else:
+            items.append((f.name, v or ""))
+    return sf.apply(text, fields, FormData(items)).text
+
+
+def changed_lines(a: str, b: str) -> list[str]:
+    import difflib
+    return [x for x in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0)
+            if x[:1] in "+-" and not x.startswith(("+++", "---"))]
+
+
+def test_lists_written_at_their_keys_column_stay_as_they_are():
+    """`allowed_users:` with `- j.doe` at the key's own column is valid YAML people write; a change elsewhere does not
+    reformat it."""
+    text = EXAMPLE.read_text()
+    text = re.sub(r"(\n  allowed_users:[^\n]*\n)((?:    - [^\n]*\n)+)",
+                  lambda m: m.group(1) + m.group(2).replace("    - ", "  - "), text)
+    assert "\n  - j.doe" in text
+    out = _apply(text, "schedule", {"schedule.poll_working": "3m"})
+    assert changed_lines(text, out) == ["-  poll_working: 2m", "+  poll_working: 3m"]
+    out = _apply(text, "tracker", {"tracker.allowed_users": "j.doe\nnew.person"})
+    assert "  - j.doe\n  - new.person\n" in out  # a changed list is written the file's way
+    assert yaml.safe_load(out)["tracker"]["allowed_users"] == ["j.doe", "new.person"]
+
+
+def test_a_hash_inside_a_value_is_kept_exactly():
+    text = EXAMPLE.read_text()
+    out = _apply(text, "code_host", {"code_host.git_author.name": "Bob # service", "code_host.bot_user": "bot # x"})
+    loaded = yaml.safe_load(out)["code_host"]
+    assert loaded["git_author"]["name"] == "Bob # service" and loaded["bot_user"] == "bot # x"
+    lines = changed_lines(text, out)
+    assert len(lines) == 4 and all("git_author" in x or "bot_user" in x for x in lines)
+    assert '  git_author: { name: "Bob # service", email: "acme-agent-bot@example.com" }' in out
+    assert "# the bot's username" in out  # the line's own comment stays
+
+
+def test_every_duration_written_in_the_file_changes_on_its_own_line_only():
+    text = EXAMPLE.read_text()
+    cfg = Config.model_validate(yaml.safe_load(text))
+    tried = 0
+    for section, fields in sf.sections(cfg, text):
+        for f in sf.flatten(fields):
+            if f.kind != "duration" or not f.in_file:
+                continue
+            new = "7m" if f.shown != "7m" else "8m"
+            out = _apply(text, section, {f.name: new})
+            lines = changed_lines(text, out)
+            assert len(lines) == 2 and lines[0].startswith("-") and lines[1].startswith("+"), (f.name, lines)
+            node = yaml.safe_load(out)
+            for key in f.path:
+                node = node[key]
+            assert node == new, f.name
+            tried += 1
+    assert tried >= 20
+
+
+def test_a_setting_the_file_does_not_have_is_added_as_one_line_under_its_section():
+    text = EXAMPLE.read_text()
+    assert "stopped_after" not in text
+    out = _apply(text, "cleanup", {"cleanup.stopped_after": "45m"})
+    assert changed_lines(text, out) == ["+  stopped_after: 45m"]
+    assert yaml.safe_load(out)["cleanup"]["stopped_after"] == "45m"
+    Config.model_validate(yaml.safe_load(out))
+
+
+def test_a_stale_form_keeps_the_persons_changes_on_top_of_the_newer_file(w):
+    admin = signed_in(w.settings, "owner@example.com")
+    page = admin.get("/settings/limits/").text
+    # Meanwhile, over SSH: another value in another section.
+    w.config.write_text(w.config.read_text().replace("poll_off_hours: 10m", "poll_off_hours: 20m"))
+    sent = [(k, v) for k, v in form_values(page) if k != "limits.max_review_rounds"]
+    r = send(admin, "/settings/limits/", sent + [("limits.max_review_rounds", "8")])
+    assert r.status_code == 409
+    assert "What changed on the server since you opened it" in r.text
+    assert "-  poll_off_hours: 10m" in r.text and "+  poll_off_hours: 20m" in r.text  # theirs
+    assert "+  max_review_rounds: 8" in r.text  # yours, on top of theirs
+    assert "Nothing would change" not in r.text
+    assert "max_review_rounds: 8" not in w.config.read_text()  # nothing written by itself
+    assert save_preview(admin, r.text).status_code == 303
+    after = yaml.safe_load(w.config.read_text())
+    assert after["limits"]["max_review_rounds"] == 8 and after["schedule"]["poll_off_hours"] == "20m"
+
+
+def test_the_yaml_editor_on_a_stale_page_shows_what_changed_on_the_server(w):
+    admin = signed_in(w.settings, "owner@example.com")
+    page = admin.get("/settings/yaml/").text
+    original = html.unescape(re.search(r'name="text"[^>]*>(.*?)</textarea>', page, re.S).group(1))
+    w.config.write_text(w.config.read_text().replace("poll_off_hours: 10m", "poll_off_hours: 20m"))
+    fields = {"csrf": csrf_of(page), "sha": re.search(r'name="sha" value="([^"]+)"', page).group(1),
+              "base": re.search(r'name="base" value="([^"]+)"', page).group(1),
+              "text": original.replace("max_ci_fix_attempts: 3", "max_ci_fix_attempts: 4")}
+    r = admin.post("/settings/yaml/", data=fields)
+    assert r.status_code == 409 and "+  poll_off_hours: 20m" in r.text and "+  max_ci_fix_attempts: 4" in r.text
+
+
+@pytest.mark.parametrize("where, setup", [("/srv/qa-runs", True), ("DATA/qa/elsewhere", False)])
+def test_moving_a_reports_folder_out_of_what_the_console_sees_needs_setup(w, where, setup):
+    where = where.replace("DATA", str(w.config.parent))
+    admin = signed_in(w.settings, "owner@example.com")
+    r = change(admin, "qa", **{"qa.reports": where})
+    assert ("run setup, then restart the runner" in r.text) is setup
+    assert ("restart the runner</strong> after saving" in r.text) is (not setup)
+    page = admin.get("/settings/qa/").text
+    assert "outside the data folder, setup.sh has to run first" in page

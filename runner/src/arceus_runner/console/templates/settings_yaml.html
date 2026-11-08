@@ -14,6 +14,7 @@
 <form class="card" method="post">
   {{ csrf_field(csrf) }}
   <input type="hidden" name="sha" value="{{ sha }}">
+  <input type="hidden" name="base" value="{{ base }}">
   <label class="sr" for="text">config.yaml</label>
   <textarea class="code" id="text" name="text" spellcheck="false"{% if not can_edit %} readonly{% endif %}>{{ text }}</textarea>
   {% if can_edit %}

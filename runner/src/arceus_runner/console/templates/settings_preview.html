@@ -4,6 +4,11 @@
 <p class="crumb"><a href="{{ origin }}">Back to editing</a></p>
 <h1>Check the change</h1>
 {{ flash(error=error) }}
+{% if server_diff %}
+<h2>What changed on the server since you opened it</h2>
+{{ diff_block(server_diff) }}
+<h2>{{ "Your changes on top of it" if not same else "Your page" }}</h2>
+{% endif %}
 {% if same %}
 <p class="notice">Nothing would change: this is config.yaml as it is.</p>
 {% else %}
@@ -16,7 +21,7 @@
 <div class="card">
   <h2>Before it takes effect</h2>
   {% if setup %}
-  <p>This change is read by <strong>setup.sh</strong> (the console, paths, metrics or the engine's checks): run setup, then restart the runner.</p>
+  <p>This change is read by <strong>setup.sh</strong> (the console, paths, metrics, the engine's checks, or a folder of reports or instructions outside the data folder, which the console's container has to have mounted): run setup, then restart the runner.</p>
   {% else %}
   <p>The runner reads config.yaml when it starts: <strong>restart the runner</strong> after saving. A task already running keeps going and is picked up again.</p>
   {% endif %}

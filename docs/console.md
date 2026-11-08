@@ -106,12 +106,15 @@ the default when the file does not say it. A setting the form cannot hold as a f
 The whole file can also be edited as YAML.
 
 Admins change it in two steps. **Check the change** shows the exact difference in `config.yaml` and what it needs
-to take effect: a runner restart, or for `console`, `paths`, `metrics` and the engine's checks, `setup.sh` and
-then a restart. The result is checked by the runner's own code (`parse_config`): a value it would refuse shows its
-error and cannot be saved. **Save** writes only the lines that changed. Comments, order, quoting and every other
-line stay byte for byte. A text value YAML would read as something else (`off`, `09:00`) is written quoted. The
+to take effect: a runner restart, or for `console`, `paths`, `metrics`, the engine's checks and a reports or
+instructions folder moved outside the data folder (the console's container has to have it mounted), `setup.sh`
+and then a restart. The result is checked by the runner's own code (`parse_config`): a value it would refuse shows its
+error and cannot be saved. **Save** writes only the lines of the settings that changed: it finds each one's lines in
+the file and replaces those alone, so comments, order, quoting, the way lists are indented and every other line
+stay byte for byte; a setting the file did not have is added as its own line under its section. A text value YAML would read as something else (`off`, `09:00`) is written quoted. The
 write is atomic and keeps the file's mode. If `config.yaml` changed since the page was opened (another admin, an
-edit over SSH), the save is refused and the difference against the file as it is now is shown. Saving restarts
+edit over SSH), nothing is written: the page shows what changed on the server, then the person's own changes put
+on top of the file as it is now, to save or drop. Saving restarts
 nothing.
 
 **History** lists every version saved from the console, with who saved it and why, and shows which one is in the

@@ -9,10 +9,12 @@ starts, so the pages say when the file differs from the one it runs with."""
 
 from __future__ import annotations
 
+import base64
+
 from starlette.responses import Response
 from starlette.routing import Route
 
-from arceus_runner.config import parse_config
+from arceus_runner.config import ConfigError, parse_config
 from arceus_runner.console import files
 from arceus_runner.console import settings_form as sf
 from arceus_runner.console.web import Ctx, Gone, page
@@ -20,6 +22,10 @@ from arceus_runner.db import ReviewStore
 
 SECTIONS = ("/settings/",)
 KIND = "config"
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
 def _path(ctx: Ctx):
@@ -88,30 +94,70 @@ def section(ctx: Ctx) -> Response:
         if sf.legacy(current.text):
             return ctx.redirect("/settings/yaml/", "This config.yaml has the older layout: edit it as YAML.")
         if ctx.field("sha") != current.sha:
-            return _preview(ctx, current, current.text, origin=f"/settings/{name}/", conflict=True,
-                            error="config.yaml changed since you opened this section. Open the section again: your "
-                                  "changes were not applied to the newer file.")
+            return _stale_section(ctx, current, name)
         try:
-            change = sf.apply(current.text, found, ctx.form)
+            change = sf.apply(current.text, found, ctx.form, _path(ctx).parent)
         except sf.Invalid as e:
             return ctx.render("settings_section.html", status=400, title=title, what=what, name=name, fields=found,
-                              sha=current.sha, error=str(e), can_edit=True)
+                              sha=current.sha, base=_b64(current.text), error=str(e), can_edit=True)
         if not change.changed:
             return ctx.render("settings_section.html", title=title, what=what, name=name, fields=found,
-                              sha=current.sha, notice="Nothing changed: every value is as it was.", can_edit=True)
+                              sha=current.sha, base=_b64(current.text),
+                              notice="Nothing changed: every value is as it was.", can_edit=True)
         return _preview(ctx, current, change.text, origin=f"/settings/{name}/", changed=change.changed)
     return ctx.render("settings_section.html", title=title, what=what, name=name, fields=found, sha=current.sha,
-                      can_edit=ctx.can("settings.edit") and not sf.legacy(current.text), notice=ctx.query("notice"))
+                      base=_b64(current.text), can_edit=ctx.can("settings.edit") and not sf.legacy(current.text),
+                      notice=ctx.query("notice"))
+
+
+def _base(ctx: Ctx) -> str | None:
+    """The config.yaml the form was made from, as the form carried it (base64, so the browser cannot touch it), if it
+    is still that text."""
+    try:
+        text = base64.b64decode(ctx.field("base"), validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return text if files.digest(text.encode()) == ctx.field("sha") else None
+
+
+def _stale_section(ctx: Ctx, current: files.Current, name: str) -> Response:
+    """A section's form made from an older config.yaml: the person's changes, worked out against the file they saw,
+    put on top of the file as it is now, for them to look at. Nothing is written until they save it."""
+    base = _base(ctx)
+    origin = f"/settings/{name}/"
+    if base is None:
+        return _preview(ctx, current, current.text, origin=origin, conflict=True,
+                        error="config.yaml changed since you opened this section, and the page did not carry the "
+                              "version it was made from. Open the section again and make your change there.")
+    try:
+        base_fields = dict(sf.sections(parse_config(base), base))[name]
+        changes = sf.edits(base_fields, ctx.form)
+    except (KeyError, sf.Invalid, ConfigError) as e:  # an older file that does not load, or a value that is not one
+        return _preview(ctx, current, current.text, origin=origin, conflict=True, server_diff=files.diff(
+            base, current.text, "when you opened it", "config.yaml now"),
+            error=f"config.yaml changed since you opened this section, and your change could not be read against "
+                  f"it ({e}). Open the section again.")
+    server = files.diff(base, current.text, "when you opened it", "config.yaml now")
+    if not changes:
+        return _preview(ctx, current, current.text, origin=origin, conflict=True, server_diff=server,
+                        error="config.yaml changed since you opened this section; you changed nothing in it.")
+    merged = sf.write(current.text, changes)
+    return _preview(ctx, current, merged, origin=origin, changed=[".".join(p) for p, _ in changes], conflict=True,
+                    server_diff=server,
+                    error="config.yaml changed since you opened this section. Below: what changed on the server, then "
+                          "your changes on top of the file as it is now. Nothing is saved until you save this.")
 
 
 def _preview(ctx: Ctx, current: files.Current, new_text: str, origin: str, changed: list[str] | None = None,
-             conflict: bool = False, error: str = "", note: str = "") -> Response:
+             conflict: bool = False, error: str = "", note: str = "", server_diff: str = "") -> Response:
     new_text = files.normal(new_text)
     problems = sf.check(new_text)
     difference = files.diff(current.text, new_text, "config.yaml now", "after saving")
     return ctx.render("settings_preview.html", status=409 if conflict else 200, title="Check the change",
                       diff=difference, problems=problems, text=new_text, sha=current.sha, origin=origin,
-                      changed=changed or [], setup=sf.needs_setup(current.text, new_text), error=error,
+                      server_diff=server_diff,
+                      changed=changed or [], error=error,
+                      setup=sf.needs_setup(current.text, new_text, _path(ctx).parent),
                       same=new_text == current.text, note=note, restart=_restart_hint(ctx))
 
 
@@ -121,9 +167,12 @@ def yaml_editor(ctx: Ctx) -> Response:
     if ctx.request.method == "POST":
         ctx.require("settings.edit")
         if ctx.field("sha") != current.sha:
+            base = _base(ctx)
+            server = files.diff(base, current.text, "when you opened it", "config.yaml now") if base is not None else ""
             return _preview(ctx, current, ctx.field("text"), origin="/settings/yaml/", conflict=True,
-                            error="config.yaml changed since you opened the editor. Below is the difference between "
-                                  "the file now and your text: check it, then save if yours should replace it.")
+                            server_diff=server,
+                            error="config.yaml changed since you opened the editor. Below: what changed on the server, "
+                                  "then the file now against your text. Saving yours replaces theirs: check first.")
         return _preview(ctx, current, ctx.field("text"), origin="/settings/yaml/", note=ctx.field("note"))
     text, restoring = current.text, None
     if ctx.query("version").isdigit():
@@ -134,6 +183,7 @@ def yaml_editor(ctx: Ctx) -> Response:
                 else restoring["after_text"]
             restoring = {**restoring, "which": "before" if which == "before" else "after"}
     return ctx.render("settings_yaml.html", title="config.yaml", text=text, sha=current.sha, path=_path(ctx),
+                      base=_b64(current.text),
                       problems=sf.check(current.text) if current.exists else [], restoring=restoring,
                       can_edit=ctx.can("settings.edit") and not current.problem, error=current.problem)
 
@@ -158,7 +208,7 @@ def save(ctx: Ctx) -> Response:
     if not saved:
         return ctx.redirect(origin, "Nothing changed: config.yaml is already this text.")
     words = "Saved. The runner reads config.yaml when it starts: restart it to apply."
-    if sf.needs_setup(current.text, text):
+    if sf.needs_setup(current.text, text, _path(ctx).parent):
         words = "Saved. This change is read by setup.sh: run setup, then restart the runner."
     return ctx.redirect("/settings/", words)
 
