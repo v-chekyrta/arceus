@@ -145,6 +145,7 @@ class Runner:
         self.cleanup = cleanup
         self.engine = engine
         self.health: dict[str, str] = {}
+        self._drain_acked: str | None = None
         self.health_detail: dict[str, tuple[str, str]] = {}  # check -> (status, detail), as last written
         self.health_since: dict[str, str] = {}               # check -> when its status last changed
         self.next_due: dict[str, float] = {"local": 0.0, "tracker": 0.0, "code_host": 0.0, "doctor": 0.0,
@@ -282,6 +283,8 @@ class Runner:
         """Run every poll that is due. Each one schedules its own next time."""
         now = self.mono()
         started = self.now()
+        if self.engine:
+            self.acknowledge_drain()  # first: whatever this pass would start, the engine holds from here on
         local_due = now >= self.next_due["local"]
         host_due = now >= self.next_due["code_host"]
         # The next time is set in `finally`: an unexpected error must not turn into a hot loop.
@@ -376,9 +379,29 @@ class Runner:
             return self.delivery.workspace_taken()
         return next(iter(self.store.tasks(*ACTIVE_STATES)), None)
 
+    def drain(self) -> dict | None:
+        """The console's request to start nothing in the engine (it restarts it once its tasks end), if any."""
+        found = self.store.state("drain") if hasattr(self.store, "state") else None
+        return found[0] if found and found[0] else None
+
+    def engine_held(self) -> str | None:
+        d = self.drain()
+        return f"the engine is to be restarted from the console ({d.get('by') or 'someone'})" if d else None
+
+    def acknowledge_drain(self) -> None:
+        """Say the runner has seen the request: from now on nothing new reaches the engine. The console's operation
+        waits for this before it counts the engine's running tasks."""
+        d = self.drain()
+        token = d.get("token") if d else None
+        if token != self._drain_acked:
+            self.store.set_state("drain_ack", {"token": token, "at": self.now().isoformat(timespec="seconds")})
+            self._drain_acked = token
+            self.events.emit("drain_acknowledged" if token else "drain_ended", token=token)
+
     def can_take(self) -> bool:
-        """New work only when nothing is failing and both the tracker and the code host answer."""
-        return (all(s != "fail" for s in self.health.values())
+        """New work only when nothing is failing, both the tracker and the code host answer, and the console is not
+        waiting to restart the engine."""
+        return (all(s != "fail" for s in self.health.values()) and not (self.engine and self.drain())
                 and self.tracker.client.available() and self.code_host.client.available())
 
     def situation(self) -> str:
@@ -470,6 +493,8 @@ def run(cfg: Config, secrets: Secrets, once: bool = False, config_sha: str | Non
             stack.callback(notifier.sender.close)
         runner = Runner(cfg, store, events, tracker, host, engine=engine, git=git, metrics=metrics,
                         classify=classify, cleanup=cleanup, notifier=notifier)
+        if engine:
+            engine.held = runner.engine_held
 
         def _stop(signum, _frame):
             stop.set()

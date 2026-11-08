@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash %}
+{% block body %}
+<p class="crumb"><a href="/operations/">Operations</a></p>
+<h1>{{ rec.title }}</h1>
+<p class="lede">Asked by {{ rec.requested_by }}, {{ rec.requested_at|when }}. This page follows the host's record of it: reload it, or close it and come back.</p>
+{{ flash(notice) }}
+<div data-refresh="/operations/{{ rec.id }}/live" data-every="3">
+{% include "operation_live.html" %}
+</div>
+{% endblock %}

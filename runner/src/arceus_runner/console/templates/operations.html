@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash %}
+{% block body %}
+<h1>Operations</h1>
+<p class="lede">Restarting the runner and the engine, and setup, done by the host from a fixed list. Nothing restarts by itself: saving settings does not.</p>
+{{ flash(notice) }}
+{% if not host.ok %}
+<p class="notice err">Operations are not available: {{ host.why }}.</p>
+{% endif %}
+<div class="tiles ops-tiles">
+  {% for name, label in [("runner", "Runner"), ("bulava-engine", "Engine")] %}
+  {% set s = (host.services or {}).get(name) %}
+  <section class="tile">
+    <h2>{{ label }} <code class="lit">{{ name }}</code></h2>
+    {% if not s %}<p class="value unknown">Unknown</p>
+    {% elif s.active == "active" %}<p class="value good"><span aria-hidden="true">✓</span> Active</p><p class="note">since {{ s.since or "?" }}</p>
+    {% else %}<p class="value bad"><span aria-hidden="true">✕</span> {{ s.active|capitalize }}</p><p class="note">{{ s.sub }}{% if s.status %}, exit status {{ s.status }}{% endif %}</p>{% endif %}
+  </section>
+  {% endfor %}
+</div>
+{% include "operations_work.html" %}
+<h2>Start one</h2>
+<ul class="links ops-links">
+  {% for op, (title, services, action) in ops.items() %}
+  <li>{% if can(user, action) and host.ok %}<a href="/operations/new/{{ op }}">{{ title }}</a>{% else %}<span class="muted-title">{{ title }}</span>{% endif %}
+    <span class="note">{% if services %}Touches {{ services|join(", ") }}.{% else %}Changes nothing.{% endif %}{% if not can(user, action) %} Admins only.{% endif %}</span></li>
+  {% endfor %}
+</ul>
+<h2>Recent</h2>
+{% if recs %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Operation</th><th>State</th><th class="hide-narrow">Asked by</th><th class="hide-narrow">When</th></tr></thead>
+  <tbody>
+  {% for r in recs %}
+  <tr>
+    <td><a href="/operations/{{ r.id }}/">{{ r.title }}</a>{% if r.result %}<span class="run-summary">{{ r.result }}</span>{% endif %}</td>
+    <td class="nowrap"><span class="tag {{ {'succeeded': 'ok', 'failed': 'bad', 'interrupted': 'bad', 'refused': 'wait', 'cancelled': 'quiet', 'pending': 'quiet'}.get(r.state, 'busy') }}">{{ words.get(r.state, r.state) }}</span></td>
+    <td class="hide-narrow">{{ r.requested_by }}</td>
+    <td class="hide-narrow nowrap">{{ r.requested_at|when }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">None yet.</p>
+{% endif %}
+{% endblock %}

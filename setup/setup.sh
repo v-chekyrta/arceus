@@ -842,6 +842,84 @@ $(for net in $(console_get CONSOLE_TRUSTED_PROXIES); do printf '  set_real_ip_fr
 }
 CONF
 }
+# The host's side of the console's operations (runner/src/arceus_runner/console/hostops.py): a path unit wakes
+# a root oneshot for each request the console writes; a timer marks lost operations interrupted and writes the
+# services' state for the console. Root reads the data folder without following links.
+OPS_UNITS=(arceus-ops.path arceus-ops.service arceus-ops-tick.service arceus-ops-tick.timer)
+ops_command() {
+  printf '%s console hostops --data %s --setup %s %s' "$RUNNER_OPT/venv/bin/arceus-runner" "$DATA_DIR" \
+    "$ARCEUS_HOME/setup/setup.sh" "$1"
+}
+ops_unit_text() {
+  case "$1" in
+    arceus-ops.path) cat <<UNIT
+[Unit]
+Description=Arceus console: requests for the host's operations
+
+[Path]
+DirectoryNotEmpty=$DATA_DIR/console/ops/requests
+Unit=arceus-ops.service
+
+[Install]
+WantedBy=paths.target
+UNIT
+    ;;
+    arceus-ops.service) cat <<UNIT
+[Unit]
+Description=Arceus console: take the console's requests (restart, setup) from its fixed list
+
+[Service]
+Type=oneshot
+ExecStart=$(ops_command dispatch)
+UNIT
+    ;;
+    arceus-ops-tick.service) cat <<UNIT
+[Unit]
+Description=Arceus console: mark lost operations interrupted, write the services' state
+
+[Service]
+Type=oneshot
+ExecStart=$(ops_command tick)
+UNIT
+    ;;
+    arceus-ops-tick.timer) cat <<UNIT
+[Unit]
+Description=Arceus console: the host executor's pass
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=20s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
+UNIT
+    ;;
+  esac
+}
+ops_units_ok() {
+  local u
+  for u in "${OPS_UNITS[@]}"; do same_file "/etc/systemd/system/$u" "$(ops_unit_text "$u")" 644 root:root || return 1; done
+  systemctl is-enabled -q arceus-ops.path && systemctl is-active -q arceus-ops.path \
+    && systemctl is-enabled -q arceus-ops-tick.timer && systemctl is-active -q arceus-ops-tick.timer \
+    && [ "$(stat -c '%U' "$DATA_DIR/console/ops/requests" 2>/dev/null)" = "$RUN_USER" ]
+}
+apply_ops_units() {
+  local u changed=0
+  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console/ops"
+  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console/ops/requests"
+  install -d -m 700 -o root -g root "$FACTS_DIR/ops"
+  for u in "${OPS_UNITS[@]}"; do put_file "/etc/systemd/system/$u" 644 root:root "$(ops_unit_text "$u")" && changed=1; done
+  systemctl daemon-reload
+  systemctl enable --now --quiet arceus-ops.path arceus-ops-tick.timer
+  if [ "$changed" = 1 ]; then systemctl restart arceus-ops.path arceus-ops-tick.timer; fi
+}
+remove_ops_units() {
+  local u
+  systemctl disable --now --quiet arceus-ops.path arceus-ops-tick.timer 2>/dev/null || true
+  for u in "${OPS_UNITS[@]}"; do rm -f "/etc/systemd/system/$u"; done
+  systemctl daemon-reload
+}
 console_running() {
   local running
   running="$(console_compose ps --status running --format '{{.Service}}' 2>/dev/null)"
@@ -860,10 +938,12 @@ console_port_taken() {  # something that is not the console's nginx listens on t
 }
 check_console() {
   if ! console_enabled; then
-    # Off in config.yaml: nothing of it runs.
-    [ ! -f "$CONSOLE_DIR/compose.yaml" ] || [ -z "$(console_compose ps -q 2>/dev/null)" ]
+    # Off in config.yaml: nothing of it runs, and nothing on the host takes its requests.
+    [ ! -f "$CONSOLE_DIR/compose.yaml" ] || [ -z "$(console_compose ps -q 2>/dev/null)" ] || return 1
+    [ ! -f /etc/systemd/system/arceus-ops.path ]
     return
   fi
+  ops_units_ok || return 1
   [ "$(cat "$CONSOLE_DIR/.source-sha256" 2>/dev/null)" = "$(console_source_hash)" ] || return 1
   same_file "$CONSOLE_DIR/.env" "$(console_env)" 644 root:root || return 1
   same_file "$CONSOLE_DIR/nginx.conf" "$(console_nginx_conf)" 644 root:root || return 1
@@ -877,6 +957,7 @@ apply_console() {
       console_compose down 2>&1 | sed 's/^/  /'
       say "  console.enabled is false in config.yaml: the console is stopped"
     fi
+    [ ! -f /etc/systemd/system/arceus-ops.path ] || remove_ops_units
     return 0
   fi
   console_port_taken && die "port $(console_get CONSOLE_PORT) is taken by something else (ss -ltnp): free it or set console.port"
@@ -895,6 +976,7 @@ apply_console() {
   fi
   # console.db and the operations' requests: the run user's, in the data folder the container sees.
   install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console"
+  apply_ops_units
   put_file "$CONSOLE_DIR/.env" 644 root:root "$(console_env)" || true
   put_file "$CONSOLE_DIR/mounts.yaml" 644 root:root "$(console_mounts)" || true
   put_file "$CONSOLE_DIR/nginx.conf" 644 root:root "$(console_nginx_conf)" || true

@@ -125,6 +125,47 @@ and goes back through the same check. The runner records which `config.yaml` it 
 Operators see all of it read-only. Nobody else opens it. Secrets are not in `config.yaml` (only the names of
 the variables in `secrets.env`), and the console never reads `secrets.env`.
 
+## Operations
+
+**Operations** restarts the runner and the engine and runs setup. The console has no root on the machine, so it
+does not do these itself. It writes a request into `~/arceus/data/console/ops/requests`, and the host does the
+rest (`runner/src/arceus_runner/console/hostops.py`):
+
+- `arceus-ops.path` wakes `arceus-ops.service` (root) for each request. The service reads the request without
+  following links, checks it against its fixed list (restart the runner, restart the engine when idle, the setup
+  check, setup), records it in its own ledger (`/var/lib/arceus/ops`, root's) and starts it as a transient unit
+  `arceus-op-<id>`. The unit outlives the console, so setup can rebuild the console's container while it runs.
+- One operation at a time. A request while one is under way is recorded as refused, with the reason.
+- `arceus-ops-tick.timer`, every 20 seconds from boot: an operation whose unit is gone without a result (a reboot,
+  a killed process) is marked **interrupted**. It never becomes a success and is never run again. The timer also
+  writes the services' state for the page. When nothing has written it for 90 seconds, the page says the
+  executor is not answering and starts nothing.
+- Root writes the copy the console reads (`console/ops/runs`) without following any link: the data folder is
+  writable by the console's user, and a planted link must not make root write elsewhere.
+
+Before an operation, the page names the services it touches and the work under way. Afterwards the operation's
+page shows its state and output as they come, its result and the service's health after it. It follows the
+host's record, so a reload or a restart of the console loses nothing. Operators restart the runner and the
+engine and run the setup check. Only admins run setup.
+
+**Restart the engine when it is idle.** Restarting the engine ends its tasks' sessions, so the operation goes in
+steps:
+
+1. It asks the runner to start nothing new in the engine (`drain` in `runner_state`). The runner then takes no
+   new tickets, and any call to the engine (a dispatch, a follow-up, a code review, a test run, an architecture
+   review) answers busy, which every caller already treats as "try again later". The runner says it has seen the
+   request on its next pass.
+2. It waits for the engine's own running tasks to end, however long they take, and shows which ones it is waiting
+   for. A run that waits longer than its own timeout ends as such.
+3. It restarts `bulava-engine` and lifts the request, whatever the outcome.
+
+While it waits, it can be cancelled, which lifts the request as well. An interrupted one is lifted by the next
+tick.
+
+**Restart the runner** restarts it straight away. A task in work keeps going, since its session belongs to the
+engine. The operation counts as done once `runner.service` is active again and the runner has recorded that it
+started with `config.yaml` (Settings then shows whether that is the saved version).
+
 ## Grafana
 
 **Monitoring** opens Grafana at `/grafana/` on the console's address. nginx asks the console who the visitor is

@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,6 +83,9 @@ class Engine:
         self.bin = cfg.paths.bulava / "bin"
         self.extra_env = extra_env or {}  # tests: a stub worker instead of Claude
         self.events = events  # an EventLog: dispatch and send can take minutes, and say so in events.jsonl
+        # While it answers a reason, nothing new goes to the engine: the console is restarting it once its running
+        # tasks end (console/hostops.py). Every caller already takes the busy answer as "try again later".
+        self.held: Callable[[], str | None] = lambda: None
 
     def env(self) -> dict[str, str]:
         b = self.cfg.bulava
@@ -185,6 +189,10 @@ class Engine:
         """dispatch.sh or worker-send.sh, bracketed by events: the runner's loop waits for it (up to TIMEOUT),
         and without them that wait looks like nothing happening."""
         emit = self.events.emit if self.events else lambda *a, **k: None
+        held = self.held()
+        if held:
+            emit("engine_call_held", call=call, task_id=task_id, reason=held)
+            return Reply(6, "busy", {}, f"held: {held}")
         emit("engine_call_started", call=call, task_id=task_id, message_id=message_id)
         started = time.monotonic()
         try:

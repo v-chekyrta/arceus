@@ -58,6 +58,16 @@ check "and believes X-Forwarded-For only from the trusted proxies" \
   "grep -q 'set_real_ip_from 10.0.0.0/8;' <<< \"\$conf\" && grep -q 'set_real_ip_from 192.168.0.0/16;' <<< \"\$conf\" && grep -q 'real_ip_recursive on;' <<< \"\$conf\""
 check "and passes everything to the console on localhost" "grep -q 'proxy_pass http://127.0.0.1:8180;' <<< \"\$conf\""
 
+eval "$(sed -n '/^OPS_UNITS=/p; /^ops_command() {/,/^}/p; /^ops_unit_text() {/,/^}/p' "$HERE/../setup.sh")"
+RUNNER_OPT=/opt/arceus-runner; ARCEUS_HOME="$T/home/arceus"
+check "the executor's units are the four it needs" "[ \"\${OPS_UNITS[*]}\" = 'arceus-ops.path arceus-ops.service arceus-ops-tick.service arceus-ops-tick.timer' ]"
+check "the path unit wakes on a request in the data folder" \
+  "ops_unit_text arceus-ops.path | grep -qx 'DirectoryNotEmpty=$DATA_DIR/console/ops/requests'"
+check "the service takes requests with the runner's own code, as root, from the fixed list" \
+  "ops_unit_text arceus-ops.service | grep -qx 'ExecStart=/opt/arceus-runner/venv/bin/arceus-runner console hostops --data $DATA_DIR --setup $T/home/arceus/setup/setup.sh dispatch' && ! ops_unit_text arceus-ops.service | grep -q '^User='"
+check "the timer passes every 20 seconds, from boot on" \
+  "ops_unit_text arceus-ops-tick.timer | grep -qx 'OnUnitActiveSec=20s' && ops_unit_text arceus-ops-tick.timer | grep -qx 'OnBootSec=15s' && ops_unit_text arceus-ops-tick.service | grep -q 'hostops .* tick$'"
+
 env_text="$(console_env)"
 check "the container runs as the run user" "grep -qx \"RUN_UID=$(id -u)\" <<< \"\$env_text\" && grep -qx 'CONSOLE_IMAGE_TAG=0123456789abcdef' <<< \"\$env_text\""
 

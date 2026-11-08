@@ -1,0 +1,15 @@
+{% from "macros.html" import csrf_field %}
+{% set tone = {'succeeded': 'good', 'failed': 'bad', 'interrupted': 'bad', 'refused': 'wait', 'cancelled': 'unknown'}.get(rec.state, 'busy') %}
+<p class="headline {{ tone }}"{% if final %} data-final{% endif %}><span class="glyph" aria-hidden="true">{{ {'good': '✓', 'bad': '✕', 'wait': '◐', 'unknown': '–'}.get(tone, '●') }}</span> {{ words.get(rec.state, rec.state) }}{% if rec.waiting_for %}: {{ rec.waiting_for }}{% endif %}</p>
+<dl class="facts">
+  {% if rec.started_at %}<dt>Started</dt><dd>{{ rec.started_at|when }}</dd>{% endif %}
+  {% if rec.finished_at %}<dt>Ended</dt><dd>{{ rec.finished_at|when }}</dd>{% endif %}
+  {% if rec.result %}<dt>Result</dt><dd>{{ rec.result }}</dd>{% endif %}
+  {% if rec.health %}<dt>After it</dt><dd>{{ rec.health }}</dd>{% endif %}
+  {% if rec.cancel %}<dt>Cancel</dt><dd>asked by {{ rec.cancelled_by }}</dd>{% endif %}
+</dl>
+{% if can_cancel %}
+<form method="post" action="/operations/{{ rec.id }}/cancel" class="spaced-top">{{ csrf_field(csrf) }}<button class="btn danger" type="submit" data-confirm="Cancel the engine restart? Work starts in the engine again.">Cancel</button></form>
+{% endif %}
+<h2>Output <span class="kind">times in UTC</span></h2>
+{% if log %}<pre class="oplog" data-keep-scroll>{{ log }}</pre>{% elif rec.state == "pending" %}<p class="empty">The host has not taken it yet: its executor takes requests within seconds.</p>{% else %}<p class="empty">No output yet.</p>{% endif %}

@@ -122,6 +122,38 @@ def cmd_env(_args, config_path: Path) -> int:
     return 0
 
 
+def cmd_drain(args, config_path: Path) -> int:
+    """The console's drain in runner.db, for the host's executor (hostops.py), which runs this as the run user."""
+    import json
+    from datetime import UTC, datetime
+
+    from arceus_runner.db import ReviewStore
+    cfg = load_config(config_path)
+    store = ReviewStore.existing(cfg.paths.db)
+    try:
+        if args.drain == "set":
+            store.set_state("drain", {"token": args.token, "by": args.by,
+                                      "at": datetime.now(UTC).isoformat(timespec="seconds")})
+        elif args.drain == "clear":
+            found = store.state("drain")
+            current = found[0] if found and found[0] else None
+            if current and (not args.token or current.get("token") == args.token):
+                store.set_state("drain", None)
+        else:
+            def value(key):
+                found = store.state(key)
+                return found[0] if found else None
+            print(json.dumps({"drain": value("drain"), "ack": value("drain_ack"), "config": value("config")}))
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_hostops(args, _config_path: Path) -> int:
+    from arceus_runner.console import hostops
+    return hostops.main(args)
+
+
 def cmd_serve(args, config_path: Path) -> int:
     import os
 
@@ -156,6 +188,22 @@ def add_parser(sub) -> None:
     u.set_defaults(console_fn=cmd_users)
     e = csub.add_parser("env", help="what setup.sh needs to install the console, from config.yaml")
     e.set_defaults(console_fn=cmd_env)
+    d = csub.add_parser("drain", help="the request to start nothing new in the engine (the host's executor uses it)")
+    dsub = d.add_subparsers(dest="drain", required=True)
+    ds = dsub.add_parser("set")
+    ds.add_argument("--token", required=True)
+    ds.add_argument("--by", default="")
+    dc = dsub.add_parser("clear")
+    dc.add_argument("--token", default="")
+    dsub.add_parser("status")
+    d.set_defaults(console_fn=cmd_drain)
+    h = csub.add_parser("hostops", help="the host's executor of the console's operations (systemd runs it as root)")
+    h.add_argument("--data", required=True, help="the data folder (~/arceus/data)")
+    h.add_argument("--setup", required=True, help="setup.sh")
+    h.add_argument("--ledger", default="/var/lib/arceus/ops")
+    h.add_argument("step", choices=["dispatch", "run", "tick"])
+    h.add_argument("id", nargs="?")
+    h.set_defaults(console_fn=cmd_hostops)
     c.set_defaults(fn=run)
 
 

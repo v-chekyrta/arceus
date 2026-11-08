@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% block body %}
+<p class="crumb"><a href="/operations/">Operations</a></p>
+<h1>{{ title }}?</h1>
+<p class="lede">{{ what }}</p>
+{{ flash(error=error) }}
+{% if not host.ok %}<p class="notice err">Not available: {{ host.why }}.</p>{% endif %}
+{% if busy %}<p class="notice warn">{{ busy[0].title }} is under way (<a href="/operations/{{ busy[0].id }}/">see it</a>): one at a time.</p>{% endif %}
+<section class="card">
+  <h2>What it touches</h2>
+  <p>{% if services %}{{ services|join(", ") }}{% else %}Nothing: it only looks.{% endif %}</p>
+</section>
+{% include "operations_work.html" %}
+<form method="post" class="toolbar spaced">
+  {{ csrf_field(csrf) }}
+  <button class="btn primary" type="submit"{% if not host.ok or busy %} disabled{% endif %}>{{ title }}</button>
+  <a class="btn" href="/operations/">Back</a>
+</form>
+{% endblock %}

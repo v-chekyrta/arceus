@@ -206,10 +206,19 @@ textarea.code.small { min-height: 0; }
 .form-end { padding: 14px 0 0; margin-top: 20px; border-top: 1px solid var(--line); align-items: center; }
 pre.diff .hunk { color: var(--blue); }
 .spaced-top { margin-top: 14px; }
+
+/* operations */
+.ops-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ops-links { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.muted-title { font-weight: 600; color: var(--quiet); }
+.toolbar.spaced { margin-top: 24px; }
+pre.oplog { margin: 0; padding: 12px 14px; max-height: 32rem; overflow: auto; background: var(--surface);
+            border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere;
+            font: 0.825rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 @media (max-width: 760px) {
   .split { grid-template-columns: 1fr; }
   .roles-help li { grid-template-columns: 1fr; gap: 2px; }
-  .settings-groups { grid-template-columns: 1fr; }
+  .settings-groups, .ops-links { grid-template-columns: 1fr; }
   .bar-in { gap: 0 12px; }
   .sections { order: 3; flex-basis: 100%; }
   .nav { margin: 0 -10px 6px; }

@@ -1,0 +1,11 @@
+<h2>Work under way</h2>
+{% if work.error %}
+<p class="notice warn">Not known: {{ work.error }}.</p>
+{% elif work.active or work.runs %}
+<ul class="rows">
+  {% for t in work.active %}<li><span class="tag busy">{{ t.words }}</span><span class="what">{{ t.key }} {{ t.summary }}<span class="note">since {{ t.since|when }}</span></span></li>{% endfor %}
+  {% for r in work.runs %}<li><span class="tag {{ 'busy' if r.holds else 'quiet' }}">{{ "Running" if r.holds else "Queued" }}</span><span class="what">{{ r.label }}, run {{ r.n }}</span></li>{% endfor %}
+</ul>
+{% else %}
+<p class="empty">Nothing is running in the engine.</p>
+{% endif %}
