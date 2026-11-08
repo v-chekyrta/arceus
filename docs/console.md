@@ -55,7 +55,15 @@ Then `sudo ./setup.sh` (or `--phase console`). The first admin comes from the se
 /opt/arceus-runner/venv/bin/arceus-runner console invite --admin you@example.com
 ```
 
-It prints a one-time link (48 hours). Open it, choose a name and a password, and sign in. While the console is
+It prints a one-time link (48 hours). Open it, choose a name and a password, and sign in.
+
+To check an installation from outside and over SSH (HTTPS, the cookie, closed inner ports, the services, the
+console reading the VM's own database, the operations it ran, nothing failed since a moment, an owner's
+invitation; exits 0 only if all of it holds):
+
+```bash
+bash setup/checks/console-live.sh https://console.example.com user@vm -p 22 --owner you@example.com --since 2026-11-08T23:20
+``` While the console is
 on, the runner no longer serves the old report pages on `qa.port` and `architect.port`.
 
 ## Home
