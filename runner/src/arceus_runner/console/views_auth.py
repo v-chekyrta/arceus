@@ -118,13 +118,8 @@ def account(ctx: Ctx) -> Response:
                       sessions=ctx.store.session_count(user.id))
 
 
-def home(ctx: Ctx) -> Response:
-    return ctx.redirect("/account/")
-
-
 def routes() -> list[Route]:
     return [
-        Route("/", page(home)),
         Route("/login", page(login, signed_in=False), methods=["GET", "POST"]),
         Route("/logout", page(logout), methods=["POST"]),
         Route("/register", page(register, signed_in=False), methods=["GET", "POST"]),

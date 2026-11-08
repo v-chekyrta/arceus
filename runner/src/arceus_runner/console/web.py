@@ -16,7 +16,7 @@ import secrets
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -235,7 +235,7 @@ class ConsoleApp:
                                      autoescape=select_autoescape(["html"]), trim_blocks=True, lstrip_blocks=True)
         self.templates.globals["can"] = auth.can
         self.templates.globals["role_words"] = auth.ROLE_WORDS
-        self.templates.filters["when"] = _when
+        self.templates.filters["when"] = self.when
         self.session_cookie = "__Host-arceus" if settings.secure else "arceus"
         self.csrf_cookie = "__Host-arceus-csrf" if settings.secure else "arceus-csrf"
         self.sections: set[str] = set()
@@ -246,22 +246,32 @@ class ConsoleApp:
         # The database exists before the first request: migrations run once, here, not in the middle of a page.
         ConsoleStore(settings.db_path).close()
 
+    def tz(self):
+        cfg, _ = self.config.get()
+        return cfg.schedule.tz if cfg else UTC
+
+    def when(self, iso_text: str | None) -> str:
+        """A stored time in the project's timezone (schedule.timezone), as people there read it."""
+        from arceus_runner.console.store import parse_iso
+        if not iso_text:
+            return ""
+        try:
+            at = parse_iso(iso_text)
+        except ValueError:
+            return iso_text
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=UTC)
+        return f"{at.astimezone(self.tz()):%d %b %Y, %H:%M}"
+
+    def now_text(self) -> str:
+        return f"{datetime.now(self.tz()):%H:%M:%S}"
+
     def asset_url(self, name: str) -> str:
         return f"/static/{name}?v={self.assets[name][2]}"
 
     def store(self) -> ConsoleStore:
         return ConsoleStore(self.settings.db_path)
 
-
-def _when(iso_text: str | None) -> str:
-    from arceus_runner.console.store import parse_iso
-    if not iso_text:
-        return ""
-    try:
-        at = parse_iso(iso_text)
-    except ValueError:
-        return iso_text
-    return f"{at:%d %b %Y, %H:%M} UTC"
 
 
 def page(handler: Callable[[Ctx], Response], *, signed_in: bool = True, api: bool = False):
@@ -339,11 +349,11 @@ async def healthz(_request: Request) -> Response:
 
 
 def create_app(settings: Settings | None = None) -> Starlette:
-    from arceus_runner.console import views_auth, views_users
+    from arceus_runner.console import views_auth, views_home, views_users
     settings = settings or Settings.from_env()
     console = ConsoleApp(settings)
     routes = [Route("/static/{name}", static), Route("/healthz", healthz)]
-    for module in (views_auth, views_users):
+    for module in (views_auth, views_home, views_users):
         routes += module.routes()
         console.sections.update(getattr(module, "SECTIONS", ()))
     app = Starlette(routes=routes)

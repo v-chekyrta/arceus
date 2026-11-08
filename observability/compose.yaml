@@ -1,6 +1,8 @@
 # Observability for one VM: Grafana with Prometheus (runner and machine
-# metrics) and Loki (runner and Bulava events). Everything listens on 127.0.0.1 only; Grafana is
-# reached through an SSH tunnel: ssh -L 3000:127.0.0.1:3000 <user>@<vm>.
+# metrics) and Loki (runner and Bulava events). Everything listens on 127.0.0.1 only. With the web
+# console on (console.enabled), Grafana is its /grafana/: nginx asks the console who the visitor is and
+# passes that as X-WEBAUTH-*, and nobody gets in anonymously. Without it, Grafana is reached through an
+# SSH tunnel (ssh -L 3000:127.0.0.1:3000 <user>@<vm>) and viewing needs no login.
 # setup.sh installs this folder to /opt/arceus-observability and writes .env next to it.
 name: arceus-observability
 
@@ -13,8 +15,20 @@ services:
       GF_SERVER_HTTP_ADDR: 127.0.0.1
       GF_SERVER_HTTP_PORT: "3000"
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin
-      GF_AUTH_ANONYMOUS_ENABLED: "true"         # reachable only through the tunnel; viewers need no login
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS:-true}   # only through the tunnel, without the console
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # The console's sign-in (setup.sh's .env): nginx sets these headers from the console's answer, over
+      # whatever the browser sent; Grafana takes them only from 127.0.0.1, where nginx is.
+      GF_AUTH_PROXY_ENABLED: ${GRAFANA_AUTH_PROXY:-false}
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_HEADER_PROPERTY: email
+      GF_AUTH_PROXY_HEADERS: "Name:X-WEBAUTH-NAME Role:X-WEBAUTH-ROLE"
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_PROXY_WHITELIST: 127.0.0.1
+      GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-%(protocol)s://%(domain)s:%(http_port)s/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: ${GRAFANA_SUB_PATH:-false}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/arceus-now.json
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"

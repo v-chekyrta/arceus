@@ -657,6 +657,15 @@ obs_source_hash() {
 obs_env() {
   printf 'GRAFANA_ADMIN_FILE=%s\nARCEUS_DATA=%s\nBULAVA_STATE=%s\n' \
     "$OBS_DIR/secrets/grafana-admin" "$DATA_DIR" "$RUN_HOME/.claude/supervisor"
+  # With the console on, Grafana is its /grafana/ and lets in only whom the console names (docs/console.md).
+  if console_enabled; then
+    printf 'GRAFANA_ANONYMOUS=false\nGRAFANA_AUTH_PROXY=true\nGRAFANA_SUB_PATH=true\nGRAFANA_ROOT_URL=%s/grafana/\n' \
+      "$(console_get CONSOLE_PUBLIC_URL)"
+  fi
+}
+# Grafana's own health address: under /grafana/ once it serves from there.
+grafana_health() {
+  if console_enabled; then echo http://127.0.0.1:3000/grafana/api/health; else echo http://127.0.0.1:3000/api/health; fi
 }
 obs_running() {
   local s running
@@ -679,7 +688,7 @@ check_observability() {
   [ -z "$(obs_stale_services)" ] || return 1
   same_file "$OBS_DIR/.env" "$(obs_env)" 644 root:root || return 1
   [ -s "$DATA_DIR/grafana-admin-password" ] && [ -s "$OBS_DIR/secrets/grafana-admin" ] || return 1
-  obs_running && curl -fsS -o /dev/null http://127.0.0.1:3000/api/health
+  obs_running && curl -fsS -o /dev/null "$(grafana_health)"
 }
 apply_observability() {
   install -d -m 755 -o root -g root "$OBS_DIR"
@@ -703,7 +712,7 @@ apply_observability() {
     docker compose --project-directory "$OBS_DIR" up -d --force-recreate --no-deps $stale 2>&1 | sed 's/^/  /'
   fi
   obs_source_hash > "$OBS_DIR/.source-sha256"
-  local _; for _ in $(seq 1 30); do curl -fs -o /dev/null http://127.0.0.1:3000/api/health && break; sleep 2; done
+  local _; for _ in $(seq 1 30); do curl -fs -o /dev/null "$(grafana_health)" && break; sleep 2; done
 }
 
 # The web console (console/ in the repository): the console and nginx in Docker, the console as the run
@@ -778,6 +787,8 @@ http {
   include /etc/nginx/mime.types;
   server_tokens off;
   access_log off;
+  # Redirects name the path only: nginx does not know the https:// address the load balancer serves.
+  absolute_redirect off;
   client_max_body_size 2m;
   client_body_temp_path /tmp/body;
   proxy_temp_path /tmp/proxy;
@@ -791,6 +802,34 @@ $(for net in $(console_get CONSOLE_TRUSTED_PROXIES); do printf '  set_real_ip_fr
   map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
   server {
     listen $(console_get CONSOLE_PORT) default_server;
+    # Grafana, once the console has said who asks. Its answer's headers replace any X-WEBAUTH-* the browser
+    # sent; no session: to the sign-in.
+    location = /_console_auth {
+      internal;
+      proxy_pass http://$CONSOLE_APP/_auth/grafana;
+      proxy_pass_request_body off;
+      proxy_set_header Content-Length "";
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+    }
+    location /grafana/ {
+      auth_request /_console_auth;
+      auth_request_set \$arceus_user \$upstream_http_x_arceus_user;
+      auth_request_set \$arceus_name \$upstream_http_x_arceus_name;
+      auth_request_set \$arceus_role \$upstream_http_x_arceus_role;
+      error_page 401 = @signin;
+      proxy_set_header X-WEBAUTH-USER \$arceus_user;
+      proxy_set_header X-WEBAUTH-NAME \$arceus_name;
+      proxy_set_header X-WEBAUTH-ROLE \$arceus_role;
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade \$http_upgrade;
+      proxy_set_header Connection \$connection_upgrade;
+      proxy_pass http://127.0.0.1:3000;
+    }
+    location = /grafana { return 301 /grafana/; }
+    location @signin { return 302 /login?next=/grafana/; }
     location / {
       proxy_pass http://$CONSOLE_APP;
       proxy_http_version 1.1;

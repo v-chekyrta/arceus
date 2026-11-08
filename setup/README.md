@@ -113,7 +113,7 @@ Each `task_dispatched` event in `events.jsonl` records what was asked for. What 
 
 ## Watching it: Grafana
 
-Grafana, Prometheus and Loki listen on 127.0.0.1 only. Open them through an SSH tunnel:
+With the web console on, Grafana is its **Monitoring** (`/grafana/`), behind its sign-in ([docs/console.md](../docs/console.md)). Without it, Grafana, Prometheus and Loki listen on 127.0.0.1 only. Open them through an SSH tunnel:
 
 ```bash
 ssh -L 3000:127.0.0.1:3000 <user>@<vm>        # then http://localhost:3000

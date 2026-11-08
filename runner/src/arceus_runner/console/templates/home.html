@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Now{% endblock %}
+{% block body %}
+<h1 class="sr">Now</h1>
+<div data-refresh="/live" data-every="15" aria-live="polite">
+{% include "home_status.html" %}
+</div>
+<section class="dashboards">
+  <h2>Monitoring</h2>
+  <p class="lede">Grafana, behind this sign-in: history, every event and the machine's resources.</p>
+  <ul class="links">
+    {% for uid, name, what in dashboards %}
+    <li><a href="/grafana/d/{{ uid }}">{{ name }}</a><span class="note">{{ what }}</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

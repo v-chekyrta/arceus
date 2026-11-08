@@ -40,6 +40,8 @@ step "setup: the console sees the data folder without its secrets; nginx trusts 
 if [ -n "$live" ]; then  # the base image and PyPI: the network, so not in --offline
   step "console: the image builds from console/Dockerfile and runs without root, sudo or secrets" \
     bash setup/tests/test-console-image.sh
+  step "console: nginx lets into Grafana only whom the console names, as Viewer or Admin" \
+    bash setup/tests/test-console-proxy.sh
 fi
 step "setup: the engine's source survives a rewritten upstream${live:+, the pinned commit installs}" \
   bash setup/tests/test-bulava-source.sh $live

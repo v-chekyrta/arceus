@@ -7,7 +7,10 @@ in Docker beside the observability stack and is set up by `setup.sh` (the `conso
 
 ```
 browser ──https──▶ load balancer (ends TLS) ──http──▶ nginx :console.port ──▶ console 127.0.0.1:8180
+                                                          │
+                                                          └─ /grafana/ ─▶ Grafana 127.0.0.1:3000, once the console says who asks
 console ──reads/writes──▶ ~/arceus/data: runner.db, config.yaml, console/console.db
+console ──reads──▶ the runner's metrics (127.0.0.1:9464) and events.jsonl
 ```
 
 - **The console** (`runner/src/arceus_runner/console`) is part of the runner's package and is built into an image
@@ -47,6 +50,28 @@ Then `sudo ./setup.sh` (or `--phase console`). The first admin comes from the se
 
 It prints a one-time link (48 hours). Open it, choose a name and a password, and sign in. While the console is
 on, the runner no longer serves the old report pages on `qa.port` and `architect.port`.
+
+## Home
+
+What the factory does now, in one line at the top: working on a ticket (and which), running a platform test or
+an architecture review, idle, waiting on people, held by a failing health check, observing, or that the runner
+does not answer. Under it: whether the runner answers and when it last finished a pass, the queue, the tickets
+waiting on people, those in code review, what runs now, the latest test run and architecture review, the health
+checks that fail with their reason (from `events.jsonl`), and Claude's and Codex's subscription usage. The part
+refreshes itself every 15 seconds.
+
+It comes from `runner.db` (read-only), the runner's metrics and the tail of `events.jsonl`. Whatever of these
+cannot be read is said as such, never shown as fine: no database yet, metrics off or not answering, a pass that
+ended more than 15 minutes ago ("stuck"), a `config.yaml` that does not load.
+
+## Grafana
+
+**Monitoring** opens Grafana at `/grafana/` on the console's address. nginx asks the console who the visitor is
+before each request; without a session it sends them to the sign-in. Grafana gets the person's email in
+`X-WEBAUTH-USER`, as a Viewer, or an Admin for the console's admins, and makes their Grafana user on the first
+visit. nginx writes those headers from the console's answer over anything the browser sent, and Grafana takes
+them only from 127.0.0.1. With the console on, Grafana's anonymous viewing is off; the SSH tunnel still reaches
+it, and its admin password (`~/arceus/data/grafana-admin-password`) still signs in there.
 
 ## People and roles
 
