@@ -273,7 +273,9 @@ class Delivery:
         self._fetched: dict[tuple, tuple[tuple, list[materials.Material]]] = {}
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
         self.reviewer = None  # code_review.ReviewAgent, set by the loop: its runs hold the workspace too
-        self.qa = None  # qa.QaAgent, set by the loop: a test run of the platform holds the workspace too
+        # The background agents (workspace_run.py: qa.QaAgent, architect.ArchitectAgent), set by the loop: their runs
+        # hold the workspace too.
+        self.background: list = []
 
     def taken(self, task: Task, comment_id: str) -> None:
         """Mark a person's command the runner has just taken with a reaction, so they see it is queued. Journaled
@@ -348,8 +350,8 @@ class Delivery:
         if not can_take or self.workspace_taken():
             return
         if self.store.has_pending_review() or self._continues_waiting() or (self.reviewer and self.reviewer.waiting()) \
-                or (self.qa and self.qa.waiting()):
-            return  # fixes for open MRs, resumed tasks, requested code reviews and test runs go first
+                or any(a.waiting() for a in self.background):
+            return  # fixes for open MRs, resumed tasks, requested code reviews and background runs go first
         for decision in self.store.accepted_untaken():
             if self.skipped(decision):
                 continue
@@ -625,9 +627,10 @@ class Delivery:
         reviewed = self.reviewer.holding() if self.reviewer else None
         if reviewed is not None:
             return reviewed
-        tested = self.qa.holding() if self.qa else None
-        if tested is not None:
-            return tested
+        for agent in self.background:
+            run = agent.holding()
+            if run is not None:
+                return run
         return next((t for t in self.store.tasks(*ACTIVE_STATES) if task is None or t.task_id != task.task_id), None)
 
     def _workspace_waits(self, task: Task) -> bool:
@@ -757,8 +760,8 @@ class Delivery:
         if task.state == "claimed":
             if show is None:  # crashed between taking it and the dispatch, or released by a security reviewer
                 if any(t.task_id != task.task_id for t in self.store.tasks("dispatched", "publishing")) \
-                        or (self.reviewer and self.reviewer.holding()) or (self.qa and self.qa.holding()):
-                    return  # another task, a code review or a test run works in the shared workspace: this one waits
+                        or (self.reviewer and self.reviewer.holding()) or any(a.holding() for a in self.background):
+                    return  # another task, a code review or a background run works in the shared workspace: it waits
                 self._take(task, self._group(), self.tracker.issue(task.task_id))
                 return
             # The engine has it: the dispatch went through before a crash. Start the clock now if the

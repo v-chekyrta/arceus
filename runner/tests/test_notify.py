@@ -409,11 +409,11 @@ def test_a_code_review_is_told_when_it_starts_and_with_its_result_per_merge_requ
 
 
 def test_a_test_run_of_the_platform_is_told_when_it_starts_and_ends_with_its_summary(b):
-    run = b.store.add_qa_run("schedule", "schedule", slot="2026-10-20T02:00:00+03:00")
+    run = b.store.add_run("qa", "schedule", "schedule", slot="2026-10-20T02:00:00+03:00")
     b.events.emit("qa_dispatched", task_id=run.id, run=run.n, source="schedule", by="schedule")
     [started] = b.flush()
     assert started.startswith("🧪 Platform test started: run 1, on schedule.")
-    b.store.update_qa_run(run.id, state="done", outcome="found", result=json.dumps(
+    b.store.update_run(run.id, state="done", outcome="found", result=json.dumps(
         {"summary": "Checked sign-in and checkout. <!channel> Checkout with a discount code fails.",
          "findings": [{}, {}]}))
     b.events.emit("qa_published", task_id=run.id, run=run.n, outcome="found", findings=2,
@@ -429,8 +429,8 @@ def test_a_test_run_of_the_platform_is_told_when_it_starts_and_ends_with_its_sum
     [quiet] = b.flush()
     assert "*the platform test, run 1*" in quiet and "yt.example" not in quiet
     # A run that checked nothing is told as unfinished with the runner's reason, however its summary sounds.
-    again = b.store.add_qa_run("command", "ops")
-    b.store.update_qa_run(again.id, state="done", outcome="unfinished",
+    again = b.store.add_run("qa", "command", "ops")
+    b.store.update_run(again.id, state="done", outcome="unfinished",
                           reason="every check was skipped: nothing was tested",
                           result=json.dumps({"summary": "All good.", "findings": []}))
     b.events.emit("qa_published", task_id=again.id, run=again.n, outcome="unfinished", findings=0, url="u")
@@ -440,13 +440,82 @@ def test_a_test_run_of_the_platform_is_told_when_it_starts_and_ends_with_its_sum
 
 
 
+def test_an_architecture_review_is_told_with_what_is_new_fixed_and_what_codex_thinks(b):
+    run = b.store.add_run("arch", "schedule", "schedule", slot="2026-10-25T03:00:00+02:00")
+    b.events.emit("arch_dispatched", task_id=run.id, run=run.n, source="schedule", by="schedule")
+    [started] = b.flush()
+    assert started.startswith("🏛 Architecture review started: run 1, on schedule.")
+    b.store.update_run(run.id, state="done", outcome="found", result=json.dumps(
+        {"summary": "Billing grew a retry of its own.", "findings": [{}, {}],
+         "ledger": {"new": [3], "still": [1], "fixed": [2]},
+         "second_opinion": {"status": "done", "verdicts": {"1": {"verdict": "confirmed"},
+                                                           "2": {"verdict": "rejected"}}}}))
+    b.events.emit("arch_published", task_id=run.id, run=run.n, outcome="found", findings=2, url="http://localhost:3301/1/")
+    [told] = b.flush()
+    assert told.startswith("🏛 Architecture review: 2 findings: run 1 (1 new, 1 still open, 1 fixed).")
+    assert "Second check: confirmed 1 of 2." in told and "Billing grew a retry of its own." in told
+    assert "Codex" not in told
+    assert "Report (through the SSH tunnel): http://localhost:3301/1/" in told
+    b.events.emit("agent_quiet", task_id=run.id, minutes=20, ts="t1")
+    [quiet] = b.flush()
+    assert "*the architecture review, run 1*" in quiet and "yt.example" not in quiet
+    # Codex missing is said, never counted as agreement.
+    again = b.store.add_run("arch", "command", "ops")
+    b.store.update_run(again.id, state="done", outcome="found", result=json.dumps(
+        {"summary": "", "findings": [{}], "second_opinion": {"status": "unavailable", "why": "quota"}}))
+    b.events.emit("arch_published", task_id=again.id, run=again.n, outcome="found", findings=1, url="u")
+    [missing] = b.flush()
+    assert "The second check of the findings did not run: see the report." in missing
+    assert "confirmed" not in missing and "Codex" not in missing
+
+
+def test_a_background_run_started_by_the_command_does_not_name_the_servers_user(b):
+    for kind, head in (("qa", "🧪 Platform test started: run 1."), ("arch", "🏛 Architecture review started: run 1.")):
+        run = b.store.add_run(kind, "command", "ai")
+        b.events.emit(f"{kind}_dispatched", task_id=run.id, run=run.n, source="command", by="ai")
+        [started] = b.flush()
+        assert started.splitlines()[0] == head and "ai" not in started.splitlines()[0]
+
+
+def test_code_in_a_summary_shows_as_code_and_a_cut_inside_it_is_closed(b):
+    summary = "The retry is in billing/retry.py:12 and `send()`. " + "The client in `" + "x" * 700 + "` too."
+    run = b.store.add_run("arch", "command", "ops")
+    b.store.update_run(run.id, state="done", outcome="found", result=json.dumps({"summary": summary, "findings": [{}]}))
+    b.events.emit("arch_published", task_id=run.id, run=run.n, outcome="found", findings=1, url="u")
+    [told] = b.flush()
+    said = told.splitlines()[1]
+    assert said.startswith("The retry is in `billing/retry.py:12` and `send()`.")
+    assert said.count("`") % 2 == 0
+
+
+def test_a_skipped_second_check_is_said_without_a_count(b):
+    run = b.store.add_run("arch", "command", "ops")
+    b.store.update_run(run.id, state="done", outcome="found", result=json.dumps(
+        {"summary": "", "findings": [{}, {}], "second_opinion": {"status": "skipped", "why": "the run was stopped"}}))
+    b.events.emit("arch_published", task_id=run.id, run=run.n, outcome="found", findings=2, url="u")
+    [told] = b.flush()
+    assert "The second check of the findings was skipped: the run was stopped." in told
+    assert "confirmed" not in told
+
+
+def test_a_fenced_block_in_a_summary_stays_one_and_a_cut_inside_it_is_closed(b):
+    run = b.store.add_run("arch", "command", "ops")
+    summary = "Before ```one``` and `two`. The wrapper is ```" + "y" * 700 + "``` here."
+    b.store.update_run(run.id, state="done", outcome="found", result=json.dumps({"summary": summary, "findings": [{}]}))
+    b.events.emit("arch_published", task_id=run.id, run=run.n, outcome="found", findings=1, url="u")
+    [told] = b.flush()
+    said = told.splitlines()[1]
+    assert said.startswith("Before ```one``` and `two`.")
+    assert said.count("```") % 2 == 0 and said.replace("```", "").count("`") % 2 == 0
+
+
 def test_a_long_test_run_summary_is_told_in_whole_sentences(b):
     # Run 1 on the server: a five-sentence summary was cut at 600 characters in the middle of a word.
     first = "I tested the piloting work merged on Dev in the last two weeks as six roles. " * 3
     summary = first + "I found 4 major problems: a terminated request can still be edited through the API. " + \
         "I also found 5 minor UI and copy problems. " * 12
-    run = b.store.add_qa_run("command", "ops")
-    b.store.update_qa_run(run.id, state="done", outcome="found",
+    run = b.store.add_run("qa", "command", "ops")
+    b.store.update_run(run.id, state="done", outcome="found",
                           result=json.dumps({"summary": summary, "findings": [{}] * 9}))
     b.events.emit("qa_published", task_id=run.id, run=run.n, outcome="found", findings=9, url="u")
     [told] = b.flush()

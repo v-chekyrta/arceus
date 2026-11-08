@@ -20,7 +20,7 @@
       "id": 1,
       "type": "stat",
       "title": "Agent",
-      "description": "Working while a task holds the agent (taken, in Bulava, or being published) or a code review has the workspace; Testing while a test run of the platform has it (arceus-runner qa run, or qa.schedule). It says nothing about whether the agent is moving; see Step, Agent quiet and Runner loop.",
+      "description": "Working while a task holds the agent (taken, in Bulava, or being published) or a code review has the workspace; Testing while a test run of the platform has it (arceus-runner qa run, or qa.schedule); Reviewing architecture while an architecture review has it (arceus-runner arch run, or architect.schedule). It says nothing about whether the agent is moving; see Step, Agent quiet and Runner loop.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -62,20 +62,25 @@
             {
               "type": "value",
               "options": {
+                "3": {
+                  "text": "Reviewing architecture",
+                  "color": "#c98500",
+                  "index": 0
+                },
                 "2": {
                   "text": "Testing",
                   "color": "#199e70",
-                  "index": 0
+                  "index": 1
                 },
                 "1": {
                   "text": "Working",
                   "color": "#3987e5",
-                  "index": 1
+                  "index": 2
                 },
                 "0": {
                   "text": "Idle",
                   "color": "#898781",
-                  "index": 2
+                  "index": 3
                 }
               }
             }
@@ -721,7 +726,7 @@
       "id": 11,
       "type": "table",
       "title": "Tasks in progress",
-      "description": "Every task that is not over: taken, running, being published, waiting for an answer, in review; and a test run of the platform, queued or under way (qa-<n>, state testing: …).",
+      "description": "Every task that is not over: taken, running, being published, waiting for an answer, in review; and a test run of the platform or an architecture review, queued or under way (qa-<n>, state testing: …; arch-<n>, state reviewing architecture: …).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -879,7 +884,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{source=~\"runner|bulava\", event=~\"task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|review_.*|qa_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|created|attempt-started|attempt-ended|stale-verdict\"} | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{else if eq .event \"engine_step\"}}step  {{.task_id}}  {{.stage}} · {{.state}}{{with .note}}  — {{.}}{{end}}{{with .ms_taken}}  ({{.}} ms){{end}}{{else if eq .event \"agent_activity\"}}agent  {{.task_id}}  {{.tools}} tool calls, last {{.last_tool}}{{with .last_target}}: {{.}}{{end}}{{else if eq .event \"agent_quiet\"}}agent  {{.task_id}}  nothing written for {{.minutes}} min{{with .step}} (step {{.}}){{end}}{{else if eq .event \"engine_state\"}}engine  {{.task_id}}  {{.state}}, attempt {{.attempt}}{{if and (eq .state \"running\") (eq .attempt_live \"false\")}}, no live session{{end}}{{with .state_reason}}  — {{.}}{{end}}{{else if eq .event \"engine_call_started\"}}{{.call}}  {{.task_id}}  started{{else if eq .event \"engine_call_finished\"}}{{.call}}  {{.task_id}}  {{.result}} in {{.seconds}} s{{with .reason}}  — {{.}}{{end}}{{else}}{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .repo}}  {{.}}{{end}}{{with .seconds}}  {{.}} s{{end}}{{with .reason}}  — {{.}}{{end}}{{with .url}}  {{.}}{{end}}{{end}}`",
+          "expr": "{source=~\"runner|bulava\", event=~\"task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|review_.*|qa_.*|arch_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|created|attempt-started|attempt-ended|stale-verdict\"} | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{else if eq .event \"engine_step\"}}step  {{.task_id}}  {{.stage}} · {{.state}}{{with .note}}  — {{.}}{{end}}{{with .ms_taken}}  ({{.}} ms){{end}}{{else if eq .event \"agent_activity\"}}agent  {{.task_id}}  {{.tools}} tool calls, last {{.last_tool}}{{with .last_target}}: {{.}}{{end}}{{else if eq .event \"agent_quiet\"}}agent  {{.task_id}}  nothing written for {{.minutes}} min{{with .step}} (step {{.}}){{end}}{{else if eq .event \"engine_state\"}}engine  {{.task_id}}  {{.state}}, attempt {{.attempt}}{{if and (eq .state \"running\") (eq .attempt_live \"false\")}}, no live session{{end}}{{with .state_reason}}  — {{.}}{{end}}{{else if eq .event \"engine_call_started\"}}{{.call}}  {{.task_id}}  started{{else if eq .event \"engine_call_finished\"}}{{.call}}  {{.task_id}}  {{.result}} in {{.seconds}} s{{with .reason}}  — {{.}}{{end}}{{else}}{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .repo}}  {{.}}{{end}}{{with .seconds}}  {{.}} s{{end}}{{with .reason}}  — {{.}}{{end}}{{with .url}}  {{.}}{{end}}{{end}}`",
           "datasource": {
             "type": "loki",
             "uid": "loki"

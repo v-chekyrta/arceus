@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from arceus_runner import media
+from arceus_runner.literals import spans
 
 HEADS = {"passed": "No problems found", "partial": "No problems in what was checked; some could not be checked",
          "found": None, "blocked": "Could not test",
@@ -54,6 +55,7 @@ main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
 a { color: var(--blue); text-underline-offset: 2px; }
 a:focus-visible, summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 3px; }
 code { font: 0.875em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+code.lit { padding: 0 4px; border-radius: 4px; background: var(--bg); border: 1px solid var(--line); }
 h1 { font-size: 1.75rem; line-height: 1.2; margin: 0 0 4px; letter-spacing: -0.01em; }
 h2 { font-size: 1.15rem; margin: 40px 0 12px; }
 h3 { font-size: 1.05rem; line-height: 1.35; margin: 0; }
@@ -130,6 +132,12 @@ def e(value: object) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
+def rich(value: object) -> str:
+    """An agent's text as HTML: escaped, with the code in it (backticks, file paths) set as code (literals.py)."""
+    return "".join(e(p) if kind == "text" else f'<code class="lit">{e(p)}</code>'
+                   for p, kind in spans(str(value or "")))
+
+
 def _when(iso: str | None, tz: ZoneInfo) -> str:
     if not iso:
         return ""
@@ -156,16 +164,17 @@ def head_of(outcome: str | None, findings: int) -> str:
     return HEADS.get(outcome or "", None) or "In progress"
 
 
-def _page(title: str, body: str) -> str:
+def _page(title: str, body: str, style: str = "") -> str:
+    """A whole page: its styles inline (the reports' own, then `style`), nothing loaded from elsewhere."""
     return (f'<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-            f'<meta name="robots" content="noindex">\n<title>{e(title)}</title>\n<style>{STYLE}</style>\n</head>\n'
-            f'<body>\n<main>\n{body}\n</main>\n</body>\n</html>\n')
+            f'<meta name="robots" content="noindex">\n<title>{e(title)}</title>\n<style>{STYLE}{style}</style>\n'
+            f'</head>\n<body>\n<main>\n{body}\n</main>\n</body>\n</html>\n')
 
 
 def _shot(s: dict) -> str:
     src = f"media/{e(s['file'])}"
-    caption = f"<figcaption>{e(s['caption'])}</figcaption>" if s.get("caption") else ""
+    caption = f"<figcaption>{rich(s['caption'])}</figcaption>" if s.get("caption") else ""
     if s.get("kind") == "video":
         thing = f'<video src="{src}" controls preload="metadata"></video>'
     else:
@@ -182,7 +191,7 @@ def _finding(i: int, f: dict) -> str:
             tries += ", may be intermittent"
     meta = [x for x in (tries, f'<a href="{e(f["url"])}">{e(f["url"])}</a>' if f.get("url") else "") if x]
     parts = [f'<article class="finding" id="f{i}">',
-             f'<header><h3>{e(f["title"])}</h3><span class="tag {e(sev)}">{SEVERITY_WORDS.get(sev, e(sev))}</span>'
+             f'<header><h3>{rich(f["title"])}</h3><span class="tag {e(sev)}">{SEVERITY_WORDS.get(sev, e(sev))}</span>'
              f'</header>']
     if meta:
         parts.append(f'<p class="meta">{"<br>".join(meta)}</p>')
@@ -195,14 +204,14 @@ def _finding(i: int, f: dict) -> str:
         for n, step in enumerate(f["steps"], 1):
             cls = ' class="failed"' if f.get("failed_step") == n else ""
             shots = by_step.get(n) or []
-            parts.append(f'<li{cls}><span class="text">{e(step)}</span>'
+            parts.append(f'<li{cls}><span class="text">{rich(step)}</span>'
                          + (f'<div class="shots">{"".join(_shot(s) for s in shots)}</div>' if shots else "")
                          + "</li>")
         parts.append("</ol>")
     if f.get("expected") or f.get("actual"):
         parts.append('<div class="compare">'
-                     f'<div><h4>Expected</h4><p>{e(f.get("expected")) or "Not said"}</p></div>'
-                     f'<div class="actual"><h4>Actual</h4><p>{e(f.get("actual")) or "Not said"}</p></div></div>')
+                     f'<div><h4>Expected</h4><p>{rich(f.get("expected")) or "Not said"}</p></div>'
+                     f'<div class="actual"><h4>Actual</h4><p>{rich(f.get("actual")) or "Not said"}</p></div></div>')
     if loose:
         parts.append(f'<div class="shots">{"".join(_shot(s) for s in loose)}</div>')
     if f.get("cause") or f.get("code"):
@@ -213,7 +222,7 @@ def _finding(i: int, f: dict) -> str:
             label = f"<code>{e(where)}</code>" + (f" at <code>{e(c['sha'][:12])}</code>" if c.get("sha") else "")
             code.append(f'<li><a href="{e(c["url"])}">{label}</a></li>' if c.get("url") else f"<li>{label}</li>")
         parts.append('<div class="cause"><h4>Suspected cause in the code, not confirmed</h4>'
-                     + (f"<p>{e(f['cause'])}</p>" if f.get("cause") else "")
+                     + (f"<p>{rich(f['cause'])}</p>" if f.get("cause") else "")
                      + (f"<ul>{''.join(code)}</ul>" if code else "") + "</div>")
     parts.append("</article>")
     return "\n".join(parts)
@@ -224,8 +233,9 @@ def render_run(view: dict, project: str, tz: ZoneInfo) -> str:
     its steps, its screenshots at the step they show, expected against actual, and the suspected cause."""
     findings = view.get("findings") or []
     outcome = view.get("outcome")
-    by = "on schedule" if view.get("source") == "schedule" else f"by {view.get('requested_by')}"
-    facts = [("Started", f"{_when(view.get('started_at') or view.get('created_at'), tz)}, {by}"),
+    # Who typed the command on the server is the runner's own user: only the schedule says something.
+    by = ", on schedule" if view.get("source") == "schedule" else ""
+    facts = [("Started", f"{_when(view.get('started_at') or view.get('created_at'), tz)}{by}"),
              ("Finished", _when(view.get("finished_at"), tz)),
              ("Took", _took(view.get("started_at"), view.get("finished_at")))]
     ins = view.get("instructions") or {}
@@ -236,9 +246,9 @@ def render_run(view: dict, project: str, tz: ZoneInfo) -> str:
             f'<p class="verdict {e(outcome)}">{e(head_of(outcome, len(findings)))}</p>',
             '<dl class="facts">' + "".join(f"<dt>{e(k)}</dt><dd>{e(v)}</dd>" for k, v in facts if v) + "</dl>"]
     if view.get("summary"):
-        body.append(f'<p class="summary">{e(view["summary"])}</p>')
+        body.append(f'<p class="summary">{rich(view["summary"])}</p>')
     if view.get("blocked"):
-        body.append(f'<div class="alert"><p><strong>Could not test:</strong> {e(view["blocked"])}</p></div>')
+        body.append(f'<div class="alert"><p><strong>Could not test:</strong> {rich(view["blocked"])}</p></div>')
     fatal = view.get("fatal") or []
     if fatal:
         body.append('<div class="alert"><p><strong>The run did not finish as it should.</strong> What is below is '
@@ -253,7 +263,7 @@ def render_run(view: dict, project: str, tz: ZoneInfo) -> str:
     if tested:
         body.append('<ul class="checks">' + "".join(
             f'<li><span class="tag {e(t["result"])}">{RESULT_WORDS.get(t["result"], e(t["result"]))}</span>'
-            f'<span>{e(t["what"])}' + (f'<span class="note">{e(t["note"])}</span>' if t.get("note") else "")
+            f'<span>{rich(t["what"])}' + (f'<span class="note">{rich(t["note"])}</span>' if t.get("note") else "")
             + "</span></li>" for t in tested) + "</ul>")
     else:
         body.append('<p class="empty">The agent did not say what it checked.</p>')
@@ -295,14 +305,14 @@ def render_index(rows: list[dict], project: str, tz: ZoneInfo) -> str:
         else:
             result = head_of(r["outcome"], r["findings"])
         run = f'<a href="{e(r["n"])}/">Run {e(r["n"])}</a>' if r.get("has_report") else f"Run {e(r['n'])}"
-        summary = f'<span class="run-summary">{e(r["summary"])}</span>' if r.get("summary") else ""
-        by = "Schedule" if r["source"] == "schedule" else e(r["requested_by"])
+        summary = f'<span class="run-summary">{rich(r["summary"])}</span>' if r.get("summary") else ""
+        by = "Schedule" if r["source"] == "schedule" else "Command"
         cls = e(r["outcome"]) if r["state"] == "done" else ""
         trs.append(f'<tr><td class="nowrap">{run}</td><td><span class="{cls}">{e(result)}</span>{summary}</td>'
                    f"<td class=\"hide-narrow nowrap\">{e(_when(r.get('started_at') or r.get('created_at'), tz))}</td>"
                    f"<td class=\"hide-narrow\">{by}</td></tr>")
     body.append('<table><thead><tr><th>Run</th><th>Result</th><th class="hide-narrow">Started</th>'
-                '<th class="hide-narrow">Started by</th></tr></thead><tbody>' + "".join(trs) + "</tbody></table>")
+                '<th class="hide-narrow">How</th></tr></thead><tbody>' + "".join(trs) + "</tbody></table>")
     return _page(f"Platform tests of {project}", "\n".join(body))
 
 
@@ -334,6 +344,8 @@ class _Handler(BaseHTTPRequestHandler):
     index: Callable[[], str] | None = None
     server_version = "arceus-qa"
     sys_version = ""
+    csp = ("default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; "
+           "form-action 'none'")
 
     def do_GET(self) -> None:  # noqa: N802 (the stdlib's name)
         bare = self.path.split("?", 1)[0]
@@ -357,8 +369,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store" if kind.startswith("text/html") else "max-age=86400")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; "
-                                                    "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'")
+        self.send_header("Content-Security-Policy", self.csp)
         self.end_headers()
         self.wfile.write(data)
 

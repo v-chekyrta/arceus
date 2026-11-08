@@ -1,4 +1,4 @@
-"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind | slack-test | qa."""
+"""Command line: arceus-runner check | run | probe-bulava | doctor | cleanup | rebind | slack-test | qa | arch."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
 from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, is_legacy, load_config, load_secrets
-from arceus_runner.db import ACTIVE_STATES, QA_UNDER_WAY, AlreadyRunning, InstanceLock, ReviewStore
+from arceus_runner.db import ACTIVE_STATES, RUN_UNDER_WAY, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
 from arceus_runner.engine import Engine
 from arceus_runner.health import claude_checks, engine_doctor, local_checks
@@ -23,7 +23,7 @@ from arceus_runner.events import EventLog
 from arceus_runner.integrations import build_code_host, build_tracker
 from arceus_runner.loop import IntegrationChanged, LiveModeUnavailable, make_cleanup, require_mode_ready, run
 from arceus_runner.notify import test_message, webhook_state
-from arceus_runner.qa import read_instructions
+from arceus_runner.workspace_run import read_instructions
 from arceus_runner.slack import Webhook
 
 EXIT_OK = 0
@@ -70,6 +70,7 @@ def cmd_check(args) -> int:
     checks.append(claude_checks(cfg, probe))
     checks.append(review_agent_check(cfg))
     checks.append(qa_check(cfg))
+    checks.append(architect_check(cfg))
     checks.append(project_notes_check(cfg))
     if not args.offline:
         checks += run_online_checks(cfg, secrets)
@@ -102,6 +103,22 @@ def qa_check(cfg: Config) -> Check:
         return Check("config.qa", "fail", f"on ({when}), but {why}: a run would only report that")
     return Check("config.qa", "ok", f"on ({when}); instructions {q.instructions}; reports on "
                                     f"http://{q.address}:{q.port}/")
+
+
+def architect_check(cfg: Config) -> Check:
+    """Whether architecture reviews can start: their optional instructions, what they look at and when they run
+    (architect.py). The runner's own criteria stand without instructions, so an empty file is no failure."""
+    a = cfg.architect
+    if not a.enabled:
+        return Check("config.architect", "ok", "off")
+    when = (f"`arceus-runner arch run`, and {', '.join(a.schedule.days)} at {a.schedule.at:%H:%M} "
+            f"({cfg.schedule.timezone})") if a.schedule else "`arceus-runner arch run` only"
+    text, why = read_instructions(a.instructions, required=False)
+    if text is None:
+        return Check("config.architect", "fail", f"on ({when}), but {why}: a run would only report that")
+    told = f"instructions {a.instructions}" if text else "the runner's criteria only (no instructions written)"
+    codex = "with Codex's second opinion" if a.second_opinion else "without a second opinion"
+    return Check("config.architect", "ok", f"on ({when}); {told}; {codex}; reports on http://{a.address}:{a.port}/")
 
 
 def review_agent_check(cfg: Config) -> Check:
@@ -222,64 +239,73 @@ def cmd_rebind(args) -> int:
     return EXIT_OK
 
 
-def cmd_qa(args) -> int:
-    """Test runs of the platform (qa.py): queue one, show the latest, or stop one. The runner does the rest."""
+# The background agents' commands: config section, what a run is called, the folder of its reports in words.
+RUN_COMMANDS = {"qa": ("qa", "test run", "No test runs yet."),
+                "arch": ("architect", "architecture review", "No architecture reviews yet.")}
+
+
+def cmd_runs(args) -> int:
+    """Runs of a background agent (workspace_run.py): queue one, show the latest, or stop one. The runner does the
+    rest."""
+    kind = args.kind
+    section, noun, none = RUN_COMMANDS[kind]
     cfg = load_config(_config_path(args.config))
-    if args.action == "run" and not cfg.qa.enabled:
-        print("qa: off in config.yaml (qa.enabled: false); nothing was queued", file=sys.stderr)
+    c = getattr(cfg, section)
+    if args.action == "run" and not c.enabled:
+        print(f"{kind}: off in config.yaml ({section}.enabled: false); nothing was queued", file=sys.stderr)
         return EXIT_CHECK_FAILED
     if args.action == "status":
         try:
             store = ReviewStore.read_only(cfg.paths.db)
         except (FileNotFoundError, RuntimeError) as e:
-            print(f"qa: {e}", file=sys.stderr)
+            print(f"{kind}: {e}", file=sys.stderr)
             return EXIT_CHECK_FAILED
     else:
         store = ReviewStore(cfg.paths.db)
     try:
         if args.action == "run":
-            under_way = store.qa_runs(*QA_UNDER_WAY)
+            under_way = store.runs(kind, *RUN_UNDER_WAY)
             if under_way:
                 r = under_way[0]
-                print(f"qa: run {r.n} is {'queued' if r.state == 'pending' else 'under way'}; nothing more was "
-                      "queued. `arceus-runner qa stop` stops it.", file=sys.stderr)
+                print(f"{kind}: run {r.n} is {'queued' if r.state == 'pending' else 'under way'}; nothing more was "
+                      f"queued. `arceus-runner {kind} stop` stops it.", file=sys.stderr)
                 return EXIT_CHECK_FAILED
             who = os.environ.get("SUDO_USER") or getpass.getuser()
-            run = store.add_qa_run("command", who)
+            run = store.add_run(kind, "command", who)
             if cfg.mode != "live":
-                print(f"qa: the runner is in mode: {cfg.mode}, which starts nothing; run {run.n} waits until it is "
+                print(f"{kind}: the runner is in mode: {cfg.mode}, which starts nothing; run {run.n} waits until it is "
                       "live", file=sys.stderr)
             print(f"Run {run.n} queued. The runner starts it once the workspace is free; the report will be at "
-                  f"http://localhost:{cfg.qa.port}/{run.n}/ (through the SSH tunnel).")
+                  f"http://localhost:{c.port}/{run.n}/ (through the SSH tunnel).")
             return EXIT_OK
         if args.action == "stop":
-            runs = [store.qa_run(f"qa-{args.n}")] if args.n else store.qa_runs(*QA_UNDER_WAY)
-            runs = [r for r in runs if r and r.state in QA_UNDER_WAY]
+            runs = [store.run(f"{kind}-{args.n}")] if args.n else store.runs(kind, *RUN_UNDER_WAY)
+            runs = [r for r in runs if r and r.state in RUN_UNDER_WAY]
             if not runs:
-                print("qa: no such run is queued or under way", file=sys.stderr)
+                print(f"{kind}: no such run is queued or under way", file=sys.stderr)
                 return EXIT_CHECK_FAILED
             for r in runs:
-                store.update_qa_run(r.id, stop_requested=1)
+                store.update_run(r.id, stop_requested=1)
                 print(f"Run {r.n}: asked to stop. The runner stops it on its next pass and writes its report.")
             return EXIT_OK
-        runs = store.qa_runs(limit=args.last)
+        runs = store.runs(kind, limit=args.last)
         if args.json:
             print(json.dumps([vars(r) | {"result": json.loads(r.result) if r.result else None} for r in runs],
                              ensure_ascii=False, indent=2))
             return EXIT_OK
         if not runs:
-            print("No test runs yet. `arceus-runner qa run` queues one.")
+            print(f"{none} `arceus-runner {kind} run` queues one.")
             return EXIT_OK
         for r in runs:
             found = len(json.loads(r.result or "{}").get("findings") or [])
             what = r.outcome if r.state == "done" else r.state
-            what += f", {found} problem{'s' if found != 1 else ''}" if r.state == "done" and found else ""
+            what += f", {found} finding{'s' if found != 1 else ''}" if r.state == "done" and found else ""
             what += ", stop asked" if r.stop_requested and r.state != "done" else ""
             by = "schedule" if r.source == "schedule" else r.requested_by
             print(f"run {r.n}: {what} (by {by}, queued {r.created_at}"
                   + (f", finished {r.finished_at}" if r.finished_at else "") + ")"
                   + (f": {r.reason}" if r.reason and r.state == "done" else ""))
-        print(f"Reports: http://localhost:{cfg.qa.port}/ (through the SSH tunnel)")
+        print(f"Reports: http://localhost:{c.port}/ (through the SSH tunnel)")
         return EXIT_OK
     finally:
         store.close()
@@ -350,9 +376,9 @@ def _cleanup_now(cfg: Config, as_json: bool) -> int:
                 print(f"cleanup: the code review {review.id} holds the workspace ({review.state}); not now",
                       file=sys.stderr)
                 return EXIT_CHECK_FAILED
-            testing = store.qa_holding()
-            if testing:
-                print(f"cleanup: the test run {testing.id} holds the workspace ({testing.state}); not now",
+            holding = store.run_holding()
+            if holding:
+                print(f"cleanup: the run {holding.id} holds the workspace ({holding.state}); not now",
                       file=sys.stderr)
                 return EXIT_CHECK_FAILED
             engine = Engine(cfg) if bulava_mod.probe(cfg.paths.bulava).installed else None
@@ -464,15 +490,20 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("slack-test", help="post one test message to the project's channel through the webhook")
     st.set_defaults(fn=cmd_slack_test)
 
-    q = sub.add_parser("qa", help="test runs of the platform: queue one, see the latest, stop one")
-    qsub = q.add_subparsers(dest="action", required=True)
-    qsub.add_parser("run", help="queue a test run of the platform by qa.instructions")
-    qs = qsub.add_parser("status", help="the latest runs and how they ended")
-    qs.add_argument("--last", type=int, default=10, help="how many runs (default 10)")
-    qs.add_argument("--json", action="store_true")
-    qx = qsub.add_parser("stop", help="stop the queued or running test run (its report says what it found so far)")
-    qx.add_argument("n", nargs="?", type=int, help="the run's number (default: the one under way)")
-    q.set_defaults(fn=cmd_qa)
+    for kind, help_, run_help in (
+            ("qa", "test runs of the platform: queue one, see the latest, stop one",
+             "queue a test run of the platform by qa.instructions"),
+            ("arch", "architecture reviews: queue one, see the latest, stop one",
+             "queue a review of the repositories that changed since the last one")):
+        q = sub.add_parser(kind, help=help_)
+        qsub = q.add_subparsers(dest="action", required=True)
+        qsub.add_parser("run", help=run_help)
+        qs = qsub.add_parser("status", help="the latest runs and how they ended")
+        qs.add_argument("--last", type=int, default=10, help="how many runs (default 10)")
+        qs.add_argument("--json", action="store_true")
+        qx = qsub.add_parser("stop", help="stop the queued or running one (its report says what it found so far)")
+        qx.add_argument("n", nargs="?", type=int, help="the run's number (default: the one under way)")
+        q.set_defaults(fn=cmd_runs, kind=kind)
 
     b = sub.add_parser("probe-bulava", help="which agreed contracts the installed engine advertises")
     b.add_argument("--root", help="engine directory (default: paths.bulava from config)")

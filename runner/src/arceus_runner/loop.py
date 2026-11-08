@@ -25,11 +25,14 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from arceus_runner import bulava as bulava_mod
+from arceus_runner import arch_report
+from arceus_runner import architect as architect_mod
 from arceus_runner import qa as qa_mod
 from arceus_runner import qa_report
 from arceus_runner.checks import Check
 from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Situation
 from arceus_runner.code_review import ReviewAgent
+from arceus_runner.architect import ArchitectAgent
 from arceus_runner.qa import QaAgent
 from arceus_runner.config import Config, Schedule, Secrets
 from arceus_runner.db import ACTIVE_STATES, InstanceLock, ReviewStore, TaskStore
@@ -131,7 +134,9 @@ class Runner:
             self.reviewer = ReviewAgent(self.delivery)
             self.delivery.reviewer = self.reviewer
             self.qa = QaAgent(self.delivery)
-            self.delivery.qa = self.qa
+            self.architect = ArchitectAgent(self.delivery)
+            self.background = [self.qa, self.architect]
+            self.delivery.background = self.background
         self.progress = ProgressWatcher(cfg.paths.bulava_state, cfg.paths.workspace, store, events, now,
                                         quiet_after=cfg.limits.agent_quiet_after) if self.delivery else None
         self.last_tick: float | None = None  # wall clock of the last finished tick, for the metrics
@@ -290,8 +295,9 @@ class Runner:
             # Reconcile with `task show` every poll_local, then take new work if nothing is running.
             self.delivery.reconcile()
             self.reviewer.reconcile()  # code reviews under way: followed, the workspace put back, published
-            self.qa.reconcile()  # test runs under way: followed, the workspace put back, the report written
-            self.qa.queue_scheduled()
+            for agent in self.background:
+                agent.reconcile()  # runs under way: followed, the workspace put back, the report written
+                agent.queue_scheduled()
             if self.delivery.published and self.code_host.client.available() and self.tracker.client.available():
                 # A task published in this tick has MR notes this tick's poll could not see (they were written
                 # while it worked): read them now, so its fixes go before the next ticket as they should.
@@ -302,7 +308,8 @@ class Runner:
             if can_take:
                 self.delivery.send_continue()  # a resumed task is new work for the workspace
             self.reviewer.start(can_take)  # a requested code review, before a new ticket
-            self.qa.start(can_take)  # a queued test run of the platform, before a new ticket too
+            for agent in self.background:
+                agent.start(can_take)  # a queued test run or architecture review, before a new ticket too
             self.delivery.maybe_start(can_take)
         elif local_due:
             self.clean_up(False, started)  # observe: nothing runs; the pass only reports
@@ -339,7 +346,7 @@ class Runner:
             any(not self.delivery.skipped(d) for d in self.store.accepted_untaken())
             or self.delivery._continues_waiting()
             or self.reviewer.waiting()
-            or self.qa.waiting()
+            or any(a.waiting() for a in self.background)
             or (hasattr(self.store, "has_pending_review") and self.store.has_pending_review())))
         try:
             self.cleanup.maybe_run(Situation(holder, waiting, self.health.get("disk_free") in ("warn", "fail"),
@@ -369,7 +376,7 @@ class Runner:
         if self.health.get(f"service.{self.tracker.client.name}") != "ok" or not self.can_take():
             return "unknown"
         if any(not self.delivery.skipped(d) for d in self.store.accepted_untaken()) or self.reviewer.waiting() \
-                or self.qa.waiting():
+                or any(a.waiting() for a in self.background):
             return "working"  # taken on this tick or the next
         if self.store.tasks("needs_input", "security_hold"):
             return "waiting"
@@ -425,6 +432,13 @@ def run(cfg: Config, secrets: Secrets, once: bool = False) -> int:
                                                  index=lambda: qa_mod.index_page(cfg))
             stack.callback(stop_reports)
             events.emit("qa_reports_served", address=cfg.qa.address, port=port, folder=str(cfg.qa.reports))
+        if cfg.architect.enabled:
+            # The architecture reviews' pages, built from runner.db on every visit; decisions are taken there.
+            a = cfg.architect
+            port, stop_reports = arch_report.serve(a.reports, a.address, a.port, architect_mod.pages(cfg, host),
+                                                   architect_mod.decider(cfg, events))
+            stack.callback(stop_reports)
+            events.emit("arch_reports_served", address=a.address, port=port, folder=str(a.reports))
         cleanup = make_cleanup(cfg, store, events, engine) if cfg.cleanup.enabled else None
         if cleanup:
             cleanup.recover()

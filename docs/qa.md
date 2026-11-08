@@ -17,4 +17,4 @@ Off by default (`qa.enabled: false`). With it on, the agent tests the whole plat
 
 Reports are served on `127.0.0.1:3300` (`qa.port`): `ssh -L 3300:127.0.0.1:3300 <user>@<vm>`, then `http://localhost:3300/`. The list is read from the database on every visit, so queued and running runs show at once. Only reports and their screenshots are served, never the instructions.
 
-**Slack and Grafana.** The channel hears when a run starts (by whom, or on schedule) and how it ended, with the agent's two or three lines and the report's link. On **Arceus · now** the agent shows as Testing, and the run is listed as `qa-<n>`.
+**Slack and Grafana.** The channel hears when a run starts (and whether the schedule started it) and how it ended, with the agent's two or three lines and the report's link. On **Arceus · now** the agent shows as Testing, and the run is listed as `qa-<n>`.

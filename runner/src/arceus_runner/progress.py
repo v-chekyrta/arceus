@@ -135,9 +135,9 @@ class ProgressWatcher:
         # A code review runs as an engine task of its own (<ticket key>.review-<n>) while its ticket waits in
         # code_review: it is followed by that id, like any dispatched task. Only while the engine has it: before
         # the dispatch there are no steps yet, and once it is restoring the workspace the run's steps are over.
-        # A test run of the platform (qa-<n>) the same way.
+        # A background agent's run (qa-<n>, arch-<n>) the same way.
         active = {t.task_id for t in self.store.tasks("dispatched")} | {r.id for r in self.store.reviews("running")} \
-            | {r.id for r in self.store.qa_runs("running")}
+            | {r.id for r in self.store.runs(None, "running")}
         for gone in set(self.tasks) - active:
             # Over, or waiting on a person: nothing runs, nothing more to show. The steps the engine wrote
             # since the last look (the gate's verdict that ended the attempt) are read once more first.

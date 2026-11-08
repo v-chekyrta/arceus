@@ -117,6 +117,7 @@ Grafana, Prometheus and Loki listen on 127.0.0.1 only. Open them through an SSH 
 ```bash
 ssh -L 3000:127.0.0.1:3000 <user>@<vm>        # then http://localhost:3000
 ssh -L 3000:127.0.0.1:3000 -L 3300:127.0.0.1:3300 <user>@<vm>   # with the test runs' reports (qa) too
+ssh -L 3000:127.0.0.1:3000 -L 3301:127.0.0.1:3301 <user>@<vm>   # with the architecture reviews (architect) too
 ```
 
 Viewing needs no login. The admin password is in `~/arceus/data/grafana-admin-password`. There are three dashboards in the **Arceus** folder:
@@ -192,6 +193,7 @@ The parts the operator configures but rarely reads end to end:
 - [docs/task-lifecycle.md](../docs/task-lifecycle.md): how a ticket goes in `live`, from the tag to the merged MR, `/continue`, research tickets, who pushes and describes the MR;
 - [docs/reviews.md](../docs/reviews.md): Claude checks before Codex (`bulava.claude_checks`) and code review on request (`review_agent`);
 - [docs/qa.md](../docs/qa.md): testing the platform (`qa`);
+- [docs/architect.md](../docs/architect.md): architecture reviews (`architect`);
 - [docs/cleanup.md](../docs/cleanup.md): what the runner removes between tasks and how to switch it on (`cleanup`);
 - [docs/security.md](../docs/security.md): the security screen (`security`) and the trust boundary;
 - [docs/agent-instructions.md](../docs/agent-instructions.md): the server notes, the project's notes and how they reach the agent;

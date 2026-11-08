@@ -210,6 +210,35 @@ class Git:
         out = self._run(["diff", "--name-only", "-z", f"{default}...{sha}"], repo).stdout
         return [f for f in out.split("\0") if f]
 
+    def commit_before(self, repo: Path, ref: str, when: str) -> str | None:
+        """The newest commit of `ref` made before `when` (ISO time, by commit date); None when it has none that old."""
+        res = self._run(["rev-list", "-1", f"--before={when}", ref], repo, check=False)
+        return res.stdout.strip() or None
+
+    def files_between(self, repo: Path, base: str | None, sha: str, deleted: bool = False) -> list[str]:
+        """The files `sha` adds or changes since where it left `base` (with `deleted`, the ones it deletes); every
+        file of `sha` without a base."""
+        if base is None:
+            out = "" if deleted else self._run(["ls-tree", "-r", "--name-only", "-z", sha], repo).stdout
+        else:
+            out = self._run(["-c", "diff.renameLimit=0", "diff", "--name-only", "-z", "--no-renames",
+                             f"--diff-filter={'D' if deleted else 'd'}", f"{base}...{sha}"], repo).stdout
+        return [f for f in out.split("\0") if f]
+
+    def commit_count(self, repo: Path, base: str | None, sha: str) -> int:
+        out = self._run(["rev-list", "--count", f"{base}..{sha}" if base else sha], repo).stdout.strip()
+        return int(out or 0)
+
+    def blob_lines(self, repo: Path, sha: str, path: str) -> int | None:
+        """How many lines the file has at `sha`: None when there is no such file there, 0 for an empty or a binary
+        one. `path` may come from an agent: it only ever names an object, never a file on disk."""
+        kind = self._run(["cat-file", "-t", f"{sha}:{path}"], repo, check=False)
+        if kind.returncode != 0 or kind.stdout.strip() != "blob":
+            return None
+        res = self._run(["grep", "-c", "-I", "-e", "", sha, "--", f":(literal){path}"], repo, check=False)
+        out = res.stdout.strip()
+        return int(out.rsplit(":", 1)[1]) if out else 0
+
     def switch(self, repo: Path, ref: str) -> None:
         """Check out a branch, or a commit (detached), that the repository already has."""
         self._run(["checkout", "--quiet", ref], repo)

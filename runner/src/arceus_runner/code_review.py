@@ -142,7 +142,8 @@ def _auto_of(row) -> str:
     return row.comment_id.split("-", 2)[2]
 
 
-def _glob(pattern: str) -> re.Pattern:
+def path_glob(pattern: str) -> re.Pattern:
+    """A path pattern as a regular expression: `**` crosses folders, `*` and `?` do not; case is ignored."""
     out, i = [], 0
     while i < len(pattern):
         if pattern.startswith("**/", i):
@@ -165,7 +166,7 @@ def _glob(pattern: str) -> re.Pattern:
 
 def attention_matches(files: list[str], patterns: list[str]) -> dict[str, str]:
     """Changed file → the `attention_paths` pattern it matches. A pattern without `/` matches the file name."""
-    compiled = [(p, _glob(p)) for p in patterns]
+    compiled = [(p, path_glob(p)) for p in patterns]
     out: dict[str, str] = {}
     for f in files:
         name = f.rsplit("/", 1)[-1]

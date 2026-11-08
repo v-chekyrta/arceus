@@ -49,6 +49,7 @@ import contextlib
 import hashlib
 import json
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -58,10 +59,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from arceus_runner.arch_report import second_check
 from arceus_runner.checks import Check
 from arceus_runner.config import Backoff, Config, Schedule
 from arceus_runner.db import ACTIVE_STATES, Task, TaskStore
 from arceus_runner.events import EventLog
+from arceus_runner.literals import balanced, marked
 from arceus_runner.slack import Webhook
 
 # Who goes first when several wait: a person is needed > a task moved > the runner's own news > routine.
@@ -73,6 +76,12 @@ QA_HEADS = {"passed": "✅ Platform test found no problems",
             "found": "🐞 Platform test found {n} problem{s}",
             "blocked": "⛔️ Platform test could not test", "unfinished": "⚠️ Platform test did not finish",
             "stopped": "⏹ Platform test stopped"}
+# A finished architecture review (architect.py).
+ARCH_HEADS = {"clean": "✅ Architecture review found nothing to raise",
+              "partial": "☑️ Architecture review found nothing to raise in what it read, but did not read everything",
+              "found": "🏛 Architecture review: {n} finding{s}",
+              "unchanged": "⚪️ Architecture review: nothing changed since the last one",
+              "unfinished": "⚠️ Architecture review did not finish", "stopped": "⏹ Architecture review stopped"}
 REVIEW_HEADS = {"approved": "✅ Code review approved", "attention": "👀 Code review approved, a person has to look first",
                 "ready": "☑️ Code review found no problems, not everything is approved", "changes": "🛠 Code review: changes needed",
                 "unverified": "⚠️ Code review could not confirm", "nothing": "⚪️ Code review: nothing left to review",
@@ -88,9 +97,9 @@ TEXT_LIMIT = 600
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
-def is_qa(task_id: object) -> bool:
-    """A test run of the platform (qa.py), not a ticket: its engine task is qa-<n>."""
-    return isinstance(task_id, str) and task_id.startswith("qa-")
+def is_run(task_id: object) -> bool:
+    """A background agent's run (workspace_run.py), not a ticket: its engine task is qa-<n> or arch-<n>."""
+    return isinstance(task_id, str) and re.fullmatch(r"(?:qa|arch)-\d+", task_id) is not None
 
 
 def esc(text: object) -> str:
@@ -115,6 +124,20 @@ def clip_sentences(text: object, limit: int = TEXT_LIMIT) -> str:
         return head[:end + 1] + " …"
     cut = head[:limit].rsplit(" ", 1)[0] if " " in head[:limit] else head[:limit]
     return cut.rstrip(",;:") + "…"
+
+
+def summary_text(text: object, limit: int = TEXT_LIMIT) -> str:
+    """An agent's summary for the channel: its code (paths, names) in backticks, as Slack shows code, cut at whole
+    sentences, and a code span the cut fell into closed."""
+    text = marked(" ".join(str(text or "").split()))
+    clipped = clip_sentences(text, limit)
+    return balanced(clipped) if clipped != text else clipped
+
+
+def started_how(r: dict) -> str:
+    """How a background run was started, when that says something: the schedule. Who typed the command on the
+    server is the runner's own user, which tells the channel nothing."""
+    return ", on schedule" if r.get("source") == "schedule" else ""
 
 
 def ago(seconds: float) -> str:
@@ -447,8 +470,9 @@ class Notifier:
 
     def line(self, task_id: str, task: Task | None = None) -> str:
         """The ticket as a link with its title: `ACME-12 Fix the login form`; a test run as its number."""
-        if is_qa(task_id):
-            return f"*the platform test, run {esc(task_id.removeprefix('qa-'))}*"
+        if is_run(task_id):
+            kind, n = task_id.split("-", 1)
+            return f"*the {'platform test' if kind == 'qa' else 'architecture review'}, run {esc(n)}*"
         task = task or self.store.task(task_id)
         key = task_id.split(".review-")[0]
         link = f"*<{self.issue_url(key)}|{esc(key)}>*"
@@ -470,7 +494,7 @@ class Notifier:
             if handler:
                 handler(record)
             task_id = record.get("task_id")
-            if isinstance(task_id, str) and ".review-" not in task_id and not is_qa(task_id):
+            if isinstance(task_id, str) and ".review-" not in task_id and not is_run(task_id):
                 # At once, not at the end of the tick: a task can pass through a state within one tick (answered,
                 # then finished) and each step is told. Inside the caller's transaction when it has one, so the
                 # telling stands or falls with the state change.
@@ -539,12 +563,11 @@ class Notifier:
         self.put(f"review:{row.id}:published", "review_published", TRANSITION, "\n".join(lines), task_id=row.task_id)
 
     def _on_qa_dispatched(self, r: dict) -> None:
-        by = "on schedule" if r.get("source") == "schedule" else f"by {esc(r.get('by'))}"
         self.put(f"qa:{r['task_id']}:started", "qa_started", TRANSITION,
-                 f"🧪 Platform test started: run {esc(r.get('run'))}, {by}.")
+                 f"🧪 Platform test started: run {esc(r.get('run'))}{started_how(r)}.")
 
     def _on_qa_published(self, r: dict) -> None:
-        run = self.store.qa_run(r["task_id"]) if hasattr(self.store, "qa_run") else None
+        run = self.store.run(r["task_id"]) if hasattr(self.store, "run") else None
         if run is None:
             return
         n = int(r.get("findings") or 0)
@@ -553,12 +576,41 @@ class Notifier:
         lines = [f"{head}: run {run.n}."]
         said = (result.get("blocked") if run.outcome == "blocked" else "") or result.get("summary")
         if said:
-            lines.append(esc(clip_sentences(said, 600)))
+            lines.append(esc(summary_text(said, 600)))
         if run.reason and run.outcome not in ("found", "passed", "partial"):
             # Why this is not a clean result, in the runner's words: the agent's summary may sound like one.
             lines.append(f"Why: {esc(clip(run.reason, 300))}")
         lines.append(f"Report (through the SSH tunnel): {r.get('url')}")
         self.put(f"qa:{run.id}:published", "qa_published", TRANSITION, "\n".join(lines))
+
+    def _on_arch_dispatched(self, r: dict) -> None:
+        self.put(f"arch:{r['task_id']}:started", "arch_started", TRANSITION,
+                 f"🏛 Architecture review started: run {esc(r.get('run'))}{started_how(r)}.")
+
+    def _on_arch_published(self, r: dict) -> None:
+        run = self.store.run(r["task_id"]) if hasattr(self.store, "run") else None
+        if run is None:
+            return
+        result = json.loads(run.result or "{}")
+        n = len(result.get("findings") or [])
+        head = ARCH_HEADS.get(run.outcome or "", "🏛 Architecture review finished").format(n=n, s="s" if n != 1 else "")
+        ledger = result.get("ledger") or {}
+        counts = [f"{len(ledger[k])} {w}" for k, w in (("new", "new"), ("still", "still open"), ("fixed", "fixed"))
+                  if ledger.get(k)]
+        lines = [f"{head}: run {run.n}" + (f" ({', '.join(counts)})." if counts else ".")]
+        so = result.get("second_opinion") or {}
+        if so.get("status") == "done":
+            lines.append(f"Second check: {second_check(so, n)}.")
+        elif so.get("status") == "unavailable":
+            lines.append("The second check of the findings did not run: see the report.")
+        elif so.get("status") == "skipped":
+            lines.append(f"The second check of the findings was skipped: {esc(so.get('why') or 'no reason given')}.")
+        if result.get("summary"):
+            lines.append(esc(summary_text(result["summary"], 600)))
+        if run.reason and run.outcome not in ("found", "clean", "partial", "unchanged"):
+            lines.append(f"Why: {esc(clip(run.reason, 300))}")
+        lines.append(f"Report (through the SSH tunnel): {r.get('url')}")
+        self.put(f"arch:{run.id}:published", "arch_published", TRANSITION, "\n".join(lines))
 
     def _on_agent_activity(self, r: dict) -> None:
         a = self.activity.setdefault(r["task_id"], Activity())
@@ -580,7 +632,7 @@ class Notifier:
                  f"🤫 {self.line(r['task_id'])}: the agent has written nothing for {r.get('minutes')} min{step}. "
                  f"It may be stuck; an attempt with no result after {timeout} is stopped.",
                  task_id=r["task_id"],
-                 live_while={"state": "dispatched"} if ".review-" not in r["task_id"] and not is_qa(r["task_id"]) else None)
+                 live_while={"state": "dispatched"} if ".review-" not in r["task_id"] and not is_run(r["task_id"]) else None)
 
     def _on_attempt_paused_for_limit(self, r: dict) -> None:
         limits = ", ".join(esc(x).replace("_", " ") for x in r.get("limits") or []) or "a usage limit"

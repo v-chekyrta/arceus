@@ -204,6 +204,31 @@ qa:
   timeout: 8h                                      # past it the run is stopped and reported as unfinished
   port: 3300                                       # 127.0.0.1 only (qa.address)
 
+# Optional. The agent reviews how the code fits together and reports what is worth a person's decision (architect.py,
+# docs/architect.md). `arceus-runner arch run` queues a review; `schedule` queues one by itself (weekly is enough).
+# A review reads only the repositories that changed since the last one, holds the workspace like a test run (plan
+# both for nights without tickets, on different days), and changes nothing. Codex checks the findings before the
+# report goes out. Reports and the decisions on findings: http://localhost:3301/ through the SSH tunnel.
+architect:
+  enabled: false
+  # Optional: the runner's own criteria work without it. setup.sh creates it once from
+  # config/architect-instructions.example.md, as comments only.
+  instructions: ~/arceus/data/architect/instructions.md
+  reports: ~/arceus/data/architect/runs              # a folder per run: report.html, result.json
+  # schedule: { days: [sun], at: "03:00" }           # schedule.timezone; none: only by the command
+  timeout: 4h
+  # Patterns of repository paths in the group; `repo:path` patterns name paths in a repository.
+  # repos: []                    # which repositories are reviewed at all; empty: every one
+  # skip: []                     # never reviewed: generated code, vendored copies, e.g. ["*:**/migrations/**"]
+  # not_ours: []                 # code the team builds on but does not own (an upstream platform, a fork of one):
+  #                              # read for context, never to be changed; edits inside it that could live outside
+  #                              # are raised, since the next upgrade undoes them
+  first_look: 30d                # the first review looks at what changed this long before it
+  max_findings: 7                # per review, the most important first
+  second_opinion: true           # Codex reads the findings against the code before the report goes out
+  second_opinion_timeout: 20m
+  port: 3301                     # 127.0.0.1 only (architect.address)
+
 # What agents leave behind: containers, test volumes, dev servers, files in the repositories, old media.
 # A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than
 # limits.continue_window): by the label arceus.task=<KEY> the agent puts on it, by its place

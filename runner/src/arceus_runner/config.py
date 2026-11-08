@@ -537,8 +537,8 @@ class ReviewAgentConfig(Strict):
         return v
 
 
-class QaSchedule(Strict):
-    """When a test run of the platform is queued by itself: these days, at this time of `schedule.timezone`."""
+class RunSchedule(Strict):
+    """When a background agent queues a run by itself: these days, at this time of `schedule.timezone`."""
     days: list[Weekday] = Field(min_length=1)
     at: time
 
@@ -552,10 +552,48 @@ class QaConfig(Strict):
     # starts and kept with the run, so a later edit never changes what a run was asked.
     instructions: ExpandedPath = Path("~/arceus/data/qa/instructions.md").expanduser()
     reports: ExpandedPath = Path("~/arceus/data/qa/runs").expanduser()
-    schedule: QaSchedule | None = None    # none: runs start only by the command
+    schedule: RunSchedule | None = None    # none: runs start only by the command
     timeout: Duration = timedelta(hours=8)  # the run's own; past it the run is stopped and reported as unfinished
     address: str = "127.0.0.1"            # the reports page; never open it outside
     port: int = Field(default=3300, ge=0, le=65535)  # 0: any free port (tests). Loki has 3100, Grafana 3000
+
+
+class ArchitectConfig(Strict):
+    """The agent reviews how the code fits together (architect.py): `arceus-runner arch run`, or `schedule`, queues
+    a review of the repositories that changed since the last one; each run gets a report of its own under `reports`,
+    and what it finds is kept across runs for a person to decide on, on the reports page at `address:port`."""
+    enabled: bool = False
+    # Optional: the runner's own criteria stand without it. What to look at harder, what to leave alone, the team's
+    # rules. Read when a run starts and kept with the run.
+    instructions: ExpandedPath = Path("~/arceus/data/architect/instructions.md").expanduser()
+    reports: ExpandedPath = Path("~/arceus/data/architect/runs").expanduser()
+    schedule: RunSchedule | None = None   # none: runs start only by the command
+    timeout: Duration = timedelta(hours=4)
+    # Which repositories of the group are reviewed at all: patterns of their paths in the group. Empty: every one.
+    repos: list[str] = []
+    # `<repository pattern>` or `<repository pattern>:<path pattern>`: never reviewed, not even read as a change
+    # (generated code, vendored copies, dependencies kept in the group).
+    skip: list[str] = []
+    # The same patterns: code the team builds on but does not own (an upstream platform, a fork kept in step with
+    # its origin). Read for context; a finding never asks to change it, and a change the team made inside it is a
+    # finding when it could have lived outside, where the next upgrade will not undo it.
+    not_ours: list[str] = []
+    # The first review, with nothing to compare with, looks at what changed in this long before it.
+    first_look: Duration = timedelta(days=30)
+    max_findings: int = Field(default=7, ge=1, le=20)
+    # Codex reads the findings against the code before the report goes out and says whether each holds.
+    second_opinion: bool = True
+    second_opinion_timeout: Duration = timedelta(minutes=20)
+    address: str = "127.0.0.1"            # the reports page; never open it outside
+    port: int = Field(default=3301, ge=0, le=65535)  # 0: any free port (tests). The test runs' page has 3300
+
+    @field_validator("repos", "skip", "not_ours")
+    @classmethod
+    def _patterns(cls, v: list[str]) -> list[str]:
+        if any(not p.strip() or p.startswith("/") or p.count(":") > 1 for p in v):
+            raise ValueError("patterns are paths in the group, `repo` or `repo:path`: no empty ones, none starting "
+                             "with /, at most one :")
+        return v
 
 
 class CleanupProtect(Strict):
@@ -668,6 +706,7 @@ class Config(Strict):
     security: SecurityConfig = SecurityConfig()
     review_agent: ReviewAgentConfig = ReviewAgentConfig()
     qa: QaConfig = QaConfig()
+    architect: ArchitectConfig = ArchitectConfig()
     cleanup: CleanupConfig = CleanupConfig()
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
@@ -690,6 +729,13 @@ class Config(Strict):
             raise ValueError(f"security.reviewers must not contain the bot itself ({self.tracker.bot_user})")
         if len(set(s.reviewers)) != len(s.reviewers):
             raise ValueError("security.reviewers has duplicates")
+        return self
+
+    @model_validator(mode="after")
+    def _report_ports(self) -> Config:
+        q, a = self.qa, self.architect
+        if q.enabled and a.enabled and q.port and q.port == a.port and q.address == a.address:
+            raise ValueError(f"qa.port and architect.port are both {q.port}: each reports page needs a port of its own")
         return self
 
 

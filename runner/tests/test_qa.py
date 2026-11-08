@@ -50,7 +50,7 @@ def w(tmp_path):
 
 
 def queue(w: World, by: str = "ops") -> None:
-    w.store.add_qa_run("command", by)
+    w.store.add_run("qa", "command", by)
     w.tick()
 
 
@@ -105,7 +105,7 @@ def test_a_queued_run_is_a_task_of_its_own_with_the_instructions_and_the_code_at
     extra = w.cfg.paths.db.parent / "tasks" / RID / "extra-dirs.txt"
     assert str(w.repo) in extra.read_text()
     assert not (extra.parent / "writable-directories.txt").exists()
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert run.state == "running"
     assert (w.cfg.qa.reports / "1" / "instructions.md").read_text() == w.cfg.qa.instructions.read_text()
     # It holds the workspace: a ticket waits for it.
@@ -119,7 +119,7 @@ def test_a_finished_run_gets_its_report_and_the_workspace_back(w):
     queue(w)
     report(w)
     finish(w)
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert (run.state, run.outcome) == ("done", "found")
     folder = w.cfg.qa.reports / "1"
     page = (folder / "report.html").read_text()
@@ -147,7 +147,7 @@ def test_a_run_that_could_not_test_says_so_and_never_passes(w):
     queue(w)
     report(w, findings=[], tested=[], blocked="The site answers 502 on every page.")
     finish(w)
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert run.outcome == "blocked"
     assert "Could not test" in (w.cfg.qa.reports / "1" / "report.html").read_text()
 
@@ -155,7 +155,7 @@ def test_a_run_that_could_not_test_says_so_and_never_passes(w):
 def test_a_run_without_a_findings_file_is_unfinished(w):
     queue(w)
     finish(w)
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert run.outcome == "unfinished"
     result = json.loads(run.result)
     assert "the agent wrote no findings file" in result["problems"]
@@ -166,7 +166,7 @@ def test_a_run_that_failed_in_the_engine_is_unfinished_whatever_it_wrote(w):
     queue(w)
     report(w)
     finish(w, state="failed", state_reason="stalled")
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert run.outcome == "unfinished" and "stalled" in run.reason
     page = (w.cfg.qa.reports / "1" / "report.html").read_text()
     assert "did not finish as it should" in page and "Reset link gives 404" in page
@@ -177,7 +177,7 @@ def test_without_instructions_nothing_is_dispatched_and_the_report_says_why(tmp_
     try:
         queue(w)
         assert dispatches(w) == []
-        run = w.store.qa_run(RID)
+        run = w.store.run(RID)
         assert (run.state, run.outcome) == ("done", "unfinished")
         assert "does not exist" in run.reason
         assert "does not exist" in (w.cfg.qa.reports / "1" / "report.html").read_text()
@@ -194,7 +194,7 @@ def test_the_example_as_setup_installs_it_is_empty_and_never_tested(tmp_path):
         assert check.status == "fail" and "empty (comments only)" in check.detail
         queue(w)
         assert dispatches(w) == []
-        run = w.store.qa_run(RID)
+        run = w.store.run(RID)
         assert (run.state, run.outcome) == ("done", "unfinished") and "empty (comments only)" in run.reason
     finally:
         w.events.close()
@@ -230,9 +230,9 @@ def test_the_agent_gets_the_instructions_without_their_comments_and_the_run_keep
 def test_stop_ends_the_run_and_keeps_what_it_found(w):
     queue(w)
     report(w)
-    w.store.update_qa_run(RID, stop_requested=1)
+    w.store.update_run(RID, stop_requested=1)
     w.tick()
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert (run.state, run.outcome) == ("done", "stopped")
     assert ["stop", str(w.cfg.paths.workspace)] in [c["argv"] for c in w.calls("night-shift")]
     assert "Reset link gives 404" in (w.cfg.qa.reports / "1" / "report.html").read_text()
@@ -240,22 +240,22 @@ def test_stop_ends_the_run_and_keeps_what_it_found(w):
 
 
 def test_a_queued_run_that_is_stopped_never_starts(w):
-    w.store.add_qa_run("command", "ops")
-    w.store.update_qa_run(RID, stop_requested=1)
+    w.store.add_run("qa", "command", "ops")
+    w.store.update_run(RID, stop_requested=1)
     w.tick()
-    assert dispatches(w) == [] and w.store.qa_run(RID).outcome == "stopped"
+    assert dispatches(w) == [] and w.store.run(RID).outcome == "stopped"
 
 
 def test_a_crash_between_dispatch_and_its_record_does_not_dispatch_twice(w):
     queue(w)
-    w.store.update_qa_run(RID, state="preparing")
+    w.store.update_run(RID, state="preparing")
     w.restart()
     w.tick()
-    assert len(dispatches(w)) == 1 and w.store.qa_run(RID).state == "running"
+    assert len(dispatches(w)) == 1 and w.store.run(RID).state == "running"
 
 
 def test_the_run_goes_before_a_queued_ticket(w):
-    w.store.add_qa_run("command", "ops")
+    w.store.add_run("qa", "command", "ops")
     take(w)
     assert [c["argv"][1] for c in w.calls("dispatch")] == [RID]
 
@@ -277,14 +277,14 @@ def test_the_schedule_queues_its_time_once(tmp_path):
     w = world(tmp_path, schedule={"days": ["tue"], "at": "09:30"})
     try:
         w.tick()
-        [run] = w.store.qa_runs()
+        [run] = w.store.runs("qa")
         assert (run.source, run.requested_by) == ("schedule", "schedule")
         report(w)
         finish(w)
         w.restart()
         w.now += timedelta(minutes=10)
         w.tick()
-        assert len(w.store.qa_runs()) == 1  # the same slot: not again, also after a restart
+        assert len(w.store.runs("qa")) == 1  # the same slot: not again, also after a restart
     finally:
         w.events.close()
         w.store.close()
@@ -294,7 +294,7 @@ def test_a_scheduled_time_missed_by_more_than_an_hour_is_not_made_up(tmp_path):
     w = world(tmp_path, schedule={"days": ["tue"], "at": "08:00"})
     try:
         w.tick()
-        assert w.store.qa_runs() == []
+        assert w.store.runs("qa") == []
     finally:
         w.events.close()
         w.store.close()
@@ -365,7 +365,7 @@ def test_a_run_that_did_not_check_everything_never_reads_as_no_problems(w, teste
     queue(w)
     report(w, tested=tested, findings=findings, summary="All good.")
     finish(w)
-    run = w.store.qa_run(RID)
+    run = w.store.run(RID)
     assert run.outcome == outcome
     page = (w.cfg.qa.reports / "1" / "report.html").read_text()
     assert head in page and "No problems found" not in page
@@ -411,11 +411,11 @@ def test_the_list_of_runs_is_there_before_any_run_and_shows_queued_and_running_o
             return r.read().decode()
     try:
         assert "No runs yet" in page()
-        w.store.add_qa_run("command", "ops")
+        w.store.add_run("qa", "command", "ops")
         assert "Run 1" in page() and "Queued" in page() and 'href="1/"' not in page()
         w.tick()
-        assert w.store.qa_run(RID).state == "running" and "Testing now" in page()
-        w.store.add_qa_run("command", "ops")
+        assert w.store.run(RID).state == "running" and "Testing now" in page()
+        w.store.add_run("qa", "command", "ops")
         listed = page()
         assert "Run 2" in listed and "Queued" in listed
         report(w)

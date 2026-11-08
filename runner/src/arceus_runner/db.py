@@ -599,6 +599,58 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 20: the architecture review (architect.py) runs the way test runs do, so both live in one table: `kind` says
+    # which (qa-<n>, arch-<n>; each kind numbered on its own), and `reviewing` is the architecture review's step
+    # between the agent and the report, when Codex gives its second opinion on the findings. `arch_findings` is
+    # what the reviews found, kept across runs: a finding seen again is the same row, and a person's decision on it
+    # (risk accepted, false positive) stays with it until they take it back.
+    """
+    CREATE TABLE agent_runs (
+        id               TEXT PRIMARY KEY,
+        kind             TEXT NOT NULL CHECK (kind IN ('qa', 'arch')),
+        n                INTEGER NOT NULL,
+        source           TEXT NOT NULL CHECK (source IN ('command', 'schedule')),
+        requested_by     TEXT NOT NULL,
+        slot             TEXT,
+        state            TEXT NOT NULL CHECK (state IN ('pending', 'preparing', 'running', 'reviewing', 'restoring',
+                                                        'publishing', 'done')),
+        stop_requested   INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)),
+        snapshot         TEXT NOT NULL DEFAULT '{}',
+        result           TEXT,
+        outcome          TEXT,
+        reason           TEXT,
+        started_at       TEXT,
+        finished_at      TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (kind, n),
+        UNIQUE (kind, slot)
+    );
+    INSERT INTO agent_runs (id, kind, n, source, requested_by, slot, state, stop_requested, snapshot, result, outcome,
+                            reason, started_at, finished_at, created_at, updated_at)
+        SELECT id, 'qa', n, source, requested_by, slot, state, stop_requested, snapshot, result, outcome, reason,
+               started_at, finished_at, created_at, updated_at FROM qa_runs;
+    DROP TABLE qa_runs;
+    CREATE INDEX agent_runs_state ON agent_runs (kind, state);
+    CREATE TABLE arch_findings (
+        n                INTEGER PRIMARY KEY,
+        title            TEXT NOT NULL,
+        body             TEXT NOT NULL,
+        first_run        INTEGER NOT NULL,
+        last_run         INTEGER NOT NULL,
+        status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'fixed')),
+        fixed_run        INTEGER,
+        decision         TEXT CHECK (decision IN ('accepted', 'false_positive')),
+        decision_note    TEXT,
+        decided_at       TEXT,
+        created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -943,16 +995,20 @@ class ReviewRequest:
     updated_at: str = ""
 
 
-# A test run in these states has the shared workspace switched to the code it reads (qa.py).
-QA_HOLDS = ("preparing", "running", "restoring")
-QA_UNDER_WAY = ("pending", *QA_HOLDS, "publishing")
-QA_FIELDS = ("state", "stop_requested", "snapshot", "result", "outcome", "reason", "started_at", "finished_at")
+# A run of a background agent (workspace_run.py: a test run of the platform, an architecture review) in these states
+# has the shared workspace switched to the code it reads.
+RUN_HOLDS = ("preparing", "running", "reviewing", "restoring")
+RUN_UNDER_WAY = ("pending", *RUN_HOLDS, "publishing")
+RUN_FIELDS = ("state", "stop_requested", "snapshot", "result", "outcome", "reason", "started_at", "finished_at")
+RUN_KINDS = ("qa", "arch")
+FINDING_FIELDS = ("title", "body", "last_run", "status", "fixed_run", "decision", "decision_note", "decided_at")
 
 
 @dataclass(frozen=True)
-class QaRun:
-    id: str              # also the engine task's id: qa-<n>
-    n: int
+class AgentRun:
+    id: str              # also the engine task's id: <kind>-<n>
+    kind: str            # qa | arch
+    n: int               # numbered per kind
     source: str          # command | schedule
     requested_by: str
     slot: str | None     # the scheduled time it was queued for
@@ -960,10 +1016,26 @@ class QaRun:
     stop_requested: int
     snapshot: str        # JSON: the instructions, the commits read, how to put the workspace back
     result: str | None   # JSON: what the run found, as the runner read it
-    outcome: str | None  # passed | found | blocked | unfinished | stopped
+    outcome: str | None  # the kind's own words: qa.OUTCOMES, architect.OUTCOMES
     reason: str | None
     started_at: str | None
     finished_at: str | None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class ArchFinding:
+    n: int                     # shown as #<n>
+    title: str
+    body: str                  # JSON: the finding as the latest run that saw it wrote it
+    first_run: int
+    last_run: int              # the latest review that still saw it
+    status: str                # open | fixed (a later review checked and found it gone)
+    fixed_run: int | None
+    decision: str | None       # a person's: accepted (the risk) | false_positive | None
+    decision_note: str | None  # why, in their words
+    decided_at: str | None
     created_at: str = ""
     updated_at: str = ""
 
@@ -1021,48 +1093,86 @@ class ReviewStore(TaskStore):
         found = self.reviews(*REVIEW_HOLDS)
         return found[0] if found else None
 
-    # -- test runs of the platform (qa.py) --
+    # -- runs of the background agents (workspace_run.py) --
 
-    def add_qa_run(self, source: str, requested_by: str, slot: str | None = None) -> QaRun | None:
-        """A new run, numbered after the earlier ones. None when a run for this scheduled slot exists already."""
+    def add_run(self, kind: str, source: str, requested_by: str, slot: str | None = None) -> AgentRun | None:
+        """A new run of this kind, numbered after its earlier ones. None when a run of the kind for this scheduled
+        slot exists already."""
+        assert kind in RUN_KINDS
         with contextlib.nullcontext() if self.conn.in_transaction else self.transaction():
-            if slot and self.conn.execute("SELECT 1 FROM qa_runs WHERE slot = ?", (slot,)).fetchone():
+            if slot and self.conn.execute("SELECT 1 FROM agent_runs WHERE kind = ? AND slot = ?",
+                                          (kind, slot)).fetchone():
                 return None
-            n = self.conn.execute("SELECT COALESCE(MAX(n), 0) FROM qa_runs").fetchone()[0] + 1
-            self.conn.execute("INSERT INTO qa_runs (id, n, source, requested_by, slot, state) VALUES (?, ?, ?, ?, ?, ?)",
-                              (f"qa-{n}", n, source, requested_by, slot, "pending"))
-        return self.qa_run(f"qa-{n}")
+            n = self.conn.execute("SELECT COALESCE(MAX(n), 0) FROM agent_runs WHERE kind = ?", (kind,)).fetchone()[0] + 1
+            self.conn.execute("INSERT INTO agent_runs (id, kind, n, source, requested_by, slot, state)"
+                              " VALUES (?, ?, ?, ?, ?, ?, ?)", (f"{kind}-{n}", kind, n, source, requested_by, slot,
+                                                                "pending"))
+        return self.run(f"{kind}-{n}")
 
-    def qa_run(self, run_id: str) -> QaRun | None:
-        r = self.conn.execute("SELECT * FROM qa_runs WHERE id = ?", (run_id,)).fetchone()
-        return QaRun(**dict(r)) if r else None
+    def run(self, run_id: str) -> AgentRun | None:
+        r = self.conn.execute("SELECT * FROM agent_runs WHERE id = ?", (run_id,)).fetchone()
+        return AgentRun(**dict(r)) if r else None
 
-    def qa_runs(self, *states: str, limit: int | None = None) -> list[QaRun]:
-        """Oldest first; with `limit`, the newest ones."""
-        q, args = "SELECT * FROM qa_runs", list(states)
+    def runs(self, kind: str | None, *states: str, limit: int | None = None) -> list[AgentRun]:
+        """A kind's runs (every kind's with None), oldest first; with `limit`, the newest ones."""
+        q, args = "SELECT * FROM agent_runs WHERE 1 = 1", []
+        if kind:
+            q += " AND kind = ?"
+            args.append(kind)
         if states:
-            q += f" WHERE state IN ({', '.join('?' * len(states))})"
+            q += f" AND state IN ({', '.join('?' * len(states))})"
+            args += states
         if limit:
-            rows = self.conn.execute(q + " ORDER BY n DESC LIMIT ?", (*args, limit)).fetchall()[::-1]
+            rows = self.conn.execute(q + " ORDER BY created_at DESC, n DESC LIMIT ?", (*args, limit)).fetchall()[::-1]
         else:
-            rows = self.conn.execute(q + " ORDER BY n", args).fetchall()
-        return [QaRun(**dict(r)) for r in rows]
+            rows = self.conn.execute(q + " ORDER BY created_at, n", args).fetchall()
+        return [AgentRun(**dict(r)) for r in rows]
 
-    def update_qa_run(self, run_id: str, **fields) -> QaRun:
-        unknown = set(fields) - set(QA_FIELDS)
+    def update_run(self, run_id: str, **fields) -> AgentRun:
+        unknown = set(fields) - set(RUN_FIELDS)
         if unknown:
             raise ValueError(f"cannot update {unknown}")
         sets = ", ".join(f"{k} = ?" for k in fields)
-        self.conn.execute(f"UPDATE qa_runs SET {sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        self.conn.execute(f"UPDATE agent_runs SET {sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
                           " WHERE id = ?", (*fields.values(), run_id))
-        run = self.qa_run(run_id)
+        run = self.run(run_id)
         assert run is not None
         return run
 
-    def qa_holding(self) -> QaRun | None:
-        """The test run that has the shared workspace now, if any."""
-        found = self.qa_runs(*QA_HOLDS)
+    def run_holding(self, kind: str | None = None) -> AgentRun | None:
+        """The run (of this kind, or of any) that has the shared workspace now, if any."""
+        found = self.runs(kind, *RUN_HOLDS)
         return found[0] if found else None
+
+    # -- what the architecture reviews found (architect.py) --
+
+    def add_finding(self, title: str, body: str, run: int) -> ArchFinding:
+        cur = self.conn.execute("INSERT INTO arch_findings (title, body, first_run, last_run) VALUES (?, ?, ?, ?)",
+                                (title, body, run, run))
+        found = self.finding(cur.lastrowid)
+        assert found is not None
+        return found
+
+    def finding(self, n: int) -> ArchFinding | None:
+        r = self.conn.execute("SELECT * FROM arch_findings WHERE n = ?", (n,)).fetchone()
+        return ArchFinding(**dict(r)) if r else None
+
+    def findings(self, *statuses: str) -> list[ArchFinding]:
+        q, args = "SELECT * FROM arch_findings", list(statuses)
+        if statuses:
+            q += f" WHERE status IN ({', '.join('?' * len(statuses))})"
+        return [ArchFinding(**dict(r)) for r in self.conn.execute(q + " ORDER BY n", args).fetchall()]
+
+    def update_finding(self, n: int, **fields) -> ArchFinding:
+        unknown = set(fields) - set(FINDING_FIELDS)
+        if unknown:
+            raise ValueError(f"cannot update {unknown}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(f"UPDATE arch_findings SET {sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                          " WHERE n = ?", (*fields.values(), n))
+        found = self.finding(n)
+        assert found is not None
+        return found
 
     def task_mrs(self, task_id: str) -> list[TaskMR]:
         rows = self.conn.execute("SELECT * FROM task_mrs WHERE task_id = ? ORDER BY repo", (task_id,)).fetchall()

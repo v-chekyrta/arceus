@@ -14,9 +14,14 @@ from pathlib import Path
 from prometheus_client import CollectorRegistry, Gauge, start_http_server
 
 from arceus_runner import __version__
+from arceus_runner.db import RUN_UNDER_WAY
 
 HEALTH_VALUE = {"ok": 0, "warn": 1, "fail": 2}
 USAGE_FILES = {"claude": "usage.json", "codex": "codex-usage.json"}
+# A background agent's run on the "now" dashboard: its state's word and its title, and runner_agent_busy while it
+# holds the workspace.
+RUN_LABELS = {"qa": ("testing", "Platform test"), "arch": ("reviewing architecture", "Architecture review")}
+BUSY_RUN = {"qa": 2, "arch": 3}
 WINDOWS = {"five_hour": "5h", "seven_day": "7d"}
 
 
@@ -29,7 +34,7 @@ class Metrics:
         self.tasks = Gauge("runner_tasks", "Tasks the runner took, by runner state", ["state"], registry=r)
         self.queue = Gauge("runner_queue_length", "Accepted tickets waiting to be taken", registry=r)
         self.busy = Gauge("runner_agent_busy", "1 while a task or a code review holds the agent, 2 while a test run of "
-                          "the platform does", registry=r)
+                          "the platform does, 3 while an architecture review does", registry=r)
         self.can_take = Gauge("runner_can_take", "1 when health allows new work", registry=r)
         # role: tracker or code_host, so a dashboard reads them whichever provider config.yaml names.
         self.service_up = Gauge("runner_service_up", "1 when the service answers", ["service", "role"], registry=r)
@@ -88,9 +93,10 @@ class Metrics:
             counts[t.state] = counts.get(t.state, 0) + 1
             if t.state not in ("failed", "done", "stopped"):
                 self.task.labels(t.task_id, t.state, t.summary[:80]).set(1)
-        if hasattr(runner.store, "qa_runs"):
-            for run in runner.store.qa_runs("pending", "preparing", "running", "restoring", "publishing"):
-                self.task.labels(run.id, f"testing: {run.state}", f"Platform test, run {run.n}").set(1)
+        if hasattr(runner.store, "runs"):
+            for run in runner.store.runs(None, *RUN_UNDER_WAY):
+                doing, what = RUN_LABELS[run.kind]
+                self.task.labels(run.id, f"{doing}: {run.state}", f"{what}, run {run.n}").set(1)
         self.tasks.clear()
         for state, n in counts.items():
             self.tasks.labels(state).set(n)
@@ -111,9 +117,10 @@ class Metrics:
         # A code review is a record of its own: its ticket sits in code_review, waiting on people, while the
         # review has the workspace and the engine.
         busy = store.tasks("claimed", "dispatched", "publishing") or store.review_holding()
-        # A test run of the platform holds the workspace and the engine too; the dashboard says Testing for it.
-        testing = hasattr(store, "qa_holding") and store.qa_holding()
-        self.busy.set(2 if testing else 1 if busy else 0)
+        # A background agent's run holds the workspace and the engine too; the dashboard says Testing or Reviewing
+        # architecture for it.
+        run = store.run_holding() if hasattr(store, "run_holding") else None
+        self.busy.set(BUSY_RUN[run.kind] if run else 1 if busy else 0)
 
     def update_cleanup(self, cleanup) -> None:
         self.cleanup_ok.clear()
