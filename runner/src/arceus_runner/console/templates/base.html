@@ -11,7 +11,7 @@
 <body>
 <header class="bar">
   <div class="bar-in">
-    <a class="brand" href="/">Arceus{% if project %} <span>{{ project }}</span>{% endif %}</a>
+    <a class="brand" href="/">Arceus{% if project %} <span title="{{ project }}">{{ project }}</span>{% endif %}</a>
     {% if user %}
     <nav class="sections" aria-label="Sections"><ul class="nav">
       {% for href, label, here in nav %}
@@ -23,7 +23,7 @@
       {% endfor %}
     </ul></nav>
     <div class="who">
-      <a href="/account/" title="Your account">{{ user.name }}</a>
+      <a href="/account/" title="Your account: {{ user.name }}">{{ user.name }}</a>
       <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="linkish" type="submit">Sign out</button></form>
     </div>
     {% endif %}

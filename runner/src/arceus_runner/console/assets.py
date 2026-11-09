@@ -14,22 +14,34 @@ CONSOLE_CSS = """
 body { min-height: 100vh; display: flex; flex-direction: column; }
 main { width: 100%; max-width: 1040px; flex: 1 0 auto; }
 .bar { background: var(--surface); border-bottom: 1px solid var(--line); }
-.bar-in { max-width: 1040px; margin: 0 auto; padding: 0 16px; display: flex; align-items: center; gap: 4px 20px;
+.bar-in { max-width: 1040px; margin: 0 auto; padding: 0 16px; display: flex; align-items: center; gap: 4px 16px;
           flex-wrap: wrap; min-height: 56px; }
 .brand { display: flex; align-items: baseline; gap: 8px; color: var(--ink); text-decoration: none; font-weight: 700;
          letter-spacing: -0.01em; padding: 14px 0; }
-.brand span { font-weight: 500; color: var(--muted); font-size: 0.9rem; }
-.sections { flex: 1 1 auto; }
+.brand span { font-weight: 500; color: var(--muted); font-size: 0.9rem; min-width: 0; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+.sections { flex: 0 1 auto; }
 .nav { display: flex; flex-wrap: wrap; gap: 2px; margin: 0; padding: 0; list-style: none; }
-.nav a { display: block; padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none;
+.nav a { display: block; padding: 6px 8px; border-radius: 6px; color: var(--muted); text-decoration: none;
          font-size: 0.925rem; font-weight: 500; }
 .nav a:hover { color: var(--ink); background: var(--bg); }
 .nav a[aria-current="page"] { color: var(--ink); background: var(--bg); }
 .external { margin-left: 3px; font-size: 0.8em; opacity: 0.75; }
 .nav .count { display: inline-block; min-width: 1.3rem; margin-left: 4px; padding: 0 6px; border-radius: 999px;
               background: var(--blue); color: #fff; font-size: 0.75rem; line-height: 1.3rem; text-align: center; }
-.who { display: flex; align-items: center; gap: 12px; font-size: 0.9rem; }
-.who a { color: var(--muted); text-decoration: none; }
+/* The name and Sign out keep to the right of the bar. When the sections do not fit beside them (an admin's full
+   list, a long name), the script marks the bar .stack: the name stays on the brand's line and the sections take a
+   line of their own, as on a narrow screen. On that first line the project and the name give way (cut with an
+   ellipsis) so that "Arceus" and Sign out both stay whole, side by side, at any width. */
+.who { display: flex; align-items: center; gap: 12px; font-size: 0.9rem; margin-left: auto; flex: 0 1 auto;
+       min-width: 0; white-space: nowrap; }
+.who a { color: var(--muted); text-decoration: none; max-width: 14rem; overflow: hidden; text-overflow: ellipsis; }
+.who form { flex: none; }
+.bar-in.stack { gap: 0 12px; }
+.bar-in.stack .brand { flex: 1 1 0; min-width: 0; }
+.bar-in.stack .who { max-width: calc(100% - 7rem); }
+.bar-in.stack .sections { order: 3; flex-basis: 100%; }
+.bar-in.stack .nav { margin: 0 -8px 6px; }
 .who a:hover { color: var(--ink); }
 .who form { margin: 0; }
 .linkish { font: inherit; font-size: 0.9rem; color: var(--muted); background: none; border: 0; padding: 0;
@@ -202,6 +214,20 @@ pre.diff .ctx { color: var(--muted); }
 .setting .kind { color: var(--quiet); font-size: 0.8rem; margin-left: 6px; }
 .setting .hint, .group > .hint { display: block; color: var(--muted); font-size: 0.85rem; margin: 4px 0 0; overflow-wrap: anywhere; }
 .setting.default input, .setting.default select, .setting.default textarea { color: var(--muted); }
+/* The settings' choices draw their own arrow: the browser's sits against the border. It is a background, so a click
+   on it is a click on the select. */
+.setting select { appearance: none; -webkit-appearance: none; padding-right: 36px; text-overflow: ellipsis;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%235d6576' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center; background-size: 12px 12px; }
+.setting select:disabled { opacity: 0.6; cursor: not-allowed; }
+@media (prefers-color-scheme: dark) {
+  .setting select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23a2a9b6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+}
+@media (forced-colors: active) {
+  .setting select { appearance: auto; -webkit-appearance: auto; background-image: none; padding-right: 10px; }
+}
 .check { display: inline-flex; gap: 8px; align-items: center; }
 textarea.code.small { min-height: 0; }
 .form-end { padding: 14px 0 0; margin-top: 20px; border-top: 1px solid var(--line); align-items: center; }
@@ -221,9 +247,10 @@ pre.oplog { margin: 0; padding: 12px 14px; max-height: 32rem; overflow: auto; ba
   .roles-help li { grid-template-columns: 1fr; gap: 2px; }
   .settings-groups, .ops-links { grid-template-columns: 1fr; }
   .bar-in { gap: 0 12px; }
+  .brand { flex: 1 1 0; min-width: 0; }
+  .who { max-width: calc(100% - 7rem); }
   .sections { order: 3; flex-basis: 100%; }
-  .nav { margin: 0 -10px 6px; }
-  .who { margin-left: auto; }
+  .nav { margin: 0 -8px 6px; }
   .narrow { margin-top: 2vh; }
 }
 """
@@ -241,6 +268,28 @@ document.addEventListener('click', function (ev) {
   if (navigator.clipboard) navigator.clipboard.writeText(field.value).then(done, function () {});
   else { document.execCommand('copy'); done(); }
 });
+// The bar: the sections in one line with the name and Sign out at the right when they fit, otherwise the sections
+// on a line of their own (.stack). Checked again whenever the bar changes width (window, zoom).
+(function () {
+  var bar = document.querySelector('.bar-in');
+  var brand = bar && bar.querySelector('.brand');
+  var who = bar && bar.querySelector('.who');
+  var sections = bar && bar.querySelector('.sections');
+  var link = sections && sections.querySelector('.nav a');
+  if (!brand || !who || !link) return;
+  var width = -1;
+  var fit = function () {
+    if (bar.clientWidth === width) return;  // only a change of width can change the answer
+    width = bar.clientWidth;
+    bar.classList.remove('stack');
+    var line = brand.getBoundingClientRect().bottom - 1;
+    if (who.getBoundingClientRect().top >= line || sections.getBoundingClientRect().top >= line ||
+        sections.offsetHeight > link.offsetHeight * 1.5) bar.classList.add('stack');
+  };
+  fit();
+  if (window.ResizeObserver) new ResizeObserver(fit).observe(bar);
+  else window.addEventListener('resize', fit);
+})();
 // Buttons that ask first: the question is in data-confirm.
 document.addEventListener('submit', function (ev) {
   var b = ev.submitter;
