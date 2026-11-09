@@ -31,6 +31,8 @@ def setup(tmp_path: Path):
 
 
 def client(settings: Settings, **kw) -> TestClient:
+    if "x-real-ip" in (kw.get("headers") or {}):
+        kw.setdefault("client", ("127.0.0.1", 50000))  # as nginx on the machine, whose X-Real-IP is believed
     return TestClient(create_app(settings), follow_redirects=False, **kw)
 
 
@@ -305,3 +307,57 @@ def test_wrong_current_passwords_on_the_account_page_are_throttled_with_a_messag
         from arceus_runner.console.store import check_password
         row = s.conn.execute("SELECT password FROM users WHERE email = 'owner@example.com'").fetchone()
         assert check_password(PASSWORD, row["password"])
+
+
+def test_a_strangers_wrong_passwords_do_not_keep_the_owner_out(setup):
+    make_admin(setup)
+    attacker = client(setup, headers={"x-real-ip": "6.6.6.6"})  # through nginx, which says who is asking
+    for _ in range(12):
+        post(attacker, "/login", {"email": "owner@example.com", "password": "nope nope nope"})
+    r = post(attacker, "/login", {"email": "owner@example.com", "password": PASSWORD})
+    assert r.status_code == 429  # the attacker's own address waits
+    signed_in(setup, "owner@example.com")  # the owner, from their own address, gets in
+
+
+def test_one_address_cannot_fill_the_list_of_requests(setup):
+    make_admin(setup)
+    c = client(setup, headers={"x-real-ip": "7.7.7.7"})
+    for i in range(5):
+        assert register(c, f"p{i}@example.com", name=f"P {i}").status_code == 200
+    r = register(c, "p5@example.com", name="P 5")
+    assert r.status_code == 400 and "Too many requests for accounts" in r.text
+    with ConsoleStore(setup.db_path) as s:
+        assert s.pending_count() == 5
+    assert register(client(setup, headers={"x-real-ip": "8.8.8.8"}), "q@example.com").status_code == 200
+
+
+@pytest.mark.parametrize("email", ["a\tb@example.com", "a\x00b@example.com", "pétr@example.com", "a b@example.com",
+                                   "a@b", "a@.example.com", "a@example..com", "\n@example.com"])
+def test_an_address_that_could_split_a_header_is_refused(setup, email):
+    from arceus_runner.console.store import valid_email
+    assert not valid_email(email)
+
+
+def test_a_name_keeps_no_control_characters(setup):
+    make_admin(setup)
+    with ConsoleStore(setup.db_path) as s:
+        u = s.register("n@example.com", "Ann\x01\x07 ‮Smith", PASSWORD)
+        assert u.name == "Ann ‮Smith".replace("‮", "") or "\x01" not in u.name
+        assert all(ch.isprintable() for ch in u.name)
+
+
+def test_setup_gets_no_line_it_did_not_mean(setup, capsys):
+    raw = yaml.safe_load(setup.config_path.read_text())
+    raw["console"] = {"enabled": True, "public_url": "https://c.example.com"}
+    raw["qa"] = {"enabled": True, "reports": "/srv/x\nCONSOLE_READ_DIR=/"}
+    setup.config_path.write_text(yaml.safe_dump(raw))
+    assert console_cli.main(["--config", str(setup.config_path), "console", "env"]) == 2
+    out = capsys.readouterr()
+    assert "CONSOLE_READ_DIR=/\n" not in out.out and "line break" in out.err
+
+
+def test_behind_https_browsers_are_told_to_stay_on_https(setup):
+    s = Settings(config_path=setup.config_path, db_path=setup.db_path, public_url="https://console.example.com")
+    r = TestClient(create_app(s), base_url="https://console.example.com").get("/login")
+    assert r.headers["strict-transport-security"] == "max-age=31536000"
+    assert "strict-transport-security" not in client(setup).get("/login").headers

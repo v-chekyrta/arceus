@@ -40,7 +40,7 @@ def grafana_auth(ctx: Ctx) -> Response:
         return PlainTextResponse("", status_code=401)
     headers = {"X-Arceus-User": user.email, "X-Arceus-Role": auth.grafana_role(user),
                "Cache-Control": "no-store"}
-    if user.name.isascii():
+    if user.name.isascii() and user.name.isprintable():
         headers["X-Arceus-Name"] = user.name
     return PlainTextResponse("", headers=headers)
 

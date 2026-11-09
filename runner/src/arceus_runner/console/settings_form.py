@@ -56,6 +56,16 @@ TITLES = {
 # setup.sh, which writes them into systemd units, Docker files or nginx, so setup has to run first.
 SETUP_KEYS = ("console", "paths", "bulava.claude_checks", "bulava.mcp_config", "metrics")
 
+# Settings the console shows and never changes: they decide what runs on the machine (a shell command, the engine,
+# the agent's MCP servers, the files the runner reads its environment and tokens from) or where the tokens go (the
+# tracker's and the code host's address, the names of their tokens, Slack's), and how the console itself is
+# reached. Changed in such a way, the console would be a way to run code on the VM or to send its tokens elsewhere;
+# they are set on the server, over SSH.
+LOCKED_KEYS = ("paths", "health.devstack_check", "bulava.mcp_config", "tracker.type", "tracker.url",
+               "tracker.token_env", "code_host.type", "code_host.url", "code_host.token_env", "code_host.approver",
+               "slack.token_env", "slack.webhook_env", "console", "metrics", "qa.instructions", "qa.reports",
+               "architect.instructions", "architect.reports")
+
 # Folders the console reads (cli._read_dirs): moved outside the data folder, setup.sh mounts them for it.
 MOUNTED_KEYS = ("qa.reports", "qa.instructions", "architect.reports", "architect.instructions")
 
@@ -81,6 +91,10 @@ class Field:
     @property
     def needs_setup(self) -> bool:
         return any(self.name == k or self.name.startswith(k + ".") for k in SETUP_KEYS)
+
+    @property
+    def locked(self) -> bool:
+        return is_locked(self.name)
 
     @property
     def mounted(self) -> bool:
@@ -528,10 +542,40 @@ class Change:
     needs_setup: bool
 
 
+def is_locked(name: str) -> bool:
+    return any(name == k or name.startswith(k + ".") for k in LOCKED_KEYS)
+
+
+def locked_changes(before: str, after: str) -> list[str]:
+    """The locked settings (LOCKED_KEYS) whose value differs between two texts of config.yaml, read the way the
+    runner reads them (the older layout's sections as the new ones)."""
+    from arceus_runner.config import _from_legacy, is_legacy
+
+    def load(text):
+        try:
+            raw = pyyaml.safe_load(text) or {}
+        except pyyaml.YAMLError:
+            return None
+        return _from_legacy(raw) if is_legacy(raw) else raw
+    a, b = load(before), load(after)
+    if a is None or b is None:
+        return []  # not YAML: the runner's own check refuses it anyway
+
+    def pick(d, key):
+        node = d
+        for k in key.split("."):
+            node = node.get(k) if isinstance(node, dict) else None
+        return node
+    return [k for k in LOCKED_KEYS if pick(a, k) != pick(b, k)]
+
+
 def edits(fields: list[Field], form) -> list[tuple[tuple[str, ...], Any]]:
-    """What the form changes: (path, new value) for each field whose value differs from what the page showed."""
+    """What the form changes: (path, new value) for each field whose value differs from what the page showed. The
+    locked settings are not read from the form at all."""
     out = []
     for f in flatten(fields):
+        if f.locked:
+            continue
         did, value = _parse(f, form)
         if did:
             out.append((f.path, value))
@@ -547,9 +591,15 @@ def apply(text: str, fields: list[Field], form, data_dir: Path | None = None) ->
     return Change(new, [".".join(p) for p, _ in changes], needs_setup(text, new, data_dir))
 
 
-def check(text: str) -> list[str]:
+def check(text: str, before: str | None = None) -> list[str]:
     """What the runner would say about this config.yaml: nothing when it loads. A key written twice in one mapping is
-    refused too: PyYAML would quietly take the last one, and the form could not show which one counts."""
+    refused too: PyYAML would quietly take the last one, and the form could not show which one counts. With `before`,
+    a change to a locked setting is refused as well."""
+    if before is not None:
+        locked = locked_changes(before, text)
+        if locked:
+            return [f"{k}: set on the server, not in the console (it decides what runs on the machine or where the "
+                    "tokens go): edit config.yaml over SSH" for k in locked]
     try:
         YAML(typ="rt").load(text)
     except Exception as e:  # ruamel's DuplicateKeyError; any other parse error parse_config words below

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -24,6 +25,10 @@ TIMEOUT = 900
 # cannot override them.
 MODEL_VARS = ("SUPERVISOR_CLAUDE_MODEL", "SUPERVISOR_CLAUDE_EFFORT", "SUPERVISOR_CODEX_MODEL", "SUPERVISOR_CODEX_EFFORT")
 CHECKS_PREFIX = "SUPERVISOR_CLAUDE_CHECKS"
+# What bulava.env may give the engine's commands: the models' credentials and the way out through a proxy. Nothing
+# that changes how a program starts or which program runs (BASH_ENV, LD_PRELOAD, PATH, NODE_OPTIONS, ...).
+TOKEN_VARS = re.compile(r"^(CLAUDE_CODE_OAUTH_TOKEN(_ISSUED_AT)?|ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|"
+                        r"(HTTPS?|NO|ALL)_PROXY|(https?|no|all)_proxy)$")
 
 
 class EngineError(Exception):
@@ -124,12 +129,13 @@ class Engine:
     def token_env(self) -> dict[str, str]:
         """bulava.env, if there is anything real in it. Without it Claude uses its own sign-in
         (~/.claude/.credentials.json). An empty or example value must never reach the engine:
-        it would override a working sign-in with a broken token."""
+        it would override a working sign-in with a broken token. Only the names it is for pass (TOKEN_VARS): a
+        variable such as BASH_ENV or LD_PRELOAD in it would run code in every engine command."""
         path = self.cfg.paths.bulava_env
         if not path.exists():
             return {}
         return {k: v for k, v in read_env_file(path).items()
-                if v.strip() and "replace-me" not in v and k not in MODEL_VARS and not k.startswith(CHECKS_PREFIX)}
+                if TOKEN_VARS.match(k) and v.strip() and "replace-me" not in v}
 
     def refresh_usage(self) -> None:
         """Take fresh subscription readings with the engine's own scripts (Bulava takes them only during

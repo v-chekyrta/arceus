@@ -330,6 +330,8 @@ def _cookie(response: Response, name: str, value: str, age: int | None, secure: 
 def _finish(app: ConsoleApp, response: Response, session: Session | None) -> Response:
     for k, v in SECURITY_HEADERS.items():
         response.headers.setdefault(k, v)
+    if app.settings.secure:  # behind https: browsers stay on https for this host
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     if response.media_type and response.media_type.startswith("text/html"):
         response.headers["Cache-Control"] = "no-store"
     return response

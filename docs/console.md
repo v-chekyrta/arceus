@@ -22,13 +22,20 @@ console ──reads──▶ the runner's metrics (127.0.0.1:9464)
   `*.env` or `secrets*`, `grafana-admin-password`, keys, `google/`. Setup lists them from the folder each time it
   runs; a new secret file put there later is hidden from the next `setup.sh` on, and `setup.sh --check` shows the
   `console` phase as `todo` until then. Report folders that `config.yaml` puts outside the data folder are mounted
-  read-only.
-- **Why Docker and not a service on the host.** Both can work. The console is the one part of Arceus reachable
-  from outside; on the host it would run as the run user, who has passwordless sudo, so a hole in it would be root
-  on the machine. In the container it is a process without sudo and without the tokens.
+  read-only, never the run user's home, a folder above it, its hidden folders or the machine's own folders
+  (`/etc`, `/var`, `/usr`, `/opt/arceus-*` and the like); setup says so and leaves such a folder out.
+- **What the container protects, and what it does not.** On the host the console would run as the run user,
+  who has passwordless sudo. In the container a bug that reads files (a path the code did not mean to open) finds
+  no sudo and no tokens: `secrets.env` and the rest are empty there, the home's folders are not mounted at all.
+  What it does not stop is someone who runs code in the console's process. The console may write `config.yaml`
+  and `runner.db`, and both steer the runner: `health.devstack_check` is a shell command the runner runs,
+  `tracker.url`/`code_host.url` decide where its tokens go, and a run's brief in `runner.db` reaches the agent,
+  which has sudo. Treat the console's process, and an **admin** account (which may change those settings), as
+  control of the VM; give the admin role accordingly, and keep its passwords long.
 - **The security boundary is still the VM.** The agents run as the same user with sudo (`docs/security.md`): they
   can read `console.db` and change anything the console can. The console keeps strangers out; it does not keep
-  the agents in.
+  the agents in. People with the QA or architect role write instructions the agent follows (the test and review
+  instructions); the architecture reviews' decision notes are screened, those files are not.
 
 ## Its data
 
@@ -244,8 +251,11 @@ A forgotten password: an admin makes a reset link on the person's page. When nob
 
 ## Sessions and forms
 
-Passwords are stored as scrypt hashes. Five wrong passwords for one address within 15 minutes (or thirty from one
-network address) make the next attempt wait. A session lasts `session_idle` (24 hours) after the last page opened
+Passwords are stored as scrypt hashes. Five wrong passwords for one address from one network address within 15
+minutes make the next attempt from there wait; thirty from one network address, whatever the accounts, too. A
+stranger's wrong passwords therefore do not keep an account's owner out (only a hundred from everywhere in 15
+minutes would). One network address can ask for at most five accounts an hour. Email addresses are printable ASCII
+only, and names keep no control characters: both go into the headers nginx passes to Grafana. A session lasts `session_idle` (24 hours) after the last page opened
 and `session_max` (14 days) at most. Its cookie is `HttpOnly` and `SameSite=Lax`, and behind `https://` it is a
-`__Host-` cookie with `Secure`. Every form carries a token of its session, and a form the browser says came from
+`__Host-` cookie with `Secure`, and the pages carry `Strict-Transport-Security`. Every form carries a token of its session, and a form the browser says came from
 another site is refused.

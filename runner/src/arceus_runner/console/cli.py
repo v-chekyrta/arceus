@@ -119,7 +119,15 @@ def cmd_env(_args, config_path: Path) -> int:
         for p in e.problems:
             print(f"config: {p}", file=sys.stderr)
         return 2
-    print("\n".join(env_lines(cfg)))
+    lines = env_lines(cfg)
+    # setup.sh reads these one per line as root: a value with a line break or a control character in it could
+    # make a line of its own (another folder to mount, another port). Refused instead.
+    bad = [line.split("=", 1)[0] for line in lines if any(not ch.isprintable() for ch in line)]
+    if bad:
+        print(f"config: {', '.join(sorted(set(bad)))}: a path or address with a line break or a control character "
+              "in it; setup will not use it", file=sys.stderr)
+        return 2
+    print("\n".join(lines))
     return 0
 
 

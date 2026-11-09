@@ -155,7 +155,7 @@ def _stale_section(ctx: Ctx, current: files.Current, name: str) -> Response:
 def _preview(ctx: Ctx, current: files.Current, new_text: str, origin: str, changed: list[str] | None = None,
              conflict: bool = False, error: str = "", note: str = "", server_diff: str = "") -> Response:
     new_text = files.normal(new_text)
-    problems = sf.check(new_text)
+    problems = sf.check(new_text, current.text)
     difference = files.diff(current.text, new_text, "config.yaml now", "after saving")
     return ctx.render("settings_preview.html", status=409 if conflict else 200, title="Check the change",
                       diff=difference, problems=problems, text=new_text, sha=current.sha, origin=origin,
@@ -196,8 +196,8 @@ def save(ctx: Ctx) -> Response:
     user = ctx.require("settings.edit")
     text = files.normal(ctx.field("text"))
     origin = ctx.field("origin") if ctx.field("origin").startswith("/settings/") else "/settings/"
-    problems = sf.check(text)
     current = files.read(_path(ctx))
+    problems = sf.check(text, current.text)
     if problems:
         return _preview(ctx, current, text, origin=origin)
     try:

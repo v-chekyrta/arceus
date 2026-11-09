@@ -6,12 +6,12 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+T="$(mktemp -d /tmp/arceus-console-test.XXXXXX)"; trap 'rm -rf "$T"' EXIT
 fails=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); fi; }
 
 # console_nginx_conf is a here-document whose own lines start with }: it ends at CONF and the line after.
-eval "$(sed -n '/^yaml_str() {/p; /^console_secret_paths() {/,/^}/p; /^console_mounts() {/,/^}/p;
+eval "$(sed -n '/^yaml_str() {/p; /^console_secret_paths() {/,/^}/p; /^console_mounts() {/,/^}/p; /^console_forbidden_dir() {/,/^}/p;
                 /^console_env() {/,/^}/p' "$HERE/../setup.sh")"
 eval "$(sed -n '/^console_nginx_conf() {/,/^CONF$/{p;/^CONF$/{n;p;};}' "$HERE/../setup.sh")"
 type yaml_str console_secret_paths console_mounts console_nginx_conf >/dev/null \
@@ -52,6 +52,10 @@ check "runner.db, config.yaml and the reports stay as they are" \
 check "a reports folder outside the data folder is mounted read-only at its own path" \
   "grep -qF '{type: bind, source: \"$T/srv/arch runs\", target: \"$T/srv/arch runs\", read_only: true}' <<< \"\$mounts\""
 check "the data folder itself is not mounted twice" "! grep -qF 'source: \"$DATA_DIR\"' <<< \"\$mounts\""
+for bad in / "$T" "$T/home" "$T/home/.ssh" /etc/ssl /root /var/lib/docker /opt/arceus-runner; do
+  check "never mounted for the console: $bad" "console_forbidden_dir '$bad'"
+done
+check "a reports folder in /srv is mounted" "! console_forbidden_dir /srv/qa-runs"
 
 conf="$(console_nginx_conf)"
 check "nginx listens on console.port" "grep -q 'listen 8081 default_server;' <<< \"\$conf\" && ! grep -q ssl_certificate <<< \"\$conf\""

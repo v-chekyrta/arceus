@@ -57,7 +57,7 @@ def register(ctx: Ctx) -> Response:
     if password != again:
         return ctx.render("register.html", status=400, values=values, error="The two passwords are not the same.")
     try:
-        ctx.store.register(values["email"], values["name"], password, values["note"])
+        ctx.store.register(values["email"], values["name"], password, values["note"], ip=ctx.ip)
     except ConsoleError as e:
         return ctx.render("register.html", status=400, values=values, error=str(e))
     # The same answer whether or not the address had an account: the form does not tell strangers who has one.

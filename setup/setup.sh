@@ -761,12 +761,29 @@ console_secret_paths() {
     case "$p" in "$DATA_DIR"/*) [ -e "$p" ] && [ ! -L "$p" ] && printf '%s\n' "$p" ;; esac
   done | sort -u
 }
+console_forbidden_dir() {  # $1: a folder outside the data folder that config.yaml asks the console to read
+  local p="${1%/}" sys
+  [ -z "$p" ] && return 0
+  case "$RUN_HOME/" in "$p"/*) return 0 ;; esac          # the home itself, or a folder above it (/home, /)
+  case "$p/" in "$RUN_HOME"/.*) return 0 ;; esac         # the home's hidden folders: .ssh, .claude, .config
+  for sys in /etc /root /proc /sys /dev /run /boot /usr /bin /sbin /lib /lib64 /var /opt/arceus-runner \
+             /opt/arceus-console /opt/arceus-observability /opt/agent-tools /opt/bulava; do
+    case "$p/" in "$sys"/*) return 0 ;; esac
+  done
+  return 1
+}
 console_mounts() {
   local p
   printf '%s\n' "# Written by setup.sh from config.yaml and the data folder. Do not edit." "services:" "  console:" "    volumes:"
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     case "$p/" in "$DATA_DIR"/*) continue ;; esac
+    # Never the machine's own folders, the run user's home or anything above it: what is in them (keys, tokens,
+    # other users' files) is not the console's to read. A reports folder there is refused, and said.
+    if console_forbidden_dir "$p"; then
+      printf '  console: %s is not mounted into the console: it is the home, above it, or a system folder\n' "$p" >&2
+      continue
+    fi
     [ -d "$p" ] || install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$p"
     printf '      - {type: bind, source: %s, target: %s, read_only: true}\n' "$(yaml_str "$p")" "$(yaml_str "$p")"
   done <<< "$(console_get CONSOLE_READ_DIR)"
