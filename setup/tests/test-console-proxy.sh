@@ -13,11 +13,28 @@ command -v docker >/dev/null && docker info >/dev/null 2>&1 || { echo "skip: no 
 T="$(mktemp -d)"; P="arceus-proxy-test-$$"; TAG="arceus-console:proxy-test-$$"; PORT=18$((RANDOM % 900 + 100))
 OBS=(docker compose -p "$P-obs" --project-directory "$ROOT/observability" -f "$ROOT/observability/compose.yaml"
      -f "$T/grafana-here.yaml")
-cleanup() { "${OBS[@]}" down -v >/dev/null 2>&1; docker rm -f "$P-console" "$P-nginx" >/dev/null 2>&1
-            docker image rm -f "$TAG" >/dev/null 2>&1; rm -rf "$T"; }
+# Everything this run made, found by its compose project's label and its names: never through compose itself,
+# whose compose.yaml needs the run's variables to be read at all (without them `down` failed quietly, and each run
+# left a Grafana and its volume behind).
+leftovers() {
+  { docker ps -aq --filter "label=com.docker.compose.project=$P-obs"; docker ps -aq --filter "name=^$P-"; } | sort -u
+}
+cleanup() {
+  local id
+  for id in $(leftovers); do docker rm -f "$id" >/dev/null 2>&1; done
+  for id in $(docker volume ls -q --filter "label=com.docker.compose.project=$P-obs"); do
+    docker volume rm -f "$id" >/dev/null 2>&1
+  done
+  for id in $(docker network ls -q --filter "label=com.docker.compose.project=$P-obs"); do
+    docker network rm "$id" >/dev/null 2>&1
+  done
+  docker image rm -f "$TAG" >/dev/null 2>&1
+  rm -rf "$T"
+}
 trap cleanup EXIT
+trap 'exit 130' INT TERM HUP  # killed (a timeout): the EXIT trap still cleans up
 # KEEP=1 leaves it running to look at; the last line says where and how to remove it.
-[ -n "${KEEP:-}" ] && trap 'echo "kept: http://127.0.0.1:$PORT  (admin@example.com / correct horse battery); remove: docker rm -f $P-console $P-nginx; ${OBS[*]} down -v"' EXIT
+[ -n "${KEEP:-}" ] && trap 'echo "kept: http://127.0.0.1:$PORT  (admin@example.com / correct horse battery). Remove it: docker rm -f \$(docker ps -aq --filter label=com.docker.compose.project=$P-obs) $P-console $P-nginx; docker volume rm \$(docker volume ls -q --filter label=com.docker.compose.project=$P-obs)"' EXIT
 fails=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); fi; }
 
@@ -121,6 +138,15 @@ check "a console admin is Grafana's Admin" \
 code="$(curl -s -o /dev/null -w '%{http_code}' -b "$T/viewer.jar" "$URL/")"
 check "the console's own pages go to the console" "[ '$code' = 200 ]"
 
+if [ "$fails" != 0 ]; then
+  docker logs "$P-nginx" 2>&1 | tail -5
+  docker logs "$(docker ps -aq --filter "label=com.docker.compose.project=$P-obs" | head -1)" 2>&1 | tail -15
+fi
+if [ -z "${KEEP:-}" ]; then
+  cleanup
+  trap - EXIT
+  check "nothing of this run is left in Docker (containers, volumes)" \
+    "[ -z \"\$(leftovers)\" ] && [ -z \"\$(docker volume ls -q --filter label=com.docker.compose.project=$P-obs)\" ]"
+fi
 [ "$fails" = 0 ] && { echo "all passed"; exit 0; }
-docker logs "$P-nginx" 2>&1 | tail -5; "${OBS[@]}" logs grafana 2>&1 | tail -15
 echo "$fails failed"; exit 1

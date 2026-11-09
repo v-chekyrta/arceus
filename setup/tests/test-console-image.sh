@@ -10,6 +10,7 @@ command -v docker >/dev/null && docker info >/dev/null 2>&1 || { echo "skip: no 
 T="$(mktemp -d)"; NAME="arceus-console-test-$$"; TAG="arceus-console:test-$$"
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1; docker image rm -f "$TAG" >/dev/null 2>&1; rm -rf "$T"; }
 trap cleanup EXIT
+trap 'exit 130' INT TERM HUP  # killed (a timeout): the EXIT trap still cleans up
 fails=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); fi; }
 
