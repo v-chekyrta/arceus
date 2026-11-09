@@ -34,12 +34,17 @@ check "the cookie is a __Host- cookie, Secure, HttpOnly, SameSite" \
   "grep -q '__Host-arceus' <<< \"\$cookie\" && grep -qi 'secure' <<< \"\$cookie\" && grep -qi 'httponly' <<< \"\$cookie\" && grep -qi 'samesite=lax' <<< \"\$cookie\""
 check "pages need a session" \
   "[ \"\$(curl -sS -m 20 -o /dev/null -w '%{http_code}' '$URL/settings/')\" = 303 ]"
-check "Grafana needs a session and sends to the sign-in" \
-  "curl -sS -m 20 -o /dev/null -D - '$URL/grafana/d/arceus-now' | tr -d '\r' | grep -qx 'location: /login?next=/grafana/'"
+check "Grafana needs a session, sends to the sign-in and from there back to the dashboard asked for" \
+  "curl -sS -m 20 -o /dev/null -D - '$URL/grafana/d/arceus-now?orgId=1' | tr -d '\r' | grep -qix 'location: /login?next=/grafana/d/arceus-now'"
+check "the sign-in page carries that dashboard to go back to" \
+  "curl -fsS -m 20 '$URL/login?next=/grafana/d/arceus-now' | grep -q 'name=\"next\" value=\"/grafana/d/arceus-now\"'"
 check "an identity header from the browser does not open Grafana" \
   "[ \"\$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H 'X-WEBAUTH-USER: admin' -H 'X-WEBAUTH-ROLE: Admin' '$URL/grafana/api/user')\" = 302 ]"
+# A connection in 5 seconds or not: dropped packets (no answer at all) count as closed, as a refusal does.
+port_open() { python3 -c 'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)' "$1" "$2" \
+  2>/dev/null; }
 for port in 3000 8180 9090 9464 3100; do
-  check "port $port is closed from outside ($VM)" "! nc -z -w 5 '$VM' $port 2>/dev/null"
+  check "port $port is closed from outside ($VM)" "! port_open '$VM' $port"
 done
 
 # -- on the VM ---------------------------------------------------------------------------------------------------
