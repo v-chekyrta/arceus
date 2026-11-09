@@ -29,7 +29,6 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from arceus_runner import __version__
 from arceus_runner.config import Config, ConfigError, load_config, parse_duration
 from arceus_runner.console import auth
 from arceus_runner.console.store import ConsoleError, ConsoleStore, Session, User
@@ -171,7 +170,7 @@ class Ctx:
         cfg, _ = self.config()
         body = self.app.templates.get_template(template).render(
             ctx=self, user=user, nav=nav, csrf=self.csrf, project=cfg.project if cfg else "",
-            pending=self.store.pending_count() if self.can("users.manage") else 0, version=__version__,
+            pending=self.store.pending_count() if self.can("users.manage") else 0,
             css=self.app.asset_url("console.css"), js=self.app.asset_url("console.js"), **values)
         return HTMLResponse(body, status_code=status)
 

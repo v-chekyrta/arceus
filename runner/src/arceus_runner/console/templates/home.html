@@ -7,10 +7,10 @@
 </div>
 <section class="dashboards">
   <h2>Monitoring</h2>
-  <p class="lede">Grafana, behind this sign-in: history, every event and the machine's resources.</p>
+  <p class="lede">Grafana, behind this sign-in: history, every event and the machine's resources. Each opens in a new tab.</p>
   <ul class="links">
     {% for uid, name, what in dashboards %}
-    <li><a href="/grafana/d/{{ uid }}">{{ name }}</a><span class="note">{{ what }}</span></li>
+    <li><a href="/grafana/d/{{ uid }}" target="_blank" rel="noopener">{{ name }}<span class="external" aria-hidden="true">↗</span><span class="sr"> (opens in a new tab)</span></a><span class="note">{{ what }}</span></li>
     {% endfor %}
   </ul>
 </section>

@@ -25,6 +25,7 @@ main { width: 100%; max-width: 1040px; flex: 1 0 auto; }
          font-size: 0.925rem; font-weight: 500; }
 .nav a:hover { color: var(--ink); background: var(--bg); }
 .nav a[aria-current="page"] { color: var(--ink); background: var(--bg); }
+.external { margin-left: 3px; font-size: 0.8em; opacity: 0.75; }
 .nav .count { display: inline-block; min-width: 1.3rem; margin-left: 4px; padding: 0 6px; border-radius: 999px;
               background: var(--blue); color: #fff; font-size: 0.75rem; line-height: 1.3rem; text-align: center; }
 .who { display: flex; align-items: center; gap: 12px; font-size: 0.9rem; }

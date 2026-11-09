@@ -821,6 +821,9 @@ $(for net in $(console_get CONSOLE_TRUSTED_PROXIES); do printf '  set_real_ip_fr
   real_ip_header X-Forwarded-For;
   real_ip_recursive on;
   map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+  # Where a visitor without a session was going, for the sign-in to send them back: the path as the browser sent
+  # it (still percent-encoded, so no line break can reach the header), without its query.
+  map \$request_uri \$grafana_path { ~^(?<path>/grafana/[^?]*) \$path; default /grafana/; }
   server {
 $(if [ "$(console_get CONSOLE_TLS)" = 1 ]; then
     printf '    listen %s ssl default_server;\n' "$(console_get CONSOLE_PORT)"
@@ -857,7 +860,7 @@ $(if [ "$(console_get CONSOLE_TLS)" = 1 ]; then
       proxy_pass http://127.0.0.1:3000;
     }
     location = /grafana { return 301 /grafana/; }
-    location @signin { return 302 /login?next=/grafana/; }
+    location @signin { return 302 /login?next=\$grafana_path; }
     location / {
       proxy_pass http://$CONSOLE_APP;
       proxy_http_version 1.1;

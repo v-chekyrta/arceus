@@ -88,9 +88,14 @@ sign_in "$T/admin.jar" admin@example.com --admin
 sign_in "$T/viewer.jar" viewer@example.com
 
 code="$(curl -s -o /dev/null -w '%{http_code}' "$URL/grafana/d/arceus-now")"
-where="$(curl -s -o /dev/null -D - "$URL/grafana/d/arceus-now" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p')"
-check "without a session /grafana/ sends to the sign-in, by path (behind TLS the scheme is not nginx's)" \
-  "[ '$code' = 302 ] && [ '$where' = '/login?next=/grafana/' ]"
+where="$(curl -s -o /dev/null -D - "$URL/grafana/d/arceus-now?orgId=1&from=now-6h" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p')"
+check "without a session a dashboard sends to the sign-in and back to that dashboard, by path" \
+  "[ '$code' = 302 ] && [ '$where' = '/login?next=/grafana/d/arceus-now' ]"
+where="$(curl -s -o /dev/null -D - "$URL/grafana/d/x%0d%0aSet-Cookie:%20evil=1" | tr -d '\r')"
+check "a line break in the path stays encoded: no header of the visitor's making" \
+  "! grep -qi '^set-cookie: evil' <<< \"\$where\" && grep -q 'next=/grafana/d/x%0d%0aSet-Cookie' <<< \"\$where\""
+login="$(curl -s "$URL/login?next=/grafana/d/arceus-now")"
+check "the sign-in page keeps where to go back to" "grep -q 'name=\"next\" value=\"/grafana/d/arceus-now\"' <<< \"\$login\""
 code="$(curl -s -o /dev/null -w '%{http_code}' -H 'X-WEBAUTH-USER: admin@example.com' -H 'X-WEBAUTH-ROLE: Admin' \
   "$URL/grafana/")"
 check "a Grafana user named by the browser itself does not get in" "[ '$code' = 302 ]"

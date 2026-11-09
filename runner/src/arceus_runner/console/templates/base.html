@@ -15,7 +15,11 @@
     {% if user %}
     <nav class="sections" aria-label="Sections"><ul class="nav">
       {% for href, label, here in nav %}
+      {% if href.startswith("/grafana/") %}
+      <li><a href="{{ href }}" target="_blank" rel="noopener">{{ label }}<span class="external" aria-hidden="true">↗</span><span class="sr"> (opens in a new tab)</span></a></li>
+      {% else %}
       <li><a href="{{ href }}"{% if here %} aria-current="page"{% endif %}>{{ label }}{% if href == "/users/" and pending %}<span class="count" title="{{ pending }} waiting for approval">{{ pending }}</span>{% endif %}</a></li>
+      {% endif %}
       {% endfor %}
     </ul></nav>
     <div class="who">
@@ -28,6 +32,6 @@
 <main>
 {% block body %}{% endblock %}
 </main>
-<footer class="foot">Arceus console {{ version }}</footer>
+<footer class="foot">Arceus Console</footer>
 </body>
 </html>

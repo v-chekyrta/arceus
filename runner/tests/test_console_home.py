@@ -200,3 +200,18 @@ def test_grafana_is_told_who_asks_and_never_lets_in_someone_without_a_session(wo
     r = vera.get("/_auth/grafana")
     assert r.headers["x-arceus-user"] == "viewer@example.com" and r.headers["x-arceus-role"] == "Viewer"
     assert 'href="/grafana/"' in vera.get("/").text  # Monitoring in the bar
+
+
+def test_grafana_opens_in_a_new_tab_and_the_footer_names_no_version(world):
+    import re as _re
+    world.metrics_text = metrics()
+    ReviewStore(world.db).close()
+    page = home(world)
+    grafana = _re.findall(r'<a href="(/grafana/[^"]*)"([^>]*)>(.*?)</a>', page)
+    assert len(grafana) == 4  # Monitoring in the bar and the three dashboards
+    for href, attrs, text in grafana:
+        assert 'target="_blank"' in attrs and 'rel="noopener"' in attrs, href
+        assert "(opens in a new tab)" in text, href
+    others = [a for a in _re.findall(r'<a href="(/[^"]*)"([^>]*)>', page) if not a[0].startswith("/grafana/")]
+    assert others and all("target=" not in attrs for _, attrs in others)  # the console's own pages: same tab
+    assert '<footer class="foot">Arceus Console</footer>' in page and "0.1.0" not in page

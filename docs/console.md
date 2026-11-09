@@ -30,6 +30,28 @@ console ──reads──▶ the runner's metrics (127.0.0.1:9464)
   can read `console.db` and change anything the console can. The console keeps strangers out; it does not keep
   the agents in.
 
+## Its data
+
+The console works with two SQLite databases in the data folder, both opened directly (no API in between, no
+copy):
+
+- **`console/console.db`, its own.** People and roles, sessions, invitations and reset links, failed sign-ins,
+  the journal of what people did, and every version of `config.yaml` and of the instruction files saved from the
+  console. Only the console writes it, and it migrates it itself.
+- **`runner.db`, the runner's, shared.** The pages read the runner's state from it (tasks, runs, findings, the
+  health it recorded, the config it started with) with read-only connections. The console also writes into it,
+  and only what a person decided: a test run or an architecture review queued or asked to stop, a decision on a
+  finding. The host's executor, as the run user, sets and lifts the drain before an engine restart. The console
+  never migrates `runner.db`: it writes only when its schema is the one this code knows (the runner and the
+  console come from the same setup), and otherwise says the two are of different versions.
+
+`config.yaml` and the instruction files stay files; the console edits them in place. Operation requests and their
+output are files too (`console/ops`), with the host's own ledger in `/var/lib/arceus/ops`.
+
+**Backups.** A backup of `runner.db` alone keeps the work, not the people: keep `console/console.db` as well.
+Both run in WAL mode, so copy them with SQLite's own backup while they are in use
+(`sqlite3 runner.db ".backup /backup/runner.db"`), not with `cp` of the file alone.
+
 ## Turning it on
 
 In `config.yaml`:
@@ -185,8 +207,9 @@ started with `config.yaml` (Settings then shows whether that is the saved versio
 
 ## Grafana
 
-**Monitoring** opens Grafana at `/grafana/` on the console's address. nginx asks the console who the visitor is
-before each request; without a session it sends them to the sign-in. Grafana gets the person's email in
+**Monitoring** opens Grafana at `/grafana/` on the console's address, in a new tab, as do the dashboards' links on Home. nginx asks the console who the visitor is
+before each request; without a session it sends them to the sign-in, and from there back to the dashboard they
+opened (its path; its time range starts over). Grafana gets the person's email in
 `X-WEBAUTH-USER`, as a Viewer, or an Admin for the console's admins, and makes their Grafana user on the first
 visit. nginx writes those headers from the console's answer over anything the browser sent, and Grafana takes
 them only from 127.0.0.1. With the console on, Grafana's anonymous viewing is off; the SSH tunnel still reaches
