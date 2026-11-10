@@ -83,7 +83,33 @@ def test_a_rule_that_lets_the_bot_force_push_task_branches_passes(protection, ca
 
 def test_task_branch_rules_are_reported_when_the_default_branch_is_not_protected(protection, capsys):
     rc, out = run(protection, [task_rule("agent/ACME-*", force=False)], capsys)
-    assert rc == 1 and "'agent/ACME-*' covers task branches" in out and "default branch is not protected" in out
+    assert rc == 1 and "'agent/ACME-*' covers task branches" in out
+    assert "[warn] acme-platform (main): default branch is not protected" in out
+
+
+def test_an_unprotected_default_branch_is_a_warning_not_a_failure(protection, capsys):
+    rc, out = run(protection, [task_rule("agent/*", force=True)], capsys)
+    assert rc == 0 and "FAIL" not in out and "[warn] acme-platform (main): default branch is not protected" in out
+
+
+@pytest.mark.parametrize("rule,could", [
+    ({**DEFAULT_RULE, "push_access_levels": [{"access_level": 30}]}, "push"),
+    ({**DEFAULT_RULE, "merge_access_levels": [{"access_level": 30}]}, "merge"),
+    ({**DEFAULT_RULE, "allow_force_push": True}, "force-push"),
+])
+def test_a_default_branch_the_bot_could_change_is_a_warning_that_names_what(protection, capsys, rule, could):
+    rc, out = run(protection, [rule], capsys)
+    assert rc == 0 and "FAIL" not in out
+    assert "[warn] acme-platform (main): rules: main;" in out and f"(the bot could {could} here)" in out
+
+
+def test_a_bot_below_developer_fails(protection, capsys):
+    gl = FakeGitLab([DEFAULT_RULE])
+    gl.get_json = lambda path, params=None: {"access_level": 20} if "/members/" in path else gl.rules
+    g = SimpleNamespace(group="clients/acme", include_subgroups=True, exclude_repos=[], branch_prefix="agent/")
+    rc = protection.check(g, gl)
+    out = capsys.readouterr().out
+    assert rc == 1 and "[FAIL] acme-agent-bot in clients/acme: reporter (needs developer" in out
 
 
 def test_a_narrow_rule_is_overruled_by_a_wider_one_that_allows_force_push(protection, capsys):
@@ -106,9 +132,10 @@ def test_a_rule_for_other_task_branches_does_not_lift_a_narrow_restriction(prote
     assert rc == 1 and "[FAIL] acme-platform: rule 'agent/ACME-*'" in out
 
 
-def test_a_wildcard_that_lets_the_bot_force_push_everywhere_fails_for_the_default_branch(protection, capsys):
+def test_a_wildcard_that_lets_the_bot_force_push_everywhere_warns_for_the_default_branch(protection, capsys):
     rc, out = run(protection, [DEFAULT_RULE, task_rule("*", force=True)], capsys)
-    assert rc == 1 and "[FAIL] acme-platform (main): rules: main, *" in out and "force push on" in out
+    assert rc == 0 and "[warn] acme-platform (main): rules: main, *" in out and "force push on" in out
+    assert "the bot could push, force-push here" in out
 
 
 @pytest.mark.parametrize("pattern,names,expected", [

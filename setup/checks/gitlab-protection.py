@@ -1,13 +1,17 @@
-"""Check in GitLab that the bot can work on task branches but cannot change the default branch.
+"""Check in GitLab that the bot can publish its task branches, and show what it could do to the default branch.
 
     /opt/arceus-runner/venv/bin/python -I gitlab-protection.py
 
-The bot is a Developer in the project's group; in every repository the default
-branch is protected, nobody may push to it, only Maintainers merge, and force push is off. A rule that
-also covers the task branches (`agent/*`, `*`) must let the bot push and force-push there: the runner
-publishes a branch the agent rebased onto its target by replacing its own last push. Read-only:
-it asks GitLab, changes nothing. Exit 0 only if every repository of the group is set up that way.
-For a runner whose `code_host:` is GitLab.
+FAIL is what stops the runner from publishing work: the bot is not a member of the group with at least the
+Developer role, a repository's protected branches cannot be read, or a rule that also covers the task branches
+(`agent/*`, `*`) refuses the bot push or force push there (the runner publishes a branch the agent rebased onto
+its target by replacing its own last push).
+
+The default branch is the team's to protect, not the runner's: the runner itself only pushes task branches and
+opens merge requests. Where the bot could also push, merge or force-push to the default branch, or the branch is
+not protected at all, the line says `warn` and names the rule, so the team knows what the bot's token can reach
+(docs/security.md); it does not change the exit code. Read-only: it asks GitLab, changes nothing. Exit 0 unless
+a line is FAIL. For a runner whose `code_host:` is GitLab.
 """
 
 import sys
@@ -76,10 +80,18 @@ def check(g, gl) -> int:
         ok &= passed
         print(f"[{'ok  ' if passed else 'FAIL'}] {text}")
 
+    def note(passed: bool, text: str) -> None:
+        """What the team decides: shown, never a failure."""
+        print(f"[{'ok  ' if passed else 'warn'}] {text}")
+
     group = gl.group(g.group)
     try:
         level = gl.c.get_json(f"/api/v4/groups/{group['id']}/members/all/{me['id']}")["access_level"]
-        line(level == DEVELOPER, f"{me['username']} in {g.group}: {LEVEL.get(level, level)} (expected developer)")
+        if level < DEVELOPER:
+            line(False, f"{me['username']} in {g.group}: {LEVEL.get(level, level)} (needs developer to push task branches)")
+        else:
+            note(level == DEVELOPER, f"{me['username']} in {g.group}: {LEVEL.get(level, level)}"
+                 + ("" if level == DEVELOPER else " (developer is enough; more lets the token change protected branches)"))
     except ServiceError as e:
         line(False, f"{me['username']} is not a member of {g.group}: {e}")
 
@@ -106,7 +118,7 @@ def check(g, gl) -> int:
                  "also matches them (both needed to publish a rebased branch)")
         matching = [r for r in rules if covers(r["name"], repo.default_branch)]
         if not matching:
-            line(False, f"{name}: default branch is not protected, the bot could push to it")
+            note(False, f"{name}: default branch is not protected, the bot could push to it")
             continue
         push, merge = _levels(matching, "push_access_levels"), _levels(matching, "merge_access_levels")
         force = any(r.get("allow_force_push") for r in matching)
@@ -114,7 +126,8 @@ def check(g, gl) -> int:
                   f"push: {', '.join(LEVEL.get(x, str(x)) for x in push) or '-'}; "
                   f"merge: {', '.join(LEVEL.get(x, str(x)) for x in merge) or '-'}; "
                   f"force push {'on' if force else 'off'}")
-        line(not _bot_may(push) and not _bot_may(merge) and not force, f"{name}: {detail}")
+        bot = [what for what, may in (("push", _bot_may(push)), ("merge", _bot_may(merge)), ("force-push", force)) if may]
+        note(not bot, f"{name}: {detail}" + (f" (the bot could {', '.join(bot)} here)" if bot else ""))
     return 0 if ok else 1
 
 
