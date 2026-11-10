@@ -1528,3 +1528,17 @@ def test_a_persons_change_counts_as_kept_only_when_the_content_is_there(tmp_path
     git(repo, *ident, "cherry-pick", side)
     without = git(repo, "rev-parse", "HEAD")
     assert not g.carries(repo, without, published, merge)
+
+
+def test_a_long_explanation_without_code_changes_reaches_the_thread_and_the_ticket_whole(w):
+    published(w)
+    d = w.gl.note(1, "reviewer", f"{BOT} why?")
+    later(w)
+    later(w)
+    why = "Kept as it is. " + " ".join(f"reason {i:03d}." for i in range(400)) + " The last reason matters most."
+    assert len(why) > 3000  # the old 3000-character cut lost its end
+    no_change(w, why)
+    [reply] = bot_replies(w, d)
+    assert "The last reason matters most." in reply
+    [note] = [c["text"] for c in w.yt.comments["2-1"] if "did not change the code" in c["text"]]
+    assert "The last reason matters most." in note and "…" not in note

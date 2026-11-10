@@ -1420,3 +1420,105 @@ def test_a_failure_recorded_by_an_earlier_version_is_posted_once_with_its_own_ke
     numbered = [t for t in w.bot_comments() if "[arceus:failed:n" in t]
     assert len(numbered) == 1 and numbered[0].endswith("[arceus:failed:n2]")   # numbered after the old one
     assert len([t for t in w.bot_comments() if "could not take this ticket" in t]) == 2
+
+
+# -- the agent's words reach the ticket whole ------------------------------------------------------
+
+def _summary_with_the_ask_at_the_end() -> str:
+    """A run summary as agents write them: what was done, how it was checked, and the request last."""
+    checks = "\n".join(f"- check {i}: " + "y" * 60 for i in range(60))
+    return (f"Three emails are sent now.\n\n### How it was checked\n{checks}\n\n### Limitations\n"
+            "- Blocked on the mockups: post the text of Figma frames 12222-10748 and 12223-10758 on the ticket.")
+
+
+def test_a_blocked_run_without_a_question_asks_with_its_whole_summary_and_screenshots(w):
+    take(w)
+    _media(w, [{"file": "email.png", "caption": "Admin email"}], {"email.png": PNG})
+    summary = _summary_with_the_ask_at_the_end()
+    assert len(summary) > 3000  # the old 1500-character cut lost the request at its end
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
+        state="blocked", state_reason="needs-user", attempt_live=False, question=None,
+        outcome={"result": "blocked", "summary": summary}))
+    w.tick()
+    assert w.store.task("ACME-1").state == "needs_input"
+    [note] = [c for c in w.yt.comments["2-1"] if "[arceus:question:1]" in c["text"]]
+    text = note["text"]
+    assert text.startswith("@j.doe, the agent needs an answer to continue:")
+    assert "post the text of Figma frames 12222-10748 and 12223-10758 on the ticket." in text
+    assert "…" not in text and "Part 1" not in text  # one comment, nothing cut
+    assert "option's number" not in text  # there are no options to number
+    assert text.index("![Admin email](") < text.index("Reply with a comment on this ticket.")
+    assert text.endswith("Reply with a comment on this ticket.\n\n[arceus:question:1]")
+    assert [n.split("-", 1)[1] for n, _ in w.yt.attachments[note["id"]]] == ["email.png"]
+
+
+def test_a_long_question_goes_as_parts_in_order_and_is_answered_as_one(w):
+    take(w)
+    lines = [f"line {i:03d} " + "z" * 100 for i in range(250)]  # about 27 000 characters: three comments
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
+        state="needs_input", attempt_live=False,
+        question={"id": "q-2", "text": "\n".join(lines), "options": ["Keep", "Drop"]}))
+    w.tick()
+    parts = [t for t in w.bot_comments() if "needs an answer" in t or "**Part " in t]
+    assert len(parts) == 3
+    assert [p.count(f"**Part {i} of 3**") for i, p in enumerate(parts, 1)] == [1, 1, 1]
+    assert parts[0].startswith("@j.doe, the agent needs an answer to continue:")
+    assert parts[0].endswith("[arceus:question:q-2]") and parts[2].endswith("[arceus:part3:question:q-2]")
+    assert all("1. Keep" not in p for p in parts[:2]) and "1. Keep\n2. Drop" in parts[2]
+    assert "the option's number or your own words." in parts[2]
+    posted = "\n".join(parts)
+    assert [ln for ln in posted.splitlines() if ln.startswith("line ")] == lines  # whole, in order
+    w.tick()
+    assert len([t for t in w.bot_comments() if "needs an answer" in t or "**Part " in t]) == 3  # posted once
+    w.yt.comment("2-1", "a.smith", "1")
+    w.tick()
+    [send] = w.calls("worker-send")
+    assert send["argv"][send["argv"].index("--answers") + 1] == "q-2" and send["argv"][-1] == "1"
+
+
+def test_long_failure_details_survive_an_outage_whole_in_order_and_keep_the_numbering(w):
+    take(w)
+    details = "\n".join(f"step {i:03d} " + "d" * 100 for i in range(150))  # about 16 000 characters: two comments
+    w.yt.fail_once[("POST", "/api/issues/2-1/comments")] = 503
+    w.runner.delivery.fail(w.store.task("ACME-1"), "the review budget ran out", details)
+    assert not [t for t in w.bot_comments() if "could not take this ticket" in t]
+    w.clock.advance(3600)
+    w.tick()
+    parts = [t for t in w.bot_comments() if "could not take this ticket" in t or "**Part 2 of 2**" in t]
+    assert len(parts) == 2 and "**Part 1 of 2**" in parts[0] and parts[1].endswith("[arceus:part2:failed:n1]")
+    assert [ln for ln in "\n".join(parts).splitlines() if ln.startswith("step ")] == details.splitlines()
+    assert "/continue" not in parts[0] and "/continue" in parts[1]  # what to do next comes after everything
+    assert w.store.count_actions("ACME-1:comment:failed:") == 1  # the parts do not count as failures
+    w.runner.delivery.fail(w.store.task("ACME-1"), "a later failure")
+    assert w.bot_comments()[-1].endswith("[arceus:failed:n2]")
+
+
+def test_a_screenshot_shown_with_the_question_is_not_attached_again_when_the_work_is_done(w):
+    """The question and the finished work read the same media folder: the ticket gets each file once, the
+    result comment brings only what changed since the question, and the MR still shows every screenshot."""
+    take(w)
+    folder = _media(w, [{"file": "email.png", "caption": "Admin email, draft"}], {"email.png": PNG})
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
+        state="needs_input", attempt_live=False,
+        question={"id": "q-1", "text": "Which wording do the mockups use?", "options": []}))
+    w.tick()
+    [q] = [c for c in w.yt.comments["2-1"] if "[arceus:question:q-1]" in c["text"]]
+    assert [n.split("-", 1)[1] for n, _ in w.yt.attachments[q["id"]]] == ["email.png"]
+
+    w.yt.comment("2-1", "a.smith", "Use the text from frame 12222")
+    w.tick()
+    (folder / "final.png").write_bytes(PNG + b"final")  # the email as built after the answer
+    (folder / "media.json").write_text(json.dumps({"items": [
+        {"file": "email.png", "caption": "Admin email, draft"},
+        {"file": "final.png", "caption": "Admin email, final"}]}))
+    w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review"
+    [note] = [c for c in w.yt.comments["2-1"] if "Merge request" in c["text"]]
+    assert [n.split("-", 1)[1] for n, _ in w.yt.attachments[note["id"]]] == ["final.png"]
+    assert "Admin email, final" in note["text"] and "Admin email, draft" not in note["text"]
+    attached = [n.split("-", 1)[1] for files in w.yt.attachments.values() for n, _ in files]
+    assert attached == ["email.png", "final.png"]  # each file on the ticket once
+    desc = w.gl.mrs[0]["description"]
+    assert "![Admin email, draft](/uploads/" in desc and "![Admin email, final](/uploads/" in desc

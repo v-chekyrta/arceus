@@ -861,8 +861,10 @@ class TaskStore(Store):
                                  (len(prefix), prefix)).fetchone()[0]
 
     def pending_actions(self) -> list[tuple[str, str, str, str | None]]:
+        """Unfinished actions in the order they were recorded: the parts of a long comment journaled in one
+        transaction share a timestamp, and are redone in order by their rowid."""
         rows = self.conn.execute(
-            "SELECT idem_key, task_id, kind, result FROM actions WHERE status = 'intent' ORDER BY updated_at"
+            "SELECT idem_key, task_id, kind, result FROM actions WHERE status = 'intent' ORDER BY updated_at, rowid"
         ).fetchall()
         return [(r["idem_key"], r["task_id"], r["kind"], r["result"]) for r in rows]
 

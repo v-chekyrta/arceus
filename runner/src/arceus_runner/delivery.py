@@ -193,6 +193,32 @@ def _close_piece(lines: list[str], fence: str | None) -> str:
     return "\n".join([*lines, *closing]).strip()
 
 
+def ticket_pieces(head: str, text: str, foot: str = "", tail: str = "") -> list[str]:
+    """A ticket comment with the agent's words in it, never cut: one comment while they fit, else several in
+    order, each marked "Part i of n". `head` opens the first; `tail` (the screenshots) and `foot` (what the reader
+    does next) close the last, so the request to act comes after everything it refers to."""
+    body = split_answer(unattributed(text).strip()) if (text or "").strip() else []
+    n = max(len(body), 1)
+    pieces = []
+    for i in range(1, n + 1):
+        parts = [head] if i == 1 and head else []
+        if n > 1:
+            parts.append(f"**Part {i} of {n}**")
+        if body:
+            parts.append(body[i - 1])
+        if i == n:
+            parts += [x for x in (tail, foot) if x]
+        pieces.append("\n\n".join(parts))
+    return pieces
+
+
+def piece_kind(kind: str, i: int) -> str:
+    """The journal kind of piece `i`: the first keeps the comment's own kind, so a comment posted as one piece
+    before is recognised as the same comment. The others start with `part<i>:`, never with the comment's kind:
+    failures and closings are numbered by counting the kinds that start with theirs."""
+    return kind if i == 1 else f"part{i}:{kind}"
+
+
 MEDIA_BEGIN, MEDIA_END = "<!-- arceus:media -->", "<!-- /arceus:media -->"
 
 
@@ -790,8 +816,9 @@ class Delivery:
         elif state == "done":
             # succeeded_no_change / succeeded_research, reviewed by Codex: a result, nothing to push.
             summary = (show.get("outcome") or {}).get("summary") or "No code changes were needed."
-            self.comment_once(task, f"done:{len(attempts)}",
-                              f"Arceus finished without code changes; the result passed review.\n\n{_short(summary)}")
+            self.post_whole(task, f"done:{len(attempts)}",
+                            "Arceus finished without code changes; the result passed review.", summary,
+                            visuals=self.task_media(task))
             self.store.update_task(task.task_id, state="done", reason="no code changes")
             self.events.emit("task_done", task_id=task.task_id)
         elif state in ("needs_input", "blocked"):
@@ -1041,17 +1068,18 @@ class Delivery:
             f"failed:n{self.store.count_actions(f'{task.task_id}:comment:failed:') + 1}"
         if task.state in ("dispatched", "needs_input") and task.branch:
             self._save_progress(task)
-        body = (f"Arceus could not answer this ticket: {reason}." if task.research else
+        head = (f"Arceus could not answer this ticket: {reason}." if task.research else
                 f"Arceus could not take this ticket to a merge request: {reason}.")
-        if details:
-            body += f"\n\n{_short(details)}"
+        foot = ""
         if task.branch and task.research:
-            body += (f"\n\nTo have Arceus try again, reply with a comment that starts with `{CONTINUE}`, followed "
-                     "by anything it should know.")
+            foot = (f"To have Arceus try again, reply with a comment that starts with `{CONTINUE}`, followed "
+                    "by anything it should know.")
         elif task.branch:
-            body += (f"\n\nTo have Arceus pick this up again, reply with a comment that starts with "
-                     f"`{CONTINUE}`, followed by anything it should know (what was fixed, what to do "
-                     f"differently). Its branches and commits are kept.")
+            foot = (f"To have Arceus pick this up again, reply with a comment that starts with "
+                    f"`{CONTINUE}`, followed by anything it should know (what was fixed, what to do "
+                    f"differently). Its branches and commits are kept.")
+        # The details whole, in parts when long: every part is journaled with the failure, below.
+        pieces = [(piece_kind(kind, i), p) for i, p in enumerate(ticket_pieces(head, details, foot), 1)]
         # Our own state first: it must not depend on the tracker being up. The comment and the tag go
         # through the journal, and retry_pending() finishes them if the tracker fails right now.
         # The state and both intents in one transaction: a crash or a tracker failure after it
@@ -1062,13 +1090,15 @@ class Delivery:
             task = self.store.update_task(task.task_id, state="failed", reason=reason,
                                           failed_at_ms=int(self.now().timestamp() * 1000))
             self.store.action_intent(tag_key, task.task_id, "tag", json.dumps({"tag": tag}))
-            self.store.action_intent(f"{task.task_id}:comment:{kind}", task.task_id, "comment",
-                                     json.dumps({"kind": kind, "text": body}))
+            for k, text in pieces:
+                self.store.action_intent(f"{task.task_id}:comment:{k}", task.task_id, "comment",
+                                         json.dumps({"kind": k, "text": text}))
             if also:
                 also()
         self.events.emit("task_failed", task_id=task.task_id, reason=reason)
         try:
-            self.comment_once(task, kind, body)
+            for k, text in pieces:
+                self.comment_once(task, k, text)
             self.tag_once(task, tag, tag_key)
         except ServiceError as e:
             self.events.emit("notify_pending", task_id=task.task_id, reason=str(e))
@@ -1292,11 +1322,14 @@ class Delivery:
         outcome = show.get("outcome") or {}
         attempt = len(show.get("attempts") or [])
         text = q.get("text") or outcome.get("summary") or "The agent needs a decision from a person."
-        lines = [f"{self.tracker.mention(task.tag_author)}, the agent needs an answer to continue:", "", _short(text)]
-        for i, opt in enumerate(q.get("options") or [], 1):
-            lines.append(f"{i}. {opt}")
-        lines += ["", "Reply with a comment on this ticket: the option's number or your own words."]
-        posted = self.comment_once(task, f"question:{q.get('id') or attempt}", "\n".join(lines))
+        options = list(q.get("options") or [])
+        # The question goes whole, with the screenshots it is about: what is cut off is what the person never sees.
+        foot = "\n".join([*(f"{i}. {opt}" for i, opt in enumerate(options, 1)), "",
+                          "Reply with a comment on this ticket: the option's number or your own words." if options
+                          else "Reply with a comment on this ticket."]).strip()
+        posted = self.post_whole(task, f"question:{q.get('id') or attempt}",
+                                 f"{self.tracker.mention(task.tag_author)}, the agent needs an answer to continue:",
+                                 text, foot, visuals=self.task_media(task))[0]
         self.tracker.add_tag(task.issue_db_id, self.cfg.tracker.tags.needs_input)
         # The words go with the state: the project's channel (notify.py) quotes them whenever it tells the question.
         words = {"id": q.get("id"), "text": _short(text), "options": list(q.get("options") or []),
@@ -1922,20 +1955,32 @@ class Delivery:
     def comment_with_media(self, task: Task, kind: str, text: str,
                            visuals: list[media.MediaItem]) -> tuple[str, int] | None:
         """comment_once, with the screenshots and recordings not yet on the ticket attached to it."""
+        return self.post_whole(task, kind, text, visuals=visuals)[0]
+
+    def post_whole(self, task: Task, kind: str, head: str, text: str = "", foot: str = "",
+                   visuals: list[media.MediaItem] = ()) -> list[tuple[str, int] | None]:
+        """A comment whose `text` (the agent's words) reaches the ticket whole: split into parts when long
+        (ticket_pieces), never cut. The screenshots not yet on the ticket go with the last part. Each part goes
+        through comment_once, so a retry posts only the parts that are missing. Returns each part's (id, ms)."""
         fresh = [m for m in visuals if (self.store.action(self._attach_key(task, m)) or ("",))[0] != "done"] \
             if self.tracker.supports_attachments else []
-        if fresh:
-            text += "\n\n" + ticket_media_text(self.tracker, fresh)
-        posted = self.comment_once(task, kind, text)
-        if posted and fresh:
-            self._ticket_media(task, posted[0], fresh)
+        tail = ticket_media_text(self.tracker, fresh) if fresh else ""
+        pieces = ticket_pieces(head, text, foot, tail)
+        posted = [self.comment_once(task, piece_kind(kind, i), p) for i, p in enumerate(pieces, 1)]
+        if posted[-1] and fresh:
+            self._ticket_media(task, posted[-1][0], fresh)
         return posted
 
-    def refresh_media(self, task: Task) -> list[media.MediaItem]:
-        """A round that changed no code may still bring new screenshots: put them into the open MRs."""
+    def task_media(self, task: Task) -> list[media.MediaItem]:
+        """The screenshots and recordings the agent left for this task, checked as for an MR."""
         visuals, skipped = media.load(media.media_dir(self.cfg.paths.workspace.resolve(), task.task_id))
         for line in skipped:
             self.events.emit("media_skipped", task_id=task.task_id, detail=line)
+        return visuals
+
+    def refresh_media(self, task: Task) -> list[media.MediaItem]:
+        """A round that changed no code may still bring new screenshots: put them into the open MRs."""
+        visuals = self.task_media(task)
         if not visuals:
             return []
         for mr in self.store.task_mrs(task.task_id):

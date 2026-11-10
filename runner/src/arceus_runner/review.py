@@ -641,14 +641,15 @@ class ReviewLoop:
     def answered_without_changes(self, task: Task, summary: str) -> None:
         """The agent decided nothing had to change: its answers go to the threads, the task stays in Code Review."""
         batch = self.store.last_sent_batch(task.task_id)
-        text = ("The agent looked into this and did not change the code: "
-                f"{replies.unattributed(summary).strip() or 'no explanation given'}")
+        head = "The agent looked into this and did not change the code:"
+        why = replies.unattributed(summary).strip() or "no explanation given"
         if batch:
-            self._answer_threads(task, batch, lambda answer, repo: answer.text if answer else text[:3000])
+            # A thread gets the explanation whole too: a merge request note holds far more than any summary.
+            self._answer_threads(task, batch, lambda answer, repo: answer.text if answer else f"{head} {why}")
             if not batch.ci_only:
                 task = self._count(task, batch.id, "answer")
         visuals = self.d.refresh_media(task)
-        self.d.comment_with_media(task, f"nochange:{batch.id if batch else 'none'}", text[:3000], visuals)
+        self.d.post_whole(task, f"nochange:{batch.id if batch else 'none'}", head, why, visuals=visuals)
         self.d.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.code_review)
         self.store.update_task(task.task_id, state="code_review", reason=None)
         self.events.emit("review_answered", task_id=task.task_id, changed=False)
