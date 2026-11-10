@@ -464,3 +464,40 @@ def test_a_key_written_twice_is_refused_and_the_pages_say_so(w):
     page = admin.get("/settings/")
     assert page.status_code == 200 and "poll_working is written twice" in page.text
     assert admin.get("/settings/schedule/").status_code == 303
+
+
+@pytest.mark.parametrize("after_mode", ["\n\n", "\n", ""])
+def test_a_comment_below_a_setting_is_not_its_hint(after_mode):
+    # The last key of a block takes, in ruamel, the comments that follow it: the next section's header.
+    doc = sf.load_doc(f"cleanup:\n  mode: act\n{after_mode}"
+                      "# Optional. The agent tests the whole platform (qa.py).\nqa:\n  enabled: false\n")
+    assert sf._comment(doc, ("cleanup", "mode")) == ""
+
+
+def test_a_settings_own_comment_is_its_hint_and_nothing_below_it():
+    doc = sf.load_doc("cleanup:\n  mode: act    # report: log what would go | act: remove it.\n"
+                      "\n# Optional. The agent tests the whole platform (qa.py).\nqa:\n  enabled: false\n")
+    assert sf._comment(doc, ("cleanup", "mode")) == "report: log what would go | act: remove it."
+
+
+def test_a_commented_out_key_is_not_the_hint_of_the_key_above_it():
+    doc = sf.load_doc("architect:\n  timeout: 4h\n  # repos: []    # which repositories\n"
+                      "  first_look: 30d   # how far back\n")
+    assert sf._comment(doc, ("architect", "timeout")) == ""
+    assert sf._comment(doc, ("architect", "first_look")) == "how far back"
+
+
+def test_cleanup_shows_no_help_of_the_section_after_it(w):
+    # A server's file: cleanup ends with a bare `mode: act`, and the qa section comes right after it.
+    text = w.config.read_text()
+    qa = text[text.index("# Optional. The agent tests the whole platform"):text.index("# Optional. The agent reviews")]
+    mode = next(line for line in text.splitlines(keepends=True) if line.startswith("  mode: report "))
+    text = text.replace(qa, "").replace(mode, "")
+    text = text.replace("# The web console", "  mode: act\n\n" + qa + "# The web console", 1)
+    w.config.write_text(text)
+    admin = signed_in(w.settings, "owner@example.com")
+    page = admin.get("/settings/cleanup/")
+    assert page.status_code == 200 and "<option selected>act</option>" in page.text
+    assert "tests the whole platform" not in page.text and "qa.py" not in page.text
+    qa_page = admin.get("/settings/qa/")
+    assert qa_page.status_code == 200 and "past it the run is stopped and reported as unfinished" in qa_page.text

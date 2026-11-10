@@ -364,8 +364,11 @@ def _comment(doc, path: tuple[str, ...]) -> str:
     if not tokens:
         return ""
     for tok in tokens:
-        if tok is not None and not isinstance(tok, list) and getattr(tok, "value", "").lstrip().startswith("#"):
-            return tok.value.strip().lstrip("#").strip().split("\n")[0]
+        # Only a comment that starts on the key's own line is its hint. ruamel also hangs on
+        # the last key of a block the blank lines and comments that follow it (the next
+        # section's header, a commented-out key); that token starts with a newline.
+        if tok is not None and not isinstance(tok, list) and getattr(tok, "value", "").lstrip(" \t").startswith("#"):
+            return tok.value.lstrip(" \t").split("\n")[0].lstrip("#").strip()
     return ""
 
 
