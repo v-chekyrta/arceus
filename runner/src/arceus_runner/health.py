@@ -96,22 +96,39 @@ def claude_checks(cfg: Config, probe: Probe, live_env=None) -> Check:
             return Check("config.claude_checks", "fail",
                          f"the review gate would run with {', '.join(differ)}: bulava-engine.service is not "
                          "up to date with config.yaml; run sudo ./setup.sh, then restart bulava-engine between tasks")
-    if not c.enabled:
-        return Check("config.claude_checks", "warn", "off in config.yaml: Codex alone reviews the work")
-    return Check("config.claude_checks", "ok", shown)
+    # Off is a choice, not a fault: Bulava's Codex review (a team with a security reviewer on a server)
+    # is then the review. Only an engine that would still run them is told above.
+    return Check("config.claude_checks", "ok", shown if c.enabled else "off in config.yaml")
+
+
+def _review_team(checks: list) -> str:
+    for c in checks:
+        d = c.get("detail") if c.get("name") == "engine.review_team" else None
+        if isinstance(d, dict) and d.get("enabled") and isinstance(d.get("members"), list):
+            return f"; Codex review team: {', '.join(map(str, d['members']))}"
+    return ""
 
 
 def engine_doctor(engine: Engine) -> list[Check]:
     """The engine's own health, with the environment the runner gives it: Claude and Codex
-    signed in as this user, hooks installed, usage readings, the browser."""
+    signed in as this user, hooks installed, usage readings, the browser.
+
+    The engine warns on a server whose Claude checks are off. When config.yaml turns them off and the
+    engine says it runs without them, that is what was asked for: ok. Any other reading of it stays."""
     try:
         report = engine.doctor()
     except EngineError as e:
         return [Check("bulava.doctor", "fail", str(e))]
+    checks = report.get("checks") or []
+    off = not engine.cfg.bulava.claude_checks.enabled
     out = []
-    for c in report.get("checks") or []:
+    for c in checks:
         status = c.get("status") if c.get("status") in ("ok", "warn", "fail") else "warn"
         detail = c.get("detail")
+        if (off and c.get("name") == "engine.claude_checks" and status == "warn" and isinstance(detail, dict)
+                and detail.get("enabled") is False):
+            out.append(Check("bulava.engine.claude_checks", "ok", "off, as config.yaml says" + _review_team(checks)))
+            continue
         out.append(Check(f"bulava.{c.get('name')}", status,
                          detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)[:300]))
     return out or [Check("bulava.doctor", "warn", "doctor returned no checks")]

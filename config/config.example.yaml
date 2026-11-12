@@ -134,7 +134,9 @@ bulava:
   # them all. Once the rounds are spent the engine does not run the checks again for that task, so
   # fixes after review comments and red CI go to Codex alone. The review gate reads these from
   # bulava-engine.service: after a change run `sudo ./setup.sh` and restart bulava-engine between
-  # tasks; `arceus-runner doctor` says FAIL until the running engine has them.
+  # tasks; `arceus-runner doctor` says FAIL until the running engine has them. `enabled: false` is a
+  # choice, not a warning: Bulava's Codex review (on a server a team of contract, security and state
+  # reviewers) is then the review.
   claude_checks:
     enabled: true
     kinds: [code, security]

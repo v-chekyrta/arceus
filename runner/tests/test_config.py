@@ -306,7 +306,8 @@ def test_independent_checks_need_an_engine_that_runs_them(tmp_path, monkeypatch)
     raw = example_raw()
     raw["bulava"]["claude_checks"] = {"enabled": False}
     off = load_config(write(tmp_path, raw))
-    assert claude_checks(off, old_probe).status == "warn"  # no engine server to compare with yet
+    c = claude_checks(off, old_probe)                      # no engine server to compare with yet
+    assert (c.status, c.detail) == ("ok", "off in config.yaml")  # turned off on purpose: not a warning
 
     new = _engine(tmp_path / "new", "", "#!/bin/sh\n")
     (new / "hooks").mkdir()
@@ -342,7 +343,7 @@ def test_the_review_gate_must_run_with_what_config_yaml_says(tmp_path, monkeypat
     off = load_config(write(tmp_path, raw))
     c = claude_checks(off, probe, live_env=lambda: old_unit)                       # the gate would still run them
     assert c.status == "fail" and "SUPERVISOR_CLAUDE_CHECKS=1 (config.yaml: 0)" in c.detail
-    assert claude_checks(off, probe, live_env=lambda: {"SUPERVISOR_CLAUDE_CHECKS": "0"}).status == "warn"
+    assert claude_checks(off, probe, live_env=lambda: {"SUPERVISOR_CLAUDE_CHECKS": "0"}).status == "ok"
     (root / "bin" / "supervisor-lib.sh").write_text('_RUN_ENV_VARS="SUPERVISOR_CODEX_EFFORT SUPERVISOR_CLAUDE_CHECKS"\n')
     carries = bulava.probe(root)                                                    # an engine that takes them per task
     assert claude_checks(cfg, carries, live_env=lambda: old_unit).status == "ok"
@@ -387,3 +388,34 @@ def test_slack_notify_idle_repeat_is_no_longer_a_setting(tmp_path):
     with pytest.raises(ConfigError) as e:
         load_config(write(tmp_path, raw))
     assert e.value.problems == ["slack.notify.idle_repeat: unknown key (typo?)"]
+
+
+def test_the_engine_warning_on_checks_turned_off_is_ok_when_config_yaml_turned_them_off(tmp_path):
+    """Bulava's doctor warns on a server whose Claude checks are off. Off in config.yaml and off in the
+    engine is what was asked for; the engine running them, or config.yaml wanting them, stays a warning."""
+    from types import SimpleNamespace
+    from arceus_runner.health import engine_doctor
+    raw = example_raw()
+    raw["bulava"]["claude_checks"] = {"enabled": False}
+    off, on = load_config(write(tmp_path, raw)), load_config(EXAMPLE)
+    team = {"name": "engine.review_team", "status": "ok",
+            "detail": {"enabled": True, "members": ["contract", "security", "state"], "calls_per_round": 3}}
+
+    def doctor(cfg, *rows):
+        engine = SimpleNamespace(cfg=cfg, doctor=lambda: {"checks": list(rows)})
+        return {c.name: c for c in engine_doctor(engine)}
+
+    def row(enabled):
+        return {"name": "engine.claude_checks", "status": "warn",
+                "detail": {"enabled": enabled, "list": ["code", "security"], "min_severity": "high",
+                           "rounds": "1", "required": False}}
+
+    c = doctor(off, row(False), team)["bulava.engine.claude_checks"]
+    assert (c.status, c.detail) == ("ok", "off, as config.yaml says; Codex review team: contract, security, state")
+    assert doctor(off, row(False))["bulava.engine.claude_checks"].detail == "off, as config.yaml says"
+    assert doctor(on, row(False), team)["bulava.engine.claude_checks"].status == "warn"   # config.yaml wants them
+    assert doctor(off, row(True), team)["bulava.engine.claude_checks"].status == "warn"   # the engine still has them
+    odd = {"name": "engine.claude_checks", "status": "warn", "detail": "off"}            # a reading not understood
+    assert doctor(off, odd)["bulava.engine.claude_checks"].status == "warn"
+    failing = {**row(False), "status": "fail"}
+    assert doctor(off, failing)["bulava.engine.claude_checks"].status == "fail"
