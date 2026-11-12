@@ -73,7 +73,7 @@ def overview(ctx: Ctx) -> Response:
                            "in_file": sum(1 for f in flat if f.in_file)})
     return ctx.render("settings.html", title="Settings", groups=groups, problems=problems, path=_path(ctx),
                       current=current, loaded=_loaded(ctx, current.sha), restart=_restart_hint(ctx),
-                      legacy=sf.legacy(current.text), notice=ctx.query("notice"),
+                      notice=ctx.query("notice"),
                       versions=ctx.store.versions(KIND, 5))
 
 
@@ -95,8 +95,6 @@ def section(ctx: Ctx) -> Response:
     title, what = sf.TITLES.get(name, (name, ""))
     if ctx.request.method == "POST":
         ctx.require("settings.edit")
-        if sf.legacy(current.text):
-            return ctx.redirect("/settings/yaml/", "This config.yaml has the older layout: edit it as YAML.")
         if ctx.field("sha") != current.sha:
             return _stale_section(ctx, current, name)
         try:
@@ -110,7 +108,7 @@ def section(ctx: Ctx) -> Response:
                               notice="Nothing changed: every value is as it was.", can_edit=True)
         return _preview(ctx, current, change.text, origin=f"/settings/{name}/", changed=change.changed)
     return ctx.render("settings_section.html", title=title, what=what, name=name, fields=found, sha=current.sha,
-                      base=_b64(current.text), can_edit=ctx.can("settings.edit") and not sf.legacy(current.text),
+                      base=_b64(current.text), can_edit=ctx.can("settings.edit"),
                       notice=ctx.query("notice"))
 
 

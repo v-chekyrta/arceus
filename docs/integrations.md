@@ -23,7 +23,7 @@ code_host:
   group: clients/acme
 ```
 
-The keys at the top of each section (`bot_user`, `allowed_users`, `tags`, `states`; `git_author`, `exclude_repos`, `branch_prefix`, `mr_label`) mean the same for every provider; the rest belong to the type. An older `config.yaml` with `youtrack:` and `gitlab:` sections still loads as the same settings.
+The keys at the top of each section (`bot_user`, `allowed_users`, `tags`, `states`; `git_author`, `exclude_repos`, `branch_prefix`, `mr_label`) mean the same for every provider; the rest belong to the type.
 
 ## Adding a tracker or a code host
 

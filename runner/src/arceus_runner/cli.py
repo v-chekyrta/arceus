@@ -9,12 +9,11 @@ import os
 import sys
 from pathlib import Path
 
-import yaml
 
 from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
-from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, is_legacy, load_config, load_secrets
+from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, load_config, load_secrets
 from arceus_runner.db import ACTIVE_STATES, RUN_UNDER_WAY, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
 from arceus_runner.engine import Engine
@@ -56,10 +55,6 @@ def _print_checks(checks: list[Check], as_json: bool) -> bool:
 def cmd_check(args) -> int:
     cfg, secrets = _load(args)
     checks = [Check("config", "ok", str(_config_path(args.config)))]
-    if is_legacy(yaml.safe_load(_config_path(args.config).read_text(encoding="utf-8"))):
-        checks.append(Check("config.layout", "warn", "the youtrack: and gitlab: sections are the layout before "
-                                                     "tracker: and code_host:; they still load as before. To move "
-                                                     "on, see config/config.example.yaml"))
     try:
         require_mode_ready(cfg, bulava_mod.probe(cfg.paths.bulava))
         checks.append(Check("config.mode", "ok", cfg.mode))

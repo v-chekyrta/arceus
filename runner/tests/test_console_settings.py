@@ -261,6 +261,31 @@ def test_secrets_are_never_shown(w, tmp_path):
         assert "glpat-very-secret" not in admin.get(path).text
 
 
+def test_the_layout_before_tracker_and_code_host_is_refused_like_any_broken_config(w):
+    original = w.config.read_text()
+    old = original.replace("\ntracker:", "\nyoutrack:").replace("\ncode_host:", "\ngitlab:")
+    assert old != original
+    admin = signed_in(w.settings, "owner@example.com")
+    with ConsoleStore(w.settings.db_path) as cs:
+        versions = len(cs.versions("config"))
+    page = admin.get("/settings/yaml/").text
+    sha = re.search(r'name="sha" value="([^"]+)"', page).group(1)
+    r = admin.post("/settings/yaml/", data={"csrf": csrf_of(page), "sha": sha, "text": old})
+    assert "The runner would refuse" in r.text  # tracker.type and code_host.type are gone: locked, and required
+    assert "Save config.yaml" not in r.text
+    r = admin.post("/settings/save", data={"csrf": csrf_of(page), "sha": sha, "origin": "/settings/yaml/",
+                                           "text": old})
+    assert "The runner would refuse" in r.text
+    assert w.config.read_text() == original
+    with ConsoleStore(w.settings.db_path) as cs:
+        assert len(cs.versions("config")) == versions
+    # A file already written that way is a config that does not load, nothing else.
+    w.config.write_text(old)
+    page = admin.get("/settings/").text
+    assert "config.yaml does not load" in page and "youtrack: unknown key" in page
+    assert "older layout" not in page
+
+
 def test_a_broken_config_can_be_fixed_as_yaml(w):
     w.config.write_text(w.config.read_text().replace("mode: observe", "mode: sometimes"))
     admin = signed_in(w.settings, "owner@example.com")

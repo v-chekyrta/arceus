@@ -29,7 +29,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString, LiteralScalarString
 
-from arceus_runner.config import Config, ConfigError, is_legacy, parse_config
+from arceus_runner.config import Config, ConfigError, parse_config
 
 # Sections of the form: the top-level keys of config.yaml, in the order the example file has them, plus `general`
 # for the two plain keys at the top.
@@ -551,15 +551,13 @@ def is_locked(name: str) -> bool:
 
 def locked_changes(before: str, after: str) -> list[str]:
     """The locked settings (LOCKED_KEYS) whose value differs between two texts of config.yaml, read the way the
-    runner reads them (the older layout's sections as the new ones)."""
-    from arceus_runner.config import _from_legacy, is_legacy
+    runner reads them."""
 
     def load(text):
         try:
-            raw = pyyaml.safe_load(text) or {}
+            return pyyaml.safe_load(text) or {}
         except pyyaml.YAMLError:
             return None
-        return _from_legacy(raw) if is_legacy(raw) else raw
     a, b = load(before), load(after)
     if a is None or b is None:
         return []  # not YAML: the runner's own check refuses it anyway
@@ -647,10 +645,3 @@ def needs_setup(before: str, after: str, data_dir: Path | None = None) -> bool:
         return True
     new = outside_mounts(after, data_dir)
     return new is not None and not new <= (outside_mounts(before, data_dir) or set())
-
-
-def legacy(text: str) -> bool:
-    try:
-        return is_legacy(pyyaml.safe_load(text))
-    except pyyaml.YAMLError:
-        return False

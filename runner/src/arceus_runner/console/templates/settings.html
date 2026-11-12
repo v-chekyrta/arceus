@@ -8,8 +8,6 @@
 {% if problems %}
 <div class="alert"><p><strong>config.yaml does not load:</strong> the runner would refuse to start.</p><ul>{% for p in problems %}<li><code class="lit">{{ p }}</code></li>{% endfor %}</ul></div>
 <p><a class="btn primary" href="/settings/yaml/">{{ "Fix it as YAML" if can(user, "settings.edit") else "See it as YAML" }}</a></p>
-{% elif legacy %}
-<p class="notice warn">This config.yaml has the older layout (youtrack: and gitlab: sections): the form cannot change it. Edit it as YAML, or move it to tracker: and code_host: (config.example.yaml shows how).</p>
 {% endif %}
 <div class="toolbar">
   <a class="btn" href="/settings/yaml/">The whole file as YAML</a>

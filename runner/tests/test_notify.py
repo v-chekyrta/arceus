@@ -600,8 +600,8 @@ def test_idle_is_told_once_after_a_quarter_hour_and_never_while_people_owe_an_an
     assert len([x for x in b.flush() if "💤" in x]) == 1
 
 
-def test_an_idle_spell_is_told_once_across_a_restart_and_with_an_old_idle_repeat(tmp_path):
-    bench = Bench(tmp_path, idle_repeat="2h")  # a config.yaml from before still loads; the setting does nothing
+def test_an_idle_spell_is_told_once_across_a_restart(tmp_path):
+    bench = Bench(tmp_path)
     bench.notifier.tick("working")
     bench.notifier.tick("idle")
     bench.clock.advance(minutes=16)

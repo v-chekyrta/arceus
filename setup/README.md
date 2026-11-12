@@ -73,7 +73,7 @@ SUPERVISOR_PROFILE=server night-shift doctor --server --json --probe   # one rea
 
 `check` prints one line per mistake and names the field: a state that is not in the workflow, a tag that does not exist, a token that belongs to someone else, a repository that is not in the group. The runner does not start while any line is `FAIL`.
 
-`config.yaml` names the issue tracker in `tracker:` and the code host in `code_host:`, each with a `type` (`youtrack`, `gitlab`). The keys at the top of each section mean the same for any provider; the rest belong to that type ([config.example.yaml](../config/config.example.yaml)). A `config.yaml` from before this layout, with `youtrack:` and `gitlab:` sections, still loads as the same settings, and `check` shows a `WARN` line for it until it is moved over.
+`config.yaml` names the issue tracker in `tracker:` and the code host in `code_host:`, each with a `type` (`youtrack`, `gitlab`). The keys at the top of each section mean the same for any provider; the rest belong to that type ([config.example.yaml](../config/config.example.yaml)).
 
 `runner.db` belongs to the tracker and the code host it first ran with: its tasks, pending comments and MR ids only make sense there. If `config.yaml` later names another one, the runner refuses to start and says so. A new tracker or host gets its own `paths.db`. The same one under a new address (a moved YouTrack, a renamed GitLab host) is bound again with `arceus-runner rebind tracker` or `rebind code_host`, with the runner stopped.
 

@@ -15,7 +15,6 @@ from .conftest import EXAMPLE, example_raw
 HOOK = "https://hooks.slack.com/services/T0ACME/B0ACME/XXXXsecretXXXX"
 SLACK_HOOK = f"SLACK_WEBHOOK_URL={HOOK}\n"
 
-LEGACY = Path(__file__).parent / "data" / "config.legacy.yaml"  # config.example.yaml before tracker:/code_host:
 
 
 def write(tmp_path: Path, raw: dict) -> Path:
@@ -380,3 +379,11 @@ def test_a_service_that_would_not_come_back_after_a_reboot_is_named(monkeypatch)
     assert autostart(run=systemctl(bulava_engine="not-found", runner="not-found")) == []   # a developer's machine
     monkeypatch.setattr("arceus_runner.health.shutil.which", lambda name: None)
     assert autostart(run=systemctl(bulava_engine="disabled", runner="disabled")) == []
+
+
+def test_slack_notify_idle_repeat_is_no_longer_a_setting(tmp_path):
+    raw = example_raw()
+    raw["slack"].setdefault("notify", {})["idle_repeat"] = "2h"
+    with pytest.raises(ConfigError) as e:
+        load_config(write(tmp_path, raw))
+    assert e.value.problems == ["slack.notify.idle_repeat: unknown key (typo?)"]

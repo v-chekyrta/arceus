@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import ast
 import json
-import re
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -16,7 +15,7 @@ import yaml
 
 from arceus_runner import loop
 from arceus_runner.cli import EXIT_CHECK_FAILED, EXIT_CONFIG, EXIT_OK, main
-from arceus_runner.config import Config, ConfigError, load_config
+from arceus_runner.config import Config, ConfigError, load_config, parse_config
 from arceus_runner.db import ReviewStore
 from arceus_runner.delivery import PROJECT_NOTES_LIMIT
 from arceus_runner.engine import Engine
@@ -28,7 +27,6 @@ from .memory_providers import MemoryHost, MemoryTracker
 from .test_delivery import World, git
 
 SRC = Path(loop.__file__).parent
-LEGACY = Path(__file__).parent / "data" / "config.legacy.yaml"  # config.example.yaml before tracker:/code_host:
 DEBOUNCE = timedelta(minutes=6)
 MEMORY = "tests.memory_providers"
 
@@ -291,50 +289,50 @@ def test_the_flow_does_not_reach_into_a_provider(name):
 # -- config -----------------------------------------------------------------------------------------
 
 
-def test_the_config_before_tracker_and_code_host_loads_as_the_same_settings():
-    example = load_config(EXAMPLE).model_dump()
-    example["paths"]["project_notes"] = None  # settings newer than that layout
-    example["cleanup"]["release_after"] = None
-    legacy = load_config(LEGACY).model_dump()
-    # Slack in that layout is the bot token and its channel; the example now reports through a webhook.
-    assert (legacy.pop("slack")["alerts_channel"], example.pop("slack")["webhook_env"]) == (
-        "#acme-agent-alerts", "SLACK_WEBHOOK_URL")
-    assert legacy == example
-
-
-def legacy_problems(tmp_path, change) -> list[str]:
-    raw = yaml.safe_load(LEGACY.read_text())
+def old_layout_problems(tmp_path, change) -> list[str]:
+    raw = example_raw()
     change(raw)
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ConfigError) as e:
         load_config(path)
-    assert not [p for p in e.value.problems if re.search(r"\b(tracker|code_host|bot_user)\b", p)]
+    with pytest.raises(ConfigError) as again:
+        parse_config(path.read_text(), path)
+    assert again.value.problems == e.value.problems
     return e.value.problems
 
 
-def test_errors_in_the_old_layout_name_its_own_keys(tmp_path):
-    def two(raw):
-        del raw["youtrack"]["states"]["in_progress"]
-        raw["gitlab"]["bot_username"] = ""
-    assert sorted(legacy_problems(tmp_path, two)) == [
-        "gitlab.bot_username: String should have at least 1 character", "youtrack.states.in_progress: required"]
-    assert legacy_problems(tmp_path, lambda raw: raw["youtrack"]["allowed_users"].append("agent-runner")) == [
-        "youtrack: allowed_users must not contain the bot itself (agent-runner)"]
-    [gone] = legacy_problems(tmp_path, lambda raw: raw["gitlab"].update(default_repo="acme-theme"))
-    assert gone.startswith("gitlab: gitlab.default_repo is no longer used")
+def test_the_layout_before_tracker_and_code_host_is_refused(tmp_path):
+    def old(raw):
+        raw["youtrack"] = {k: v for k, v in raw.pop("tracker").items() if k != "type"}
+        raw["gitlab"] = {k: v for k, v in raw.pop("code_host").items() if k != "type"}
+    problems = old_layout_problems(tmp_path, old)
+    assert "youtrack: unknown key (typo?)" in problems and "gitlab: unknown key (typo?)" in problems
+    assert "tracker: required" in problems and "code_host: required" in problems
 
 
-def test_check_says_the_old_layout_still_works_but_is_old(tmp_path, capsys):
-    raw = yaml.safe_load(LEGACY.read_text())
-    secrets = tmp_path / "secrets.env"
-    secrets.write_text("YOUTRACK_TOKEN=a\nGITLAB_TOKEN=b\nSLACK_BOT_TOKEN=c\n")
-    secrets.chmod(0o600)
-    raw["paths"] = {"secrets": str(secrets)}
+def test_an_old_section_next_to_the_new_ones_is_refused_not_ignored(tmp_path):
+    problems = old_layout_problems(tmp_path, lambda raw: raw.update(youtrack=dict(raw["tracker"])))
+    assert problems == ["youtrack: unknown key (typo?)"]
+
+
+def test_the_old_bot_key_names_are_refused_in_the_new_sections(tmp_path):
+    def old_names(raw):
+        raw["tracker"]["bot_login"] = raw["tracker"].pop("bot_user")
+        raw["code_host"]["bot_username"] = raw["code_host"].pop("bot_user")
+    problems = old_layout_problems(tmp_path, old_names)
+    assert {"tracker.bot_login: unknown key (typo?)", "code_host.bot_username: unknown key (typo?)",
+            "tracker.bot_user: required", "code_host.bot_user: required"} <= set(problems)
+
+
+def test_check_refuses_the_old_layout(tmp_path, capsys):
+    raw = example_raw()
+    raw["youtrack"] = raw.pop("tracker")
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))
-    assert main(["--config", str(path), "check", "--offline"]) == EXIT_OK
-    assert "[WARN] config.layout: the youtrack: and gitlab: sections" in capsys.readouterr().out
+    assert main(["--config", str(path), "check", "--offline"]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "youtrack: unknown key" in err and "Traceback" not in err
 
 
 def test_check_shows_the_project_notes_and_fails_on_a_missing_file(tmp_path, capsys):

@@ -193,8 +193,6 @@ class SlackNotify(Strict):
     summary_every: Duration = timedelta(minutes=30)     # what a running task did, only when it did something
     summaries_off_hours: bool = False                   # off hours the summary waits for the working day
     idle_after: Duration = timedelta(minutes=15)        # nothing to take this long, in working hours: said once
-    # No longer used: an idle spell is told once. Kept so a config.yaml that still sets it loads.
-    idle_repeat: Duration | None = None
     question_reminder: Duration = timedelta(hours=24)   # an unanswered question or held text: again, in working hours
     service_down_after: Duration = timedelta(minutes=10)  # the tracker or code host unreachable this long
     runner_lifecycle: bool = False                      # tell the runner's starts and stops (off: events.jsonl only)
@@ -723,37 +721,6 @@ def _provider_section(kind: str):
     return classmethod(pick)
 
 
-# The layout before `tracker:` and `code_host:`: a `youtrack:` and a `gitlab:` section. It still loads,
-# read as the same settings; the keys that were renamed on the way are named back in its errors.
-LEGACY_SECTIONS = {"youtrack": ("tracker", {"bot_login": "bot_user"}),
-                   "gitlab": ("code_host", {"bot_username": "bot_user"})}
-
-
-def is_legacy(raw: object) -> bool:
-    return isinstance(raw, dict) and any(k in raw for k in LEGACY_SECTIONS)
-
-
-def _from_legacy(raw: dict) -> dict:
-    out = dict(raw)
-    for old, (new, renamed) in LEGACY_SECTIONS.items():
-        if old not in out or new in out:
-            continue
-        section = out.pop(old)
-        if isinstance(section, dict):
-            section = {"type": old, **{renamed.get(k, k): v for k, v in section.items()}}
-        out[new] = section
-    return out
-
-
-def legacy_words(text: str) -> str:
-    """An error about the new layout, worded for a config.yaml in the old one."""
-    for old, (new, renamed) in LEGACY_SECTIONS.items():
-        for was, now in renamed.items():
-            text = re.sub(rf"\b{new}\.{now}\b", f"{new}.{was}", text)
-        text = re.sub(rf"(?<![\w.]){new}(?=[.:]|$)", old, text)
-    return text
-
-
 class Config(Strict):
     project: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     # observe: read the tracker and the code host, log what would happen, change nothing.
@@ -778,11 +745,6 @@ class Config(Strict):
 
     _tracker = field_validator("tracker", mode="wrap")(_provider_section("issue tracker"))
     _code_host = field_validator("code_host", mode="wrap")(_provider_section("code host"))
-
-    @model_validator(mode="before")
-    @classmethod
-    def _legacy(cls, data):
-        return _from_legacy(data) if is_legacy(data) else data
 
     @model_validator(mode="after")
     def _security(self) -> Config:
@@ -844,8 +806,7 @@ def parse_config(text: str, path: Path | str = "config.yaml") -> Config:
     try:
         return Config.model_validate(raw)
     except ValidationError as e:
-        problems = _format(e)
-        raise ConfigError([legacy_words(p) for p in problems] if is_legacy(raw) else problems) from None
+        raise ConfigError(_format(e)) from None
 
 
 def read_env_file(path: Path) -> dict[str, str]:
