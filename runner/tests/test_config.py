@@ -419,3 +419,7 @@ def test_the_engine_warning_on_checks_turned_off_is_ok_when_config_yaml_turned_t
     assert doctor(off, odd)["bulava.engine.claude_checks"].status == "warn"
     failing = {**row(False), "status": "fail"}
     assert doctor(off, failing)["bulava.engine.claude_checks"].status == "fail"
+    unknown = {**row(False), "status": "unexpected"}                                     # a status not understood
+    assert doctor(off, unknown)["bulava.engine.claude_checks"].status == "warn"
+    nameless = {k: v for k, v in row(False).items() if k != "status"}                   # no status at all
+    assert doctor(off, nameless)["bulava.engine.claude_checks"].status == "warn"

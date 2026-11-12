@@ -125,7 +125,7 @@ def engine_doctor(engine: Engine) -> list[Check]:
     for c in checks:
         status = c.get("status") if c.get("status") in ("ok", "warn", "fail") else "warn"
         detail = c.get("detail")
-        if (off and c.get("name") == "engine.claude_checks" and status == "warn" and isinstance(detail, dict)
+        if (off and c.get("name") == "engine.claude_checks" and c.get("status") == "warn" and isinstance(detail, dict)
                 and detail.get("enabled") is False):
             out.append(Check("bulava.engine.claude_checks", "ok", "off, as config.yaml says" + _review_team(checks)))
             continue
