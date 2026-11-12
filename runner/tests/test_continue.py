@@ -22,6 +22,11 @@ def failed(w: World, **settle) -> int:
     return task.failed_at_ms
 
 
+def release_note_now(w: World) -> str | None:
+    from arceus_runner.cleanup import release_note
+    return release_note(w.store, "ACME-1")
+
+
 def sends(w: World) -> list[dict]:
     return w.calls("worker-send")
 
@@ -357,3 +362,30 @@ def test_a_continue_waits_while_another_task_holds_the_workspace(w):
     w.tick()
     assert w.store.task("ACME-1").state == "dispatched" and len(w.calls("dispatch")) == 2
     assert set(branches(w).values()) == {mine}
+
+
+def test_a_continue_tells_the_agent_what_cleanup_removed_while_the_task_waited(w):
+    """The task's containers went while it waited (cleanup.release_after): the next message it is sent names them,
+    in the runner's words after the person's, so the agent makes them again instead of finding them gone. A later
+    message does not repeat what it was told."""
+    failed(w)
+    at = (w.now + timedelta(days=4)).isoformat()
+    w.store.cleanup_started("r1", "daily", "full", "act", at)
+    w.store.cleanup_item("r1", "container", "c1", "remove", "done", "ACME-1", {"name": "acme1-db"})
+    w.store.cleanup_item("r1", "volume", "acme1-testdb", "remove", "done", "ACME-1", {"name": "acme1-testdb"})
+    w.store.cleanup_item("r1", "process", "300:3", "kill", "done", "ACME-1", {"name": "npm run dev (pid 300)"})
+    w.store.cleanup_item("r1", "container", "c2", "remove", "kept", "ACME-1", {"name": "acme1-repro"})
+    w.store.cleanup_item("r1", "container", "c3", "remove", "done", "ACME-9", {"name": "acme9-db"})
+    w.now += timedelta(days=4, hours=1)
+    w.yt.comment("2-1", "j.doe", "/continue The verifier is fixed now, finish the error pages.")
+    w.tick()
+    w.tick()
+    [send] = sends(w)
+    text = send["argv"][-1]
+    person, _, note = text.partition("\n\nRunner note: ")
+    assert person.endswith("The verifier is fixed now, finish the error pages.")
+    assert note.startswith("while this task waited, the server's cleanup removed what can be made again: "
+                           "containers acme1-db; volumes acme1-testdb; 1 dev server.")
+    assert "acme1-repro" not in note and "acme9" not in note and "npm run dev" not in note
+    assert "declare the outcome blocked" in note
+    assert release_note_now(w) is None  # the attempt it began is after the removal: told once

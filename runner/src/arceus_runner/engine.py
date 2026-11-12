@@ -91,6 +91,9 @@ class Engine:
         # While it answers a reason, nothing new goes to the engine: the console is restarting it once its running
         # tasks end (console/hostops.py). Every caller already takes the busy answer as "try again later".
         self.held: Callable[[], str | None] = lambda: None
+        # The runner's own words added to what a task is sent, after the screen: what cleanup removed while the task
+        # waited (cleanup.release_note), so the agent makes it again instead of finding it gone.
+        self.notes: Callable[[str], str | None] = lambda task_id: None
 
     def env(self) -> dict[str, str]:
         b = self.cfg.bulava
@@ -178,13 +181,19 @@ class Engine:
     def dispatch(self, *, task_id: str, message_id: str, author: str, branch: str, base: str, repo: Path,
                  text: str, clearance: Clearance, source: str = "tracker", extra_dirs: Path | None = None) -> Reply:
         _require(clearance, text, task_id)
+        text = self._noted(task_id, text)
         return self._call("dispatch", task_id, message_id, [
             str(self.bin / "dispatch.sh"), "--task-id", task_id, "--message-id", message_id, "--source", source,
             "--author", author, "--branch", branch, "--base", base, "--dirty", "fail", str(repo), text], extra_dirs)
 
+    def _noted(self, task_id: str, text: str) -> str:
+        note = self.notes(task_id)
+        return f"{text}\n\n{note}" if note else text
+
     def send(self, *, task_id: str, message_id: str, source: str, author: str, repo: Path, text: str,
              clearance: Clearance, answers: str | None = None, extra_dirs: Path | None = None) -> Reply:
         _require(clearance, text, task_id)
+        text = self._noted(task_id, text)
         args = [str(self.bin / "worker-send.sh"), "--task-id", task_id, "--relation", "continue",
                 "--message-id", message_id, "--source", source, "--author", author]
         if answers:

@@ -52,11 +52,11 @@ class FakeDocker:
 
     def add(self, cid: str, *, status: str = "exited", created: datetime, finished: datetime | None = None,
             labels: dict | None = None, binds: tuple = (), volumes: tuple = (), networks: tuple = (),
-            image: str = "sha256:postgres") -> None:
+            image: str = "sha256:postgres", auto_remove: bool = False) -> None:
         self.cs[cid] = {
             "Id": cid, "Name": f"/{cid}", "Created": iso(created), "Image": image,
             "State": {"Status": status, "FinishedAt": iso(finished) if finished else "0001-01-01T00:00:00Z"},
-            "Config": {"Labels": labels or {}, "Image": "postgres:16"},
+            "Config": {"Labels": labels or {}, "Image": "postgres:16"}, "HostConfig": {"AutoRemove": auto_remove},
             "Mounts": [{"Type": "bind", "Source": b} for b in binds] + [{"Type": "volume", "Name": v} for v in volumes],
             "NetworkSettings": {"Networks": {n: {} for n in networks}},
         }
@@ -77,6 +77,16 @@ class FakeDocker:
 
     def containers(self) -> list[dict]:
         return copy.deepcopy(list(self.cs.values()))
+
+    def labelled_mounts(self, label: str, disposable: str) -> list[tuple[str, bool, list[str]]]:
+        self.calls.append(("ps", label))
+        out = []
+        for c in self.cs.values():
+            labels = c["Config"]["Labels"]
+            names = [m["Name"] for m in c["Mounts"] if m.get("Type") == "volume" and len(m["Name"]) == 64]
+            if labels.get(label) and names:
+                out.append((labels[label], labels.get(disposable) == "true" or c["HostConfig"]["AutoRemove"], names))
+        return out
 
     def container(self, cid: str) -> dict | None:
         return copy.deepcopy(self.cs.get(cid))
@@ -1137,6 +1147,130 @@ def test_real_docker_removes_only_what_a_finished_task_labelled(tmp_path):
         w.store.close()
 
 
+@pytest.mark.skipif(not os.environ.get("ARCEUS_REAL_DOCKER"), reason="set ARCEUS_REAL_DOCKER=1 on a host with Docker")
+def test_real_docker_releases_only_what_a_waiting_task_marked_disposable(tmp_path):
+    """Against the real daemon: a task waiting past `release_after` loses its `arceus.disposable` container with
+    its anonymous volume, its `--rm` container, its marked volume and its network; its unmarked container keeps
+    its anonymous volume and its unmarked volume stays. The next message to the agent names what went."""
+    from arceus_runner.cleanup import release_note
+    from arceus_runner.dockerops import Docker
+    import uuid
+    tag = uuid.uuid4().hex[:8].lower()
+    key = f"ZZ{tag.upper()}-2"
+    w = World(tmp_path, release_after="3d")
+    w.docker = Docker()
+    w.docker.dangling_images = lambda: 0
+    w.cleanup = w.make()
+    real_now = datetime.now(UTC)
+    w.task(key, "code_review")
+    w.store.update_task(key, attempt_started=(real_now - timedelta(days=6)).isoformat())
+    worked(w, key, real_now - timedelta(days=6), real_now - timedelta(days=5))
+
+    def run(*args: str) -> str:
+        return subprocess.run(["docker", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    own = ["--label", f"arceus.task={key}"]
+    gone = [*own, "--label", "arceus.disposable=true"]
+    made = {"container": [], "volume": [], "network": []}
+    try:
+        made["container"].append(run("create", *gone, "--name", f"zz-{tag}-db", "-v", "/data", "busybox:1.36", "true"))
+        made["container"].append(run("create", *own, "--name", f"zz-{tag}-repro", "-v", "/data", "busybox:1.36",
+                                     "true"))
+        made["container"].append(run("run", "-d", "--rm", *own, "--name", f"zz-{tag}-app", "busybox:1.36",
+                                     "sleep", "600"))
+        db_vol = run("inspect", "-f", "{{range .Mounts}}{{.Name}}{{end}}", f"zz-{tag}-db")
+        repro_vol = run("inspect", "-f", "{{range .Mounts}}{{.Name}}{{end}}", f"zz-{tag}-repro")
+        made["volume"] += [db_vol, repro_vol,
+                           run("volume", "create", *gone, f"zz-{tag}-testdb"), run("volume", "create", *own,
+                                                                                    f"zz-{tag}-dump")]
+        made["network"].append(run("network", "create", *own, f"zz-{tag}-net"))
+        w.now = real_now + timedelta(hours=1)
+
+        result = w.cleanup.run("full", "manual")
+
+        assert result["status"] == "succeeded", result["errors"]
+        assert run("ps", "-a", "--format", "{{.Names}}", "--filter", f"label=arceus.task={key}") == f"zz-{tag}-repro"
+        volumes = set(run("volume", "ls", "-q").split())
+        assert db_vol not in volumes and f"zz-{tag}-testdb" not in volumes
+        assert {repro_vol, f"zz-{tag}-dump"} <= volumes
+        assert run("network", "ls", "-q", "--filter", f"name=zz-{tag}-net") == ""
+        note = release_note(w.store, key)
+        assert f"zz-{tag}-db" in note and f"zz-{tag}-app" in note and f"zz-{tag}-testdb" in note
+        assert f"zz-{tag}-repro" not in note and f"zz-{tag}-dump" not in note
+        # The agent's next round makes them again from the same commands: nothing half-removed holds a name.
+        made["container"].append(run("create", *gone, "--name", f"zz-{tag}-db", "-v", "/data", "busybox:1.36",
+                                     "true"))
+        made["container"].append(run("run", "-d", "--rm", *own, "--name", f"zz-{tag}-app", "busybox:1.36",
+                                     "sleep", "600"))
+        made["volume"].append(run("volume", "create", *gone, f"zz-{tag}-testdb"))
+        made["network"].append(run("network", "create", *own, f"zz-{tag}-net"))
+        made["volume"].append(run("inspect", "-f", "{{range .Mounts}}{{.Name}}{{end}}", f"zz-{tag}-db"))
+        assert run("start", "-a", f"zz-{tag}-db") == "" and run("inspect", "-f", "{{.State.ExitCode}}",
+                                                              f"zz-{tag}-db") == "0"
+    finally:
+        for kind, ids in made.items():
+            for i in ids:
+                subprocess.run(["docker", *(["rm", "-f", "-v"] if kind == "container" else [kind, "rm"]), i],
+                               capture_output=True)
+        w.events.close()
+        w.store.close()
+
+
+@pytest.mark.skipif(not os.environ.get("ARCEUS_REAL_DOCKER"), reason="set ARCEUS_REAL_DOCKER=1 on a host with Docker")
+def test_real_docker_removes_only_the_anonymous_volumes_a_finished_tasks_container_left(tmp_path):
+    """Against the real daemon: mongo-style `-v /data/db -v /data/configdb` volumes of a container labelled for a
+    finished task, removed with `docker rm -f` (no -v), go a day after a pass first saw them unused: the runner saw
+    the container use them. The same volumes of an unlabelled container stay, and so does one a stopped container
+    still has. Every volume the host had before the test is protected as well."""
+    from arceus_runner.dockerops import Docker
+    import uuid
+
+    def run(*args: str) -> str:
+        return subprocess.run(["docker", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    w = World(tmp_path, protect={"volumes": run("volume", "ls", "-q").split()}, stopped_after="30d")
+    w.docker = Docker()
+    w.docker.dangling_images = lambda: 0
+    w.cleanup = w.make()
+    tag = uuid.uuid4().hex[:8]
+    key = f"ZZ{tag.upper()}-1"
+    w.task(key, "done")
+    made: list[str] = []
+
+    def database(name: str, *labels: str) -> list[str]:
+        run("create", "--name", name, *labels, "-v", "/data/db", "-v", "/data/configdb", "busybox:1.36", "true")
+        found = run("inspect", "-f", "{{range .Mounts}}{{.Name}} {{end}}", name).split()
+        made.extend(found)
+        return found
+    try:
+        left = database(f"zz-{tag}-db", "--label", f"arceus.task={key}")
+        stranger = database(f"zz-{tag}-person")
+        w.now = datetime.now(UTC)
+        w.cleanup.observe()  # the runner's tick, while the containers exist
+        run("rm", "-f", f"zz-{tag}-db", f"zz-{tag}-person")  # as the agents did: no -v
+        run("create", "--name", f"zz-{tag}-kept", "-v", "/data", "busybox:1.36", "true")
+        kept = run("inspect", "-f", "{{range .Mounts}}{{.Name}}{{end}}", f"zz-{tag}-kept")
+        made.append(kept)
+
+        first = w.cleanup.run("full", "manual")
+        assert first["status"] == "succeeded", first["errors"]
+        assert set(left) <= set(run("volume", "ls", "-q").split())
+        w.now += timedelta(hours=25)
+        second = w.cleanup.run("full", "manual")
+
+        assert second["status"] == "succeeded", second["errors"]
+        assert w.items(second) == {f"anonymous volume {v[:12]}": ("remove", "done") for v in left}
+        volumes = set(run("volume", "ls", "-q").split())
+        assert not set(left) & volumes and {kept, *stranger} <= volumes
+    finally:
+        subprocess.run(["docker", "rm", "-f", f"zz-{tag}-kept", f"zz-{tag}-db", f"zz-{tag}-person"],
+                       capture_output=True)
+        for v in made:
+            subprocess.run(["docker", "volume", "rm", v], capture_output=True)
+        w.events.close()
+        w.store.close()
+
+
 def test_cli_plans_without_changing_anything_and_acts_when_asked(tmp_path, monkeypatch, capsys):
     import yaml
 
@@ -1646,3 +1780,445 @@ def test_mount_id_reads_fdinfo(tmp_path):
         assert isinstance(_mount_id(fd), int)
     finally:
         os.close(fd)
+
+
+# -- a task left waiting (release_after) ---------------------------------------------------------
+
+
+@pytest.fixture
+def waiting_world(tmp_path):
+    w = World(tmp_path, release_after="3d")
+    yield w
+    w.events.close()
+    w.store.close()
+
+
+def worked(w: World, key: str, start: datetime, end: datetime) -> None:
+    """`key` held the workspace from `start` to `end`: a round of its work."""
+    w.store.hold_workspace(key, iso(start))
+    w.store.hold_workspace(None, iso(end))
+
+
+def left_behind(w: World, key: str, made: datetime, done: datetime) -> None:
+    """What a task's agent typically leaves. Marked as made again by a script (`arceus.disposable=true`) or `--rm`:
+    a test database with its anonymous volume, a running app container, a seeded volume. Not marked, so possibly
+    the only copy of something: a reproduction container with its anonymous volume, and a volume. Plus a labelled
+    network and image, and a compose service it started (tied to it by time only)."""
+    tag = key.lower().replace("-", "")
+    own, gone = {"arceus.task": key}, {"arceus.task": key, "arceus.disposable": "true"}
+    d = w.docker
+    d.add_volume(f"{'a' * 63}{tag[-1]}", {"com.docker.volume.anonymous": ""})
+    d.add(f"{tag}-db", created=made, finished=done, labels=gone, volumes=(f"{'a' * 63}{tag[-1]}",))
+    d.add(f"{tag}-app", status="running", created=made, labels=own, auto_remove=True)
+    d.add_volume(f"{'b' * 63}{tag[-1]}", {"com.docker.volume.anonymous": ""})
+    d.add(f"{tag}-repro", created=made, finished=done, labels=own, volumes=(f"{'b' * 63}{tag[-1]}",))
+    d.add(f"{tag}-web-1", created=made, finished=done, labels=compose(w.ws, "web"), binds=(str(w.ws / "web"),))
+    d.add_volume(f"{tag}-testdb", gone)
+    d.add_volume(f"{tag}-dump", own)
+    d.add_network(f"net-{tag}", f"{tag}-net", made, own)
+    d.add_image(f"sha256:{tag}", (f"{tag}-app:dev",), own)
+
+
+def test_a_task_left_waiting_loses_what_can_be_made_again_and_keeps_its_work(waiting_world):
+    """A merge request waits for review for days: after `release_after` with no work, what is marked as made again
+    goes (containers, test data), with its network, image and dev server; what nothing marks so stays, and so do
+    its branch, uncommitted files, notes and screenshots."""
+    w = waiting_world
+    w.task("ACME-2", "code_review", updated=T0)  # touched by bookkeeping today: not work
+    worked(w, "ACME-2", T0 - timedelta(days=5), T0 - timedelta(days=4))
+    left_behind(w, "ACME-2", T0 - timedelta(days=5) + timedelta(hours=1), T0 - timedelta(days=4))
+    w.procs = [Proc(300, 3, T0 - timedelta(days=4, hours=12), w.ws, "python manage.py runserver", session=False)]
+    web = make_repo(w, "web")
+    git(web, "checkout", "-q", "-b", "agent/ACME-2-work")
+    (web / "half-done.py").write_text("x")
+    for kind in ("notes", "media", "replies"):
+        (w.ws / ".arceus" / kind / "ACME-2").mkdir(parents=True)
+
+    result = w.cleanup.run("full", "manual")
+
+    assert w.items(result) == {
+        "acme2-db": ("remove", "done"), "acme2-app": ("stop", "done"), "acme2-testdb": ("remove", "done"),
+        "acme2-net": ("remove", "done"), "acme2-app:dev": ("remove", "done"),
+        "python manage.py runserver (pid 300)": ("kill", "done")}
+    why = {i["name"]: i["why"] for i in result["planned"]}
+    assert why["acme2-testdb"] == "test data of ACME-2, which has waited 4 days with no work"
+    assert ("rm", "acme2-db") in w.docker.calls and "a" * 63 + "2" not in w.docker.vols  # its test database went too
+    assert {"acme2-repro", "acme2-dump", "b" * 63 + "2"} <= set(w.docker.cs) | set(w.docker.vols)  # maybe unique
+    assert "acme2-web-1" in w.docker.cs  # a compose service tied by time, nothing marks it disposable
+    assert (web / "half-done.py").exists() and git(web, "stash", "list") == ""
+    assert git(web, "rev-parse", "--abbrev-ref", "HEAD") == "agent/ACME-2-work"
+    assert all((w.ws / ".arceus" / kind / "ACME-2").exists() for kind in ("notes", "media", "replies"))
+
+
+def test_the_wait_is_counted_from_the_last_work(waiting_world):
+    w = waiting_world
+    w.task("ACME-2", "code_review")  # under the limit by a minute
+    worked(w, "ACME-2", T0 - timedelta(days=4), T0 - timedelta(days=3) + timedelta(minutes=1))
+    w.task("ACME-3", "code_review")  # an old round, but a `/continue` (or the MR comment) since
+    worked(w, "ACME-3", T0 - timedelta(days=9), T0 - timedelta(days=8))
+    w.store.update_task("ACME-3", published_at_ms=int((T0 - timedelta(days=1)).timestamp() * 1000))
+    w.task("ACME-4", "needs_input")  # asked its question two days ago
+    w.store.update_task("ACME-4", question_at_ms=int((T0 - timedelta(days=2)).timestamp() * 1000))
+    w.task("ACME-5", "needs_input", updated=T0 - timedelta(days=6))  # nothing else known of it: its record's age
+    for key in ("ACME-2", "ACME-3", "ACME-4", "ACME-5"):
+        w.docker.add(f"{key}-db", created=T0 - timedelta(days=10), finished=T0 - timedelta(days=9),
+                     labels={"arceus.task": key, "arceus.disposable": "true"})
+
+    assert w.items(w.cleanup.run("full", "manual")) == {"ACME-5-db": ("remove", "done")}
+
+    w.now = T0 + timedelta(minutes=2)
+    assert w.items(w.cleanup.run("full", "manual")) == {"ACME-2-db": ("remove", "done")}
+
+
+def test_a_task_about_to_go_on_keeps_everything(waiting_world):
+    """Review comments waiting for the agent, or an accepted `/continue`: the round is next, whatever the wait."""
+    w = waiting_world
+    w.task("ACME-2", "code_review")
+    w.task("ACME-3", "failed", failed_at=T0 - timedelta(days=5))
+    for key in ("ACME-2", "ACME-3"):
+        worked(w, key, T0 - timedelta(days=6), T0 - timedelta(days=5))
+        w.docker.add(f"{key}-db", created=T0 - timedelta(days=6), finished=T0 - timedelta(days=5),
+                     labels={"arceus.task": key, "arceus.disposable": "true"})
+    w.store.add_signal("n1", "ACME-2", "review", "j.doe", "please rename it", iso(T0 - timedelta(hours=1)))
+    w.store.action_intent("yt-continue-c1", "ACME-3", "continue", '{"author": "j.doe", "comment": "c1"}')
+
+    assert w.items(w.cleanup.run("full", "manual")) == {}
+    assert {"ACME-2-db", "ACME-3-db"} <= set(w.docker.cs)
+
+
+def test_an_answer_that_comes_during_the_pass_keeps_what_was_planned(waiting_world, monkeypatch):
+    w = waiting_world
+    w.task("ACME-3", "failed", failed_at=T0 - timedelta(days=5))
+    worked(w, "ACME-3", T0 - timedelta(days=6), T0 - timedelta(days=5))
+    w.docker.add("acme3-db", created=T0 - timedelta(days=6), finished=T0 - timedelta(days=5),
+                 labels={"arceus.task": "ACME-3", "arceus.disposable": "true"})
+    w.docker.add_volume("acme3-testdb", {"arceus.task": "ACME-3", "arceus.disposable": "true"})
+    plan = w.cleanup.plan
+
+    def plan_then_continue(*a, **kw):
+        found = plan(*a, **kw)
+        w.store.action_intent("yt-continue-c1", "ACME-3", "continue", '{"author": "j.doe", "comment": "c1"}')
+        return found
+    monkeypatch.setattr(w.cleanup, "plan", plan_then_continue)
+
+    result = w.cleanup.run("full", "manual")
+
+    assert w.items(result) == {"acme3-db": ("remove", "kept"), "acme3-testdb": ("remove", "kept")}
+    assert "acme3-db" in w.docker.cs and "acme3-testdb" in w.docker.vols
+
+
+def test_a_live_or_silent_engine_session_keeps_a_waiting_tasks_things_in_an_independent_pass(waiting_world):
+    """A full pass waits for a quiet engine anyway; an independent one runs beside a working task, so it asks the
+    engine about each task it would release."""
+    w = waiting_world
+    w.task("ACME-1", "dispatched")
+    w.task("ACME-2", "needs_input")
+    worked(w, "ACME-2", T0 - timedelta(days=6), T0 - timedelta(days=5))
+    w.docker.add("acme2-db", created=T0 - timedelta(days=6), finished=T0 - timedelta(days=5),
+                 labels={"arceus.task": "ACME-2", "arceus.disposable": "true"})
+    holder = w.store.task("ACME-1")
+
+    w.engine.shows["ACME-2"] = {"state": "needs_input", "attempt_live": True}
+    assert w.items(w.make().run("independent", "daily", holder)) == {}
+    w.engine.shows.clear()
+    w.engine.broken = True
+    assert w.items(w.make().run("independent", "daily", holder)) == {}
+    w.engine.broken = False
+    assert w.items(w.make().run("independent", "daily", holder)) == {"acme2-db": ("remove", "done")}
+
+
+def test_report_mode_lists_a_waiting_tasks_things_and_removes_nothing(tmp_path):
+    w = World(tmp_path, cleanup_mode="report", release_after="3d")
+    try:
+        w.task("ACME-2", "code_review")
+        worked(w, "ACME-2", T0 - timedelta(days=5), T0 - timedelta(days=4))
+        left_behind(w, "ACME-2", T0 - timedelta(days=5) + timedelta(hours=1), T0 - timedelta(days=4))
+        before = (copy.deepcopy(w.docker.cs), copy.deepcopy(w.docker.vols), copy.deepcopy(w.docker.nets))
+
+        result = w.cleanup.run("full", "manual")
+
+        assert {n: a for n, (a, _r) in w.items(result).items()} == {
+            "acme2-db": "remove", "acme2-app": "stop", "acme2-testdb": "remove", "acme2-net": "remove",
+            "acme2-app:dev": "remove"}
+        assert (w.docker.cs, w.docker.vols, w.docker.nets) == before and w.docker.calls == []
+    finally:
+        w.events.close()
+        w.store.close()
+
+
+def test_without_release_after_a_waiting_task_keeps_everything(world):
+    world.task("ACME-2", "code_review")
+    worked(world, "ACME-2", T0 - timedelta(days=60), T0 - timedelta(days=59))
+    left_behind(world, "ACME-2", T0 - timedelta(days=60), T0 - timedelta(days=59))
+    assert world.items(world.cleanup.run("full", "manual")) == {}
+
+
+def test_release_after_is_a_wait_not_a_pause(tmp_path):
+    with pytest.raises(ValueError, match="at least 1h"):
+        config(tmp_path, release_after="30m")
+    assert config(tmp_path, release_after="2d").cleanup.release_after == timedelta(days=2)
+
+
+def test_a_mark_taken_off_during_the_pass_keeps_the_container(waiting_world, monkeypatch):
+    w = waiting_world
+    w.task("ACME-2", "code_review")
+    worked(w, "ACME-2", T0 - timedelta(days=6), T0 - timedelta(days=5))
+    w.docker.add("acme2-db", created=T0 - timedelta(days=6), finished=T0 - timedelta(days=5),
+                 labels={"arceus.task": "ACME-2", "arceus.disposable": "true"})
+    plan = w.cleanup.plan
+
+    def plan_then_unmark(*a, **kw):
+        found = plan(*a, **kw)
+        del w.docker.cs["acme2-db"]["Config"]["Labels"]["arceus.disposable"]  # the agent took the mark off
+        return found
+    monkeypatch.setattr(w.cleanup, "plan", plan_then_unmark)
+
+    assert w.items(w.cleanup.run("full", "manual")) == {"acme2-db": ("remove", "kept")}
+    assert "acme2-db" in w.docker.cs
+
+
+def test_a_release_cut_short_goes_on_at_the_next_pass_and_says_what_it_did(waiting_world, monkeypatch):
+    """The pass's budget runs out after the first removal: the rest is `skipped`, the pass `partial`, and the next
+    pass removes what is left. What the agent is told lists only what was really removed."""
+    from arceus_runner.cleanup import release_note
+    w = waiting_world
+    w.task("ACME-2", "code_review")
+    w.store.update_task("ACME-2", attempt_started=iso(T0 - timedelta(days=6)))
+    worked(w, "ACME-2", T0 - timedelta(days=6), T0 - timedelta(days=5))
+    for name in ("acme2-a", "acme2-b"):
+        w.docker.add(name, created=T0 - timedelta(days=6), finished=T0 - timedelta(days=5),
+                     labels={"arceus.task": "ACME-2", "arceus.disposable": "true"})
+    remove = w.docker.remove_container
+
+    def slow_remove(cid, volumes=True):
+        remove(cid, volumes)
+        w.mono.advance(w.cfg.cleanup.max_duration.total_seconds() + 1)
+    monkeypatch.setattr(w.docker, "remove_container", slow_remove)
+
+    first = w.cleanup.run("full", "manual")
+    assert first["status"] == "partial"
+    assert sorted(w.items(first).values()) == [("remove", "done"), ("remove", "skipped")]
+    [left] = [n for n in ("acme2-a", "acme2-b") if n in w.docker.cs]
+    assert release_note(w.store, "ACME-2").count("acme2-") == 1 and left not in release_note(w.store, "ACME-2")
+
+    w.now += w.cfg.cleanup.retry_after
+    second = w.cleanup.run("full", "retry")
+    assert second["status"] == "succeeded" and w.items(second) == {left: ("remove", "done")}
+    assert "removed what can be made again: containers acme2-a, acme2-b. " in release_note(w.store, "ACME-2")
+
+
+def test_the_note_names_only_what_an_acting_pass_removed_since_the_last_attempt(waiting_world):
+    from arceus_runner.cleanup import release_note
+    w = waiting_world
+    w.task("ACME-2", "code_review")
+    w.store.update_task("ACME-2", attempt_started=iso(T0 - timedelta(days=5)))
+    w.store.cleanup_started("old", "daily", "full", "act", iso(T0 - timedelta(days=9)))
+    w.store.cleanup_item("old", "container", "c0", "remove", "done", "ACME-2", {"name": "told-before"})
+    w.store.cleanup_started("seen", "daily", "full", "report", iso(T0 - timedelta(days=1)))
+    w.store.cleanup_item("seen", "container", "c1", "remove", "planned", "ACME-2", {"name": "only-planned"})
+    assert release_note(w.store, "ACME-2") is None
+    w.store.cleanup_started("now", "daily", "full", "act", iso(T0))
+    w.store.cleanup_item("now", "image", "sha256:1", "remove", "done", "ACME-2", {"name": "acme2-app:dev"})
+    w.store.cleanup_item("now", "network", "n1", "remove", "done", "ACME-2", {"name": "acme2-net"})
+    w.store.cleanup_item("now", "volume", "v`rm -rf`", "remove", "done", "ACME-2", {"name": "v`rm -rf`"})
+    note = release_note(w.store, "ACME-2")
+    assert "networks acme2-net; images acme2-app:dev." in note
+    assert "told-before" not in note and "only-planned" not in note and "rm -rf" not in note
+
+
+# -- anonymous volumes left behind (orphaned_volumes_after) ---------------------------------------
+
+
+def anon(n: int) -> str:
+    return f"{n:064x}"
+
+
+def orphan(w: World, n: int, created: datetime = T0 - timedelta(days=2)) -> str:
+    w.docker.add_volume(anon(n), {"com.docker.volume.anonymous": ""}, created=created)
+    return anon(n)
+
+
+def left_by(w: World, key: str | None, n: int, *, disposable: bool = False) -> str:
+    """A container (labelled for `key`) with the anonymous volume a database image makes, seen by the runner while
+    it exists, then removed with `docker rm -f` and no `-v`: the volume stays, with no label and no container."""
+    name = orphan(w, n)
+    labels = {"arceus.task": key, **({"arceus.disposable": "true"} if disposable else {})} if key else {}
+    w.docker.add(f"db-{n}", status="running", created=T0 - timedelta(days=2), labels=labels, volumes=(name,))
+    w.cleanup._observed = None
+    w.cleanup.observe()
+    del w.docker.cs[f"db-{n}"]
+    return name
+
+
+def test_an_anonymous_volume_a_finished_tasks_container_left_goes_a_day_after_a_pass_saw_it_unused(world):
+    """`docker rm -f` without `-v` leaves the database's anonymous volume behind. The runner saw the task's
+    labelled container use it, so it is the task's: counted at first, removed once unused for a day."""
+    world.task("ACME-1", "done")
+    left = left_by(world, "ACME-1", 1)
+
+    first = world.cleanup.run("full", "manual")
+    assert world.items(first) == {} and "1 anonymous volumes" in world.unknown(first)
+    world.now += timedelta(hours=23)
+    assert world.items(world.cleanup.run("full", "manual")) == {}
+    world.now += timedelta(hours=1)
+    result = world.cleanup.run("full", "manual")
+
+    assert world.items(result) == {f"anonymous volume {left[:12]}": ("remove", "done")}
+    [why] = [i["why"] for i in result["planned"]]
+    assert why == ("anonymous, and no container has used it since 2026-10-20; a container labelled for ACME-1 used "
+                   "it and was removed without `-v`; ACME-1, which is over")
+    assert left not in world.docker.vols
+
+
+def test_an_anonymous_volume_nobody_can_be_tied_to_stays_however_long_it_is_unused(world):
+    """It can still be mounted by its ID, and may be the only copy of a person's database: unused alone does not
+    make it garbage. Nor does being made while a task held the workspace."""
+    world.task("ACME-1", "done")
+    worked(world, "ACME-1", T0 - timedelta(days=3), T0 - timedelta(days=1))
+    strangers = [orphan(world, 1), left_by(world, None, 2)]  # never seen used; used by an unlabelled container
+    world.cleanup.run("full", "manual")
+    world.now += timedelta(days=60)
+    result = world.cleanup.run("full", "manual")
+    assert world.items(result) == {} and set(strangers) <= set(world.docker.vols)
+    [count] = [i for i in result["unknown"] if i["name"] == "2 anonymous volumes"]
+    assert "can still be mounted by their ID" in count["why"] and "prune_unowned_volumes" in count["why"]
+
+
+def test_prune_unowned_volumes_removes_them_host_wide_when_asked(tmp_path):
+    w = World(tmp_path, prune_unowned_volumes=True, protect={"volumes": [anon(3)]})
+    try:
+        stranger, kept = orphan(w, 1), orphan(w, 3)
+        w.cleanup.run("full", "manual")
+        w.now += timedelta(days=1)
+        result = w.cleanup.run("full", "manual")
+        assert w.items(result) == {f"anonymous volume {stranger[:12]}": ("remove", "done")}
+        assert "`prune_unowned_volumes` is on" in result["planned"][0]["why"] and kept in w.docker.vols
+    finally:
+        w.events.close()
+        w.store.close()
+
+
+def test_a_waiting_tasks_volume_goes_only_if_its_container_was_marked_disposable(waiting_world):
+    w = waiting_world
+    w.task("ACME-2", "code_review")
+    worked(w, "ACME-2", T0 - timedelta(days=6), T0 - timedelta(days=5))
+    w.task("ACME-3", "code_review")
+    seeded, repro, fresh = left_by(w, "ACME-2", 1, disposable=True), left_by(w, "ACME-2", 2), left_by(w, "ACME-3", 3)
+    w.cleanup.run("full", "manual")
+    w.now += timedelta(days=1)
+    assert w.items(w.cleanup.run("full", "manual")) == {f"anonymous volume {seeded[:12]}": ("remove", "done")}
+    assert {repro, fresh} <= set(w.docker.vols)  # unmarked; a task with recent work (ACME-3 was never idle)
+
+
+def test_a_volume_two_tasks_containers_used_is_nobodys(world):
+    world.task("ACME-1", "done")
+    world.task("ACME-2", "done")
+    shared = left_by(world, "ACME-1", 1)
+    world.docker.add("other", created=T0, labels={"arceus.task": "ACME-2"}, volumes=(shared,))
+    world.cleanup._observed = None
+    world.cleanup.observe()
+    del world.docker.cs["other"]
+    world.cleanup.run("full", "manual")
+    world.now += timedelta(days=1)
+    assert world.items(world.cleanup.run("full", "manual")) == {} and shared in world.docker.vols
+
+
+def test_observing_is_one_cheap_listing_every_few_minutes(world):
+    world.cleanup.observe()
+    world.cleanup.observe()
+    world.now += timedelta(minutes=2)
+    world.cleanup.observe()
+    assert world.docker.calls.count(("ps", "arceus.task")) == 2
+
+
+def test_a_volume_used_again_or_made_anew_starts_its_day_again(world):
+    world.task("ACME-1", "done")
+    d = world.docker
+    again, anew = left_by(world, "ACME-1", 1), left_by(world, "ACME-1", 2)
+    world.cleanup.run("full", "manual")
+    world.now += timedelta(hours=12)
+    d.add("restarted", status="running", created=world.now, volumes=(again,))  # a person mounted it by its ID
+    del d.vols[anew]
+    orphan(world, 2, created=world.now)  # the same name, a new volume
+    world.cleanup.run("full", "manual")
+    del d.cs["restarted"]
+    world.now += timedelta(hours=13)  # 25 h after the first pass, 13 h after these changes
+    assert world.items(world.cleanup.run("full", "manual")) == {}
+    world.now += timedelta(hours=24)
+    assert set(world.items(world.cleanup.run("full", "manual"))) == {f"anonymous volume {again[:12]}",
+                                                                     f"anonymous volume {anew[:12]}"}
+
+
+def test_a_pass_that_could_not_list_volumes_does_not_restart_the_clock(world, monkeypatch):
+    world.task("ACME-1", "done")
+    left = left_by(world, "ACME-1", 1)
+    world.cleanup.run("full", "manual")
+    world.now += timedelta(hours=12)
+    monkeypatch.setattr(world.docker, "available", lambda: False)
+    world.cleanup.run("full", "manual")
+    monkeypatch.undo()
+    world.now += timedelta(hours=12)
+    assert world.items(world.cleanup.run("full", "manual")) == {f"anonymous volume {left[:12]}": ("remove", "done")}
+
+
+def test_a_container_that_mounts_it_during_the_pass_keeps_it(world, monkeypatch):
+    world.task("ACME-1", "done")
+    left = left_by(world, "ACME-1", 1)
+    world.cleanup.run("full", "manual")
+    world.now += timedelta(days=1)
+    plan = world.cleanup.plan
+
+    def plan_then_mount(*a, **kw):
+        found = plan(*a, **kw)
+        world.docker.add("came-back", status="running", created=world.now, volumes=(left,))
+        return found
+    monkeypatch.setattr(world.cleanup, "plan", plan_then_mount)
+
+    assert world.items(world.cleanup.run("full", "manual")) == {f"anonymous volume {left[:12]}": ("remove", "kept")}
+    assert left in world.docker.vols
+
+
+def test_an_independent_pass_removes_them_while_another_task_works(world):
+    world.task("ACME-1", "done")
+    world.task("ACME-2", "dispatched")
+    left = left_by(world, "ACME-1", 1)
+    holder = world.store.task("ACME-2")
+    world.cleanup.run("independent", "daily", holder)
+    world.now += timedelta(days=1)
+    assert world.items(world.cleanup.run("independent", "daily", holder)) == {
+        f"anonymous volume {left[:12]}": ("remove", "done")}
+
+
+def test_without_orphaned_volumes_after_they_are_only_counted(tmp_path):
+    w = World(tmp_path, orphaned_volumes_after=None)
+    try:
+        w.task("ACME-1", "done")
+        left_by(w, "ACME-1", 1)
+        w.cleanup.run("full", "manual")
+        w.now += timedelta(days=30)
+        result = w.cleanup.run("full", "manual")
+        assert w.items(result) == {} and anon(1) in w.docker.vols
+        [count] = [i for i in result["unknown"] if i["name"] == "1 anonymous volumes"]
+        assert "`docker volume prune` removes these" in count["why"]
+    finally:
+        w.events.close()
+        w.store.close()
+    with pytest.raises(ValueError, match="at least 1h"):
+        config(tmp_path, orphaned_volumes_after="10m")
+
+
+def test_a_week_of_test_databases_removed_without_v_is_cleared(world):
+    """The staging06 week: agents ran mongo and mysql with the task label and removed them with `docker rm -f`;
+    each left anonymous volumes. A day after the runner first sees them unused, the finished tasks' are gone; a
+    person's database volume beside them stays."""
+    for k in range(10):
+        world.task(f"EDCMP-{k}", "done")
+    for n in range(136):
+        left_by(world, f"EDCMP-{n % 10}", n + 1)
+    persons = orphan(world, 999)
+    first = world.cleanup.run("full", "manual")
+    assert "137 anonymous volumes" in world.unknown(first)
+    world.now += timedelta(days=1)
+    result = world.cleanup.run("full", "manual")
+    assert result["planned_total"] == 136 and set(world.docker.vols) == {persons}
+    assert all(r == ("remove", "done") for r in world.items(result).values())

@@ -68,6 +68,20 @@ class Docker:
         except ValueError:
             raise DockerError(f"docker {what} inspect: {(r.stderr or r.stdout).strip()[-300:]}") from None
 
+    def labelled_mounts(self, label: str, disposable: str, timeout: float = 20) -> list[tuple[str, bool, list[str]]]:
+        """(task, marked disposable, anonymous volumes it mounts) of every container with `label`, in one cheap
+        listing: seen while the container exists, so its volumes stay known as the task's after a `docker rm`
+        without `-v`. Bind mounts and named volumes are left out."""
+        r = self._run("ps", "-a", "--no-trunc", "--filter", f"label={label}", "--format",
+                      f'{{{{.Label "{label}"}}}}\t{{{{.Label "{disposable}"}}}}\t{{{{.Mounts}}}}', timeout=timeout)
+        out = []
+        for line in r.stdout.splitlines():
+            task, mark, mounts = (line.split("\t") + ["", ""])[:3]
+            names = [m for m in mounts.split(",") if re.fullmatch(r"[0-9a-f]{64}", m)]
+            if task and names:
+                out.append((task, mark == "true", names))
+        return out
+
     def containers(self) -> list[dict]:
         return self._inspect("container", self._run("ps", "-aq", "--no-trunc").stdout.split())
 

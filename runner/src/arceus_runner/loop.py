@@ -32,7 +32,7 @@ from arceus_runner import architect as architect_mod
 from arceus_runner import qa as qa_mod
 from arceus_runner import qa_report
 from arceus_runner.checks import Check
-from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Situation
+from arceus_runner.cleanup import ClaudeAdvisor, Cleanup, Situation, release_note
 from arceus_runner.code_review import ReviewAgent
 from arceus_runner.architect import ArchitectAgent
 from arceus_runner.qa import QaAgent
@@ -144,6 +144,8 @@ class Runner:
         self.last_tick: float | None = None  # wall clock of the last finished tick, for the metrics
         self.cleanup = cleanup
         self.engine = engine
+        if engine is not None:  # what cleanup removed while a task waited goes with the next message it is sent
+            engine.notes = lambda task_id: release_note(store, task_id)
         self.health: dict[str, str] = {}
         self._drain_acked: str | None = None
         self.health_detail: dict[str, tuple[str, str]] = {}  # check -> (status, detail), as last written

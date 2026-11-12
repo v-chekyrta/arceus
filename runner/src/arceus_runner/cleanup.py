@@ -10,12 +10,20 @@ each thing itself, and removes only what passes three tests:
   made for the workspace while task X held it is X's. What was made outside every hold (the dev stack, a
   person's work) has no owner and is only reported.
 - **the owner is over**: done, stopped by hand, or failed (or stopped as people closed every MR) longer ago than
-  `/continue` still works. A task that waits for an answer, a review or a security reviewer keeps everything it has.
+  `/continue` still works. A task that waits for an answer, a review or a security reviewer keeps everything it has,
+  until it has waited `release_after` with no work: then what can be made again goes (`Owners.releasable`): its
+  networks, images and dev servers, and the containers and volumes marked so (`arceus.disposable=true`, `--rm`).
+  Its other containers and volumes, branch, uncommitted files and notes stay until it is over. The next message
+  the task is sent names what went (`release_note`).
 - **nothing protects it**: the observability stack, `cleanup.protect`, the `arceus.keep=true` label.
 
 A running container goes only with an explicit task label; one put down to a task by time alone may be the dev
 stack the agent restarted, so it is reported. Named Docker volumes are dependency caches and go only with a task
-label, and images only when built with one; untagged images are counted in the report, never pruned. Uncommitted
+label, and images only when built with one; untagged images are counted in the report, never pruned. An anonymous
+volume left by a `docker rm` without `-v` carries nothing that says whose it is, and can still be mounted by its ID:
+it goes only when a task's labelled container was seen using it (`observe`, and every pass), by that task's rules,
+once no container has used it for `orphaned_volumes_after`. One nobody can be tied to is only counted, unless
+`prune_unowned_volumes` says to prune them host-wide. Uncommitted
 files go to `git stash`, never away. A pass has `max_duration`: every docker and git command gets what is left of
 it. With `cleanup.llm: advise`, Claude (no tools) comments on what the rules could not place; the comment is for a
 person, and never removes anything.
@@ -63,6 +71,7 @@ from arceus_runner.machine import OUT_OF_TIME, Proc, inside, kill_process, remov
 OBSERVABILITY = "arceus-observability"  # observability/compose.yaml
 CONSOLE = "arceus-console"  # console/compose.yaml
 TASK_LABEL, KEEP_LABEL = "arceus.task", "arceus.keep"
+DISPOSABLE_LABEL = "arceus.disposable"  # "true": its contents can be made again (seeded by a script, rebuilt)
 PROJECT_LABEL = "com.docker.compose.project"
 WORKDIR_LABEL = "com.docker.compose.project.working_dir"
 ONEOFF_LABEL = "com.docker.compose.oneoff"  # "True" on a `docker compose run` container
@@ -74,6 +83,7 @@ FOLDER_KINDS = {"media": "keep_media", "notes": "keep_notes", "reviews": "keep_n
 WAITING_STATES = ("needs_input", "code_review", "security_hold", "failed", "stopped")
 LIVE_ENGINE_STATES = ("queued", "running")
 ENGINE_BUSY_RECHECK = timedelta(minutes=10)
+OBSERVE_EVERY = timedelta(minutes=2)  # how often labelled containers' anonymous volumes are noted between passes
 HISTORY = timedelta(days=90)
 ORDER = ("process", "container", "network", "volume", "image", "repo", "branch", "folder")
 UNKNOWN_SHOWN, PLANNED_SHOWN = 200, 100  # how many of each a pass's summary lists
@@ -104,6 +114,12 @@ def _human(n: float) -> str:
     return f"{n:.1f} GB"
 
 
+def _span(td: timedelta) -> str:
+    """A long wait for a person: days, or hours under two days."""
+    hours = int(td.total_seconds() // 3600)
+    return f"{hours // 24} days" if hours >= 48 else "1 hour" if hours == 1 else f"{hours} hours"
+
+
 def _day(value: str | None) -> str:
     """The date part of a Docker timestamp, for a person."""
     return (value or "?")[:10]
@@ -116,12 +132,18 @@ class Owners:
     """Tasks by what they still need, and who held the workspace when."""
 
     def __init__(self, tasks: list[Task], holds: list[tuple[str, str, str | None]], now: datetime,
-                 continue_window: timedelta, resuming: set[str] = frozenset()):
+                 continue_window: timedelta, resuming: set[str] = frozenset(),
+                 release_after: timedelta | None = None, quiet: Callable[[str], bool] | None = None):
         self.tasks = {t.task_id: t for t in tasks}
-        self.resuming = resuming  # a `/continue` was accepted and waits to be sent: whenever it goes, it needs all
+        # A `/continue` was accepted and waits to be sent, or review comments wait for the agent: whenever that
+        # goes, the task needs all it has.
+        self.resuming = resuming
         self.now = now
         self.window = continue_window
         self.holds = [(k, _ts(a), _ts(b)) for k, a, b in holds]
+        self.release_after = release_after
+        self.quiet = quiet or (lambda key: True)  # the engine has no live session for the task
+        self._quiet: dict[str, bool] = {}
 
     def phase(self, key: str) -> str:
         """working | waiting (keeps everything) | over | unknown."""
@@ -138,6 +160,38 @@ class Owners:
                                                  or self._failed_at(t) + self.window <= self.now):
             return "over"  # past `/continue`, or nothing to continue
         return "waiting"
+
+    def last_work(self, key: str) -> datetime:
+        """When anything last happened to the task: the end of its last hold of the workspace (every round of
+        work holds it), its MR comment or `/continue`, its question, its failure. Not `updated_at`, which moves
+        on bookkeeping; that only when none of these is known."""
+        t = self.tasks[key]
+        times = [b for k, _a, b in self.holds if k == key and b]
+        times += [datetime.fromtimestamp(ms / 1000, UTC) for ms in (t.published_at_ms, t.question_at_ms,
+                                                                    t.failed_at_ms) if ms]
+        return max(times) if times else (_ts(t.updated_at) or self.now)
+
+    def idle_for(self, key: str) -> timedelta | None:
+        """How long a waiting task has had no work, once that is `release_after` or more; else None. Never while
+        it is about to go on, or while its engine session is live or cannot be asked."""
+        if self.release_after is None or key in self.resuming or self.phase(key) != "waiting":
+            return None
+        idle = self.now - self.last_work(key)
+        if idle < self.release_after:
+            return None
+        if key not in self._quiet:
+            self._quiet[key] = self.quiet(key)
+        return idle if self._quiet[key] else None
+
+    def releasable(self, key: str) -> str | None:
+        """Why what can be made again may go, or None: the task is over, or it has waited `release_after` with no
+        work. For a waiting task the container and volume rules also ask for a mark (`_disposable`): owning a
+        thing does not say its contents can be made again. Branches, uncommitted files and `.arceus` folders are
+        not of this kind: they follow `phase` alone, so a waiting task keeps them whatever its idle time."""
+        if self.phase(key) == "over":
+            return "which is over"
+        idle = self.idle_for(key)
+        return f"which has waited {_span(idle)} with no work" if idle is not None else None
 
     def over_for(self, key: str) -> timedelta:
         t = self.tasks[key]
@@ -220,9 +274,13 @@ class Cleanup:
         self.roots = tuple(dict.fromkeys(os.path.normpath(p) for p in (str(ws), os.path.realpath(ws))))
         self.idle_since: datetime | None = None
         self.seen_projects: dict[str, str | None] = {}  # the last plan's workspace compose projects
+        self.seen_orphans: dict[str, str | None] | None = None  # anonymous volumes it saw unused; None: not listed
+        self.seen_volumes: set[str] = set()  # every volume the last plan listed
+        self.seen_owners: list[tuple[str, bool, list[str]]] = []  # (task, disposable, anonymous volumes) it saw
+        self._observed: datetime | None = None
         self.images_in_use = 0  # the last plan's images that containers use: never listed
         self._deadline: float | None = None  # self.mono() by which the pass in progress must end
-        self._owners: Owners | None = None  # the last plan's
+        self._planned: Owners | None = None  # the last plan's
         self._busy: tuple[datetime, str] | None = None  # the engine was not quiet: until when, and why
 
     def recover(self) -> None:
@@ -241,9 +299,11 @@ class Cleanup:
         self.store.hold_workspace(holder.task_id if holder else None, _iso(at), _iso(began) if began else None)
 
     def maybe_run(self, sit: Situation) -> dict | None:
-        """Called every local tick: note who holds the workspace, and run a pass if one is due."""
+        """Called every local tick: note who holds the workspace and whose containers use which anonymous volumes,
+        and run a pass if one is due."""
         now = self.now()
         self.note_holder(sit.holder, sit.since or now, began=now)
+        self.observe()
         full, independent = self.due(sit)
         if full:
             busy = self.engine_busy()
@@ -254,6 +314,23 @@ class Cleanup:
         if independent:
             return self.run("independent", independent, sit.holder)
         return None
+
+    def observe(self) -> None:
+        """Which anonymous volumes containers labelled for a task use, noted while they exist: once one is removed
+        without `-v`, its volumes say nothing of whose they were. One cheap `docker ps` every OBSERVE_EVERY; a
+        Docker that does not answer is tried at the next tick, and changes nothing."""
+        now = self.now()
+        if self._observed and now - self._observed < OBSERVE_EVERY:
+            return
+        self._observed = now
+        if not self.c.enabled or not self.docker.available():
+            return
+        try:
+            seen = self.docker.labelled_mounts(TASK_LABEL, DISPOSABLE_LABEL)
+        except DockerError:
+            return
+        if seen:
+            self.store.remember_volume_owners(seen, _iso(now))
 
     def due(self, sit: Situation) -> tuple[str | None, str | None]:
         """(trigger of a full pass, trigger of an independent one), each None when not due."""
@@ -297,9 +374,27 @@ class Cleanup:
 
     def _resuming(self) -> set[str]:
         """Tasks whose `/continue` was accepted and not yet sent: it waits for a free workspace or a reviewer, and
-        is sent however long that takes (delivery.send_continue), so the window no longer applies."""
+        is sent however long that takes (delivery.send_continue), so the window no longer applies. And tasks with
+        review comments the agent has not been given yet: their round comes before new work."""
         pending = getattr(self.store, "pending_continues", None)
-        return {task_id for _key, task_id, _payload in pending()} if pending else set()
+        reviews = getattr(self.store, "pending_review_tasks", None)
+        return ({task_id for _key, task_id, _payload in pending()} if pending else set()) | \
+            (reviews() if reviews else set())
+
+    def _owners(self) -> Owners:
+        return Owners(self.store.tasks(), self.store.workspace_holds(), self.now(),
+                      self.cfg.limits.continue_window, self._resuming(), self.c.release_after, self._quiet)
+
+    def _quiet(self, key: str) -> bool:
+        """No live engine session for a waiting task, by the engine's own word. One that does not answer is not
+        quiet: its containers may be what the session is using."""
+        if not self.engine:
+            return True
+        try:
+            show = self.engine.show(key)
+        except EngineError:
+            return False
+        return not (show and (show.get("attempt_live") or show.get("state") in LIVE_ENGINE_STATES))
 
     def engine_busy(self) -> str | None:
         """Why a full pass has to wait: the runner sees a task waiting, but its engine session may be live.
@@ -349,9 +444,13 @@ class Cleanup:
         # External commands get only what is left of the budget (they run on the real clock).
         self.docker.deadline = self.git.deadline = time.monotonic() + budget
         try:
-            self.seen_projects = {}
+            self.seen_projects, self.seen_orphans, self.seen_owners = {}, None, []
             items, errors = self.plan(scope, holder, deadline=deadline)
             self.store.remember_projects(self.seen_projects, _iso(started))
+            self.store.remember_volume_owners(self.seen_owners, _iso(started))
+            if self.seen_orphans is not None:  # only a pass that listed every volume says which are unused
+                self.store.remember_orphans(self.seen_orphans, _iso(started))
+                self.store.forget_volume_owners(self.seen_volumes)
             if scope == "full" and self.advise:
                 if deadline - self.mono() > self.c.llm_timeout.total_seconds():
                     self._advise(items)
@@ -384,15 +483,14 @@ class Cleanup:
     def plan(self, scope: str, holder: Task | None = None,
              deadline: float | None = None) -> tuple[list[Item], list[str]]:
         """Everything that would go (or that nobody owns) and why. Reads only."""
-        owners = Owners(self.store.tasks(), self.store.workspace_holds(), self.now(), self.cfg.limits.continue_window,
-                        self._resuming())
+        owners = self._owners()
         steps = [self._plan_docker, self._plan_folders]
         if scope == "full":
             steps += [self._plan_repos, self._plan_processes]
         items: list[Item] = []
         errors: list[str] = []
         self._deadline = deadline
-        self._owners = owners  # the second look before a removal judges by the same tasks
+        self._planned = owners  # the second look before a removal judges by the same tasks
         for step in steps:
             if deadline is not None and self.mono() > deadline:
                 errors.append(f"{OUT_OF_TIME} before {step.__name__.removeprefix('_plan_')} was looked at")
@@ -428,6 +526,10 @@ class Cleanup:
         seen: dict[str, set[str | None]] = {}
         for c in containers:
             labels = (c.get("Config") or {}).get("Labels") or {}
+            anonymous = [m.get("Name") for m in c.get("Mounts") or [] if m.get("Type") == "volume"
+                         and re.fullmatch(r"[0-9a-f]{64}", m.get("Name") or "")]
+            if labels.get(TASK_LABEL) and anonymous:
+                self.seen_owners.append((labels[TASK_LABEL], _disposable(c), anonymous))
             if labels.get(PROJECT_LABEL) and (_in_workspace(c, self.roots) or labels.get(TASK_LABEL)):
                 seen.setdefault(labels[PROJECT_LABEL], set()).add(labels.get(TASK_LABEL))
             if any(m.get("Type") == "volume" and m.get("Name") in kept_volumes for m in c.get("Mounts") or []):
@@ -475,11 +577,10 @@ class Cleanup:
             if not key or labels.get(KEEP_LABEL) == "true":
                 continue
             name = ", ".join(img.get("RepoTags") or []) or iid.removeprefix("sha256:")[:12]
-            phase = owners.phase(key)
-            if phase == "unknown":
+            if owners.phase(key) == "unknown":
                 items.append(Item("image", iid, name, "report", f"labelled for {key}, which the runner never had"))
-            elif phase == "over" and iid not in used:
-                items.append(Item("image", iid, name, "remove", f"built for {key}, which is over", task=key,
+            elif iid not in used and (why := owners.releasable(key)):
+                items.append(Item("image", iid, name, "remove", f"built for {key}, {why}", task=key,
                                   independent=True))
         return items
 
@@ -554,14 +655,17 @@ class Cleanup:
         if phase == "unknown":
             item.why = f"labelled for {key}, which the runner never had"
             return item
-        if phase != "over":
+        why = owners.releasable(key)
+        if not why:
             return None
+        if owners.phase(key) != "over" and not _disposable(c):
+            return None  # a waiting task's container may hold what nothing makes again: kept until it is over
         if running:
             if not by_label:
                 item.why = (f"running; made while {key} held the workspace, but a running container goes only with "
                             f"its task's label (it may be the dev stack)")
                 return item
-            item.action, item.why = "stop", f"running, labelled for {key}, which is over"
+            item.action, item.why = "stop", f"running, labelled for {key}, {why}"
             return item
         if not by_label and project and labels.get(ONEOFF_LABEL) != "True":
             # A recreated dev stack looks exactly like a test stack the agent left, and `rm -v` would take the
@@ -573,7 +677,7 @@ class Cleanup:
         finished = _ts(state.get("FinishedAt")) or created
         if finished and self.now() - finished < self.c.stopped_after:
             return None
-        item.action, item.why = "remove", f"{status}, made by {key}, which is over"
+        item.action, item.why = "remove", f"{status}, made by {key}, {why}"
         return item
 
     @staticmethod
@@ -592,8 +696,11 @@ class Cleanup:
             if not (ANONYMOUS_LABEL in labels or re.fullmatch(r"[0-9a-f]{64}", name or "")):
                 continue  # named: `rm -v` leaves a named volume alone
             key = labels.get(TASK_LABEL)
-            if key and owners.phase(key) != "over":
+            if key and not owners.releasable(key):
                 return f"its volume {name[:12]} is labelled for {key} ({owners.phase(key)})"
+            if key and owners.phase(key) != "over" and labels.get(DISPOSABLE_LABEL) != "true" and not (
+                    _disposable(c) and ((c.get("Config") or {}).get("Labels") or {}).get(TASK_LABEL) == key):
+                return f"its volume {name[:12]} is labelled for {key}, which waits, and nothing marks it disposable"
             if any(o.get("Id") != c.get("Id") and any(om.get("Name") == name for om in o.get("Mounts") or [])
                    for o in containers):
                 return f"another container uses its volume {name[:12]}"
@@ -629,19 +736,28 @@ class Cleanup:
                 items.append(Item("network", n["Id"], name, "report",
                                   f"empty network {whose}; made {_day(n.get('Created'))}" + owners.named(name)))
                 continue
-            phase = owners.phase(key)
-            if phase == "unknown":
+            if owners.phase(key) == "unknown":
                 items.append(Item("network", n["Id"], name, "report", f"labelled for {key}, which the runner never had"))
-            elif phase == "over":
-                items.append(Item("network", n["Id"], name, "remove", f"empty, made by {key}, which is over", task=key,
+            elif why := owners.releasable(key):
+                items.append(Item("network", n["Id"], name, "remove", f"empty, made by {key}, {why}", task=key,
                                   independent=project is None))
         return items
 
     def _volumes(self, volumes: list[dict], containers: list[dict], going: set[str], owners: Owners,
                  projects: set[str], sizes: dict[str, int] | None = None) -> list[Item]:
         sizes = sizes or {}
+        mounted = {m.get("Name") for c in containers for m in c.get("Mounts") or [] if m.get("Type") == "volume"}
         used = {m.get("Name") for c in containers if c.get("Id") not in going
                 for m in c.get("Mounts") or [] if m.get("Type") == "volume"}
+        orphans = {}  # anonymous volumes no container uses, running or stopped, even one this pass removes
+        known = self.store.orphan_volumes()
+        whose = self.store.volume_owners()
+        for task, disposable, names in self.seen_owners:  # what this pass saw counts before it is stored
+            for n in names:
+                was = whose.get(n)
+                whose[n] = (task if not was or was[0] == task else None, disposable and (not was or was[1]))
+        after = self.c.orphaned_volumes_after
+        self.seen_volumes = {v.get("Name") or "" for v in volumes}
         items, anonymous, anonymous_bytes = [], 0, 0
         for v in volumes:
             name, labels = v.get("Name") or "", v.get("Labels") or {}
@@ -654,6 +770,15 @@ class Cleanup:
                     continue
                 size = sizes.get(name)
                 if re.fullmatch(r"[0-9a-f]{64}", name) and set(labels) <= {ANONYMOUS_LABEL}:
+                    if name not in mounted:
+                        orphans[name] = v.get("CreatedAt")
+                    first, since = known.get(name, (None, None))
+                    since = _ts(since) if first == v.get("CreatedAt") and name not in mounted else None
+                    if after is not None and since is not None and self.now() - since >= after:
+                        item = self._orphan(name, v, labels, size, since, whose.get(name), owners)
+                        if item:
+                            items.append(item)
+                            continue
                     anonymous += 1
                     anonymous_bytes += size or 0
                 else:
@@ -663,20 +788,48 @@ class Cleanup:
                                       f"{_day(v.get('CreatedAt'))}" + owners.named(name),
                                       detail={"bytes": size} if size is not None else {}))
                 continue
-            phase = owners.phase(key)
-            if phase == "unknown":
+            if owners.phase(key) == "unknown":
                 items.append(Item("volume", name, name, "report", f"labelled for {key}, which the runner never had"))
-            elif phase == "over" and name not in used:
+            elif name not in used and (why := owners.releasable(key)) and (
+                    owners.phase(key) == "over" or labels.get(DISPOSABLE_LABEL) == "true"):
                 # A volume is known by its name alone, so what makes it this one is kept for the second look.
-                items.append(Item("volume", name, name, "remove", f"test data of {key}, which is over", task=key,
+                items.append(Item("volume", name, name, "remove", f"test data of {key}, {why}", task=key,
                                   independent=True, detail={"created": v.get("CreatedAt"), "labels": labels}))
+        self.seen_orphans = orphans
         if anonymous:
+            when = ("they can still be mounted by their ID. One a task's labelled container used goes by that "
+                    f"task's rules once unused for {_span(after)}; the rest only with `prune_unowned_volumes`, or "
+                    "by hand (`docker volume prune`)" if after is not None
+                    else "`docker volume prune` removes these, and only these")
             items.append(Item("volume", "anonymous-unused", f"{anonymous} anonymous volumes", "report",
                               f"not used by any container; nothing says whose they were"
-                              f"{'; ' + _human(anonymous_bytes) if sizes else ''}. `docker volume prune` "
-                              "removes these, and only these",
+                              f"{'; ' + _human(anonymous_bytes) if sizes else ''}. {when}",
                               detail={"count": anonymous, **({"bytes": anonymous_bytes} if sizes else {})}))
         return items
+
+    def _orphan(self, name: str, v: dict, labels: dict, size: int | None, since: datetime,
+                owner: tuple[str | None, bool] | None, owners: Owners) -> Item | None:
+        """An anonymous volume no container has used for `orphaned_volumes_after`: removed by the rules of the task
+        whose labelled container was seen using it, or, with `prune_unowned_volumes`, whoever made it. None: kept.
+        It can still be mounted by its ID, so being unused alone does not make it garbage."""
+        unused = (f"anonymous, and no container has used it since {_day(_iso(since))}"
+                  f"{', ' + _human(size) if size is not None else ''}")
+        detail = {"created": v.get("CreatedAt"), "labels": labels, **({"bytes": size} if size is not None else {})}
+        key, disposable = owner or (None, False)
+        if key:
+            why = owners.releasable(key)
+            if not why or (owners.phase(key) != "over" and not disposable):
+                return None  # its task still needs it, or its container was not marked disposable
+            return Item("volume", name, f"anonymous volume {name[:12]}", "remove",
+                        f"{unused}; a container labelled for {key} used it and was removed without `-v`; {key}, {why}",
+                        task=key, independent=True, detail=detail)
+        if not self.c.prune_unowned_volumes:
+            return None
+        made_by = owners.at(_ts(v.get("CreatedAt")))
+        return Item("volume", name, f"anonymous volume {name[:12]}", "remove",
+                    f"{unused}; no task's container was seen using it, and `prune_unowned_volumes` is on"
+                    + (f"; made while {made_by} held the workspace" if made_by else ""),
+                    independent=True, detail=detail)
 
     def _volume_protected(self, v: dict, projects: set[str]) -> bool:
         labels = v.get("Labels") or {}
@@ -847,9 +1000,9 @@ class Cleanup:
             if not key:
                 items.append(Item("process", f"{p.pid}:{p.ticks}", name, "report",
                                   "runs in the workspace, started outside every task's hold", detail=detail))
-            elif owners.phase(key) == "over":
+            elif why := owners.releasable(key):
                 items.append(Item("process", f"{p.pid}:{p.ticks}", name, "kill",
-                                  f"started while {key} held the workspace, and no session is left above it",
+                                  f"started while {key} held the workspace, {why}, and no session is left above it",
                                   task=key, detail={**detail, "ticks": p.ticks}))
         return items
 
@@ -883,6 +1036,12 @@ class Cleanup:
 
     def _do(self, run_id: str, it: Item) -> str:
         """One removal, after checking again that it is still the thing that was planned."""
+        if it.task and self._planned and it.task in self._planned.tasks and self._planned.phase(it.task) != "over":
+            # Planned because its task had waited `release_after` with no work: asked again, from the store and
+            # the engine as they are now, since an answer, a review comment or a `/continue` may have come since.
+            now = self._owners()
+            if not now.releasable(it.task):
+                return self._kept(it, f"{it.task} has work again since the plan ({now.phase(it.task)})")
         if it.kind == "container":
             c = self.docker.container(it.ref)
             if c is None:
@@ -893,6 +1052,9 @@ class Cleanup:
             if labels.get(KEEP_LABEL) == "true" or it.name in self.c.protect.containers \
                     or labels.get(PROJECT_LABEL) in self._protected_projects():
                 return self._kept(it, "it is protected now")
+            if self._planned and it.task in self._planned.tasks and self._planned.phase(it.task) != "over" \
+                    and not _disposable(c):
+                return self._kept(it, "it is no longer marked disposable")
             running = (c.get("State") or {}).get("Status") in ("running", "paused", "restarting")
             if running and it.action != "stop":
                 return self._kept(it, "it runs again")
@@ -901,7 +1063,7 @@ class Cleanup:
                        for v in [self.docker.volume(m["Name"])] if v]  # one not read: _volumes_stay keeps them
             if any(self._volume_protected(v, self._protected_projects()) for v in mounted):
                 return self._kept(it, "a volume it uses is protected now")
-            stay = self._volumes_stay(c, mounted, self.docker.containers(), self._owners) if self._owners else \
+            stay = self._volumes_stay(c, mounted, self.docker.containers(), self._planned) if self._planned else \
                 "the tasks were not read"
             if stay:
                 it.detail["keep_volumes"] = stay
@@ -910,8 +1072,8 @@ class Cleanup:
                     self.docker.stop(it.ref)
                 self.docker.remove_container(it.ref, volumes=not stay)
             except DockerError as e:
-                if "No such container" in str(e):
-                    return "gone"
+                if "No such container" in str(e) or "already in progress" in str(e):
+                    return "done" if running else "gone"  # a `--rm` container Docker removed as we stopped it
                 raise
             return "done"
         if it.kind == "network":
@@ -1086,6 +1248,45 @@ class Cleanup:
             if r["status"] == "succeeded":
                 out.setdefault(f"ok:{r['scope']}", dict(r))
         return out
+
+
+NOTE_KINDS = (("container", "containers"), ("volume", "volumes"), ("network", "networks"), ("image", "images"))
+
+
+def release_note(store: TaskStore, task_id: str) -> str | None:
+    """For the agent, added to what its task is sent next: what cleanup removed since its last attempt began (while
+    the task waited, or after it was over), so it makes again what it needs instead of finding it gone. Names are
+    Docker's own (letters, digits, `_.-:/@`); a dev server is only counted, its command line never repeated."""
+    task = store.task(task_id)
+    if task is None:
+        return None
+    since = _ts(task.attempt_started) if task.attempt_started not in (None, "paused") else None
+    removed = [(kind, d) for at, kind, d in store.cleanup_removed(task_id) if since is None or (_ts(at) or since) >= since]
+    if not removed:
+        return None
+    parts = []
+    for kind, plural in NOTE_KINDS:
+        names = sorted({d.get("name", "") for k, d in removed if k == kind
+                        and re.fullmatch(r"[\w.:/@-]{1,128}", d.get("name", ""))})
+        if names:
+            parts.append(f"{plural} {', '.join(names)}")
+    servers = sum(1 for k, _d in removed if k == "process")
+    if servers:
+        parts.append(f"{servers} dev server{'s' if servers > 1 else ''}")
+    if not parts:
+        return None
+    return ("Runner note: while this task waited, the server's cleanup removed what can be made again: "
+            f"{'; '.join(parts)}. Your branch, uncommitted files and `.arceus` notes are as you left them. Before "
+            "you use any of these, build, seed or start it again. If something cannot be made again (a download or "
+            "a registry fails), do not skip the check that needs it: say what is missing and declare the outcome "
+            "blocked.")
+
+
+def _disposable(c: dict) -> bool:
+    """A container whose contents its maker said can be made again: labelled `arceus.disposable=true`, or started
+    with `--rm`, which Docker removes with its anonymous volumes the moment it stops anyway."""
+    labels = (c.get("Config") or {}).get("Labels") or {}
+    return labels.get(DISPOSABLE_LABEL) == "true" or bool((c.get("HostConfig") or {}).get("AutoRemove"))
 
 
 def _in_workspace(c: dict, roots: tuple[str, ...]) -> bool:

@@ -615,6 +615,18 @@ class CleanupConfig(Strict):
     retry_after: Duration = timedelta(hours=1)     # after a pass with errors (doubles each time), and on low disk
     max_duration: Duration = timedelta(minutes=10)
     stopped_after: Duration = timedelta(minutes=30)  # an exited container this long is a leftover, not a step
+    # A task that waits (a review, an answer, `/continue`) this long with no work loses what can be made again:
+    # containers and volumes marked `arceus.disposable=true` (or run with `--rm`), its networks, images and dev
+    # servers. Its other containers and volumes, branch, uncommitted files and notes stay. None: all kept until
+    # the task is over.
+    release_after: Duration | None = None
+    # An anonymous volume no container (running or stopped) has used this long, that a task's labelled container
+    # was seen using: what `docker rm` without `-v` leaves. It goes by that task's rules (over, or waiting with the
+    # container marked disposable). None: only counted in the report.
+    orphaned_volumes_after: Duration | None = timedelta(hours=24)
+    # Also anonymous volumes no task's container was seen using, host-wide, as `docker volume prune` does. Such a
+    # volume can still be mounted by its ID and may hold the only copy of something: only when that is accepted.
+    prune_unowned_volumes: bool = False
     keep_media: Duration = timedelta(days=14)     # .arceus/media/<KEY> after the task is over
     keep_notes: Duration = timedelta(days=90)     # .arceus/notes/<KEY>: reviewers ask weeks later
     stash: bool = True       # uncommitted leftovers on a finished task's branch go to `git stash`
@@ -625,6 +637,20 @@ class CleanupConfig(Strict):
     llm_model: str = Field(default="auto", pattern=MODEL_NAME)
     llm_timeout: Duration = timedelta(minutes=3)
     protect: CleanupProtect = CleanupProtect()
+
+    @field_validator("release_after")
+    @classmethod
+    def _release_after(cls, v: timedelta | None) -> timedelta | None:
+        if v is not None and v < timedelta(hours=1):
+            raise ValueError("at least 1h: a shorter wait is a pause between two answers, not a task left waiting")
+        return v
+
+    @field_validator("orphaned_volumes_after")
+    @classmethod
+    def _orphaned_after(cls, v: timedelta | None) -> timedelta | None:
+        if v is not None and v < timedelta(hours=1):
+            raise ValueError("at least 1h: a stack being recreated leaves its volumes unused for a moment")
+        return v
 
 
 PRIVATE_NETWORKS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"]

@@ -293,7 +293,8 @@ def test_the_flow_does_not_reach_into_a_provider(name):
 
 def test_the_config_before_tracker_and_code_host_loads_as_the_same_settings():
     example = load_config(EXAMPLE).model_dump()
-    example["paths"]["project_notes"] = None  # a setting newer than that layout
+    example["paths"]["project_notes"] = None  # settings newer than that layout
+    example["cleanup"]["release_after"] = None
     legacy = load_config(LEGACY).model_dump()
     # Slack in that layout is the bot token and its channel; the example now reports through a webhook.
     assert (legacy.pop("slack")["alerts_channel"], example.pop("slack")["webhook_env"]) == (

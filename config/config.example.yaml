@@ -233,12 +233,17 @@ architect:
 # A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than
 # limits.continue_window): by the label arceus.task=<KEY> the agent puts on it, by its place
 # (.arceus/<kind>/<KEY>, a task branch), or because it was made while that task held the workspace.
+# A task waiting release_after with no work loses what is marked arceus.disposable=true (or --rm), its networks,
+# images and dev servers; the next message tells the agent what to make again. Its branch and notes stay.
 # Anything else is only reported: `arceus-runner cleanup` shows the plan, `cleanup --last` the last pass.
 cleanup:
   mode: report                         # report: log what would go | act: remove it. Start with report.
   idle_after: 15m                      # a pass once the workspace is free and no work waits this long
   min_interval: 6h                     # but not more often than this
   force_every: 24h                     # at least this often; while a task works, only what cannot be its own
+  release_after: 3d                    # a waiting task idle this long loses what is marked disposable
+  orphaned_volumes_after: 24h          # anonymous volumes a task's container left, unused this long, follow its task
+  prune_unowned_volumes: false         # true: also those no task's container used, host-wide (docker volume prune)
   keep_media: 14d                      # .arceus/media/<KEY> after the task is over
   keep_notes: 90d                      # .arceus/notes/<KEY>: reviewers ask about decisions weeks later
   llm: off                             # advise: Claude (no tools) comments on what nobody owns; never removes

@@ -712,6 +712,26 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 23: anonymous volumes (cleanup.py). Which task's labelled container was seen using each one, kept after the
+    # container is gone: a `docker rm` without `-v` leaves the volume and nothing on it says whose it is. And when a
+    # pass first saw each one unused by any container.
+    """
+    CREATE TABLE cleanup_volume_owners (
+        name             TEXT PRIMARY KEY,
+        task_id          TEXT,
+        disposable       INTEGER NOT NULL DEFAULT 0,
+        seen_at          TEXT NOT NULL
+    );
+    CREATE TABLE cleanup_orphans (
+        name             TEXT PRIMARY KEY,
+        created          TEXT,
+        unused_since     TEXT NOT NULL
+    );
+    """
+)
+
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
@@ -957,6 +977,50 @@ class TaskStore(Store):
                     " SET task_id = CASE WHEN cleanup_projects.task_id IS excluded.task_id THEN excluded.task_id"
                     " ELSE NULL END, seen_at = excluded.seen_at", (name, task_id, at))
 
+    def volume_owners(self) -> dict[str, tuple[str | None, bool]]:
+        """Anonymous volume → (the task whose labelled container used it, None when two tasks' did; whether that
+        container was marked disposable)."""
+        return {r["name"]: (r["task_id"], bool(r["disposable"]))
+                for r in self.conn.execute("SELECT name, task_id, disposable FROM cleanup_volume_owners")}
+
+    def remember_volume_owners(self, seen: list[tuple[str, bool, list[str]]], at: str) -> None:
+        """(task, disposable, volumes) as containers were seen. A volume used by two tasks' containers is nobody's;
+        one used by an unmarked container stays unmarked."""
+        with self.transaction():
+            for task, disposable, names in seen:
+                for name in names:
+                    self.conn.execute(
+                        "INSERT INTO cleanup_volume_owners (name, task_id, disposable, seen_at) VALUES (?, ?, ?, ?)"
+                        " ON CONFLICT (name) DO UPDATE SET task_id = CASE WHEN cleanup_volume_owners.task_id IS"
+                        " excluded.task_id THEN excluded.task_id ELSE NULL END, disposable = MIN("
+                        "cleanup_volume_owners.disposable, excluded.disposable), seen_at = excluded.seen_at",
+                        (name, task, int(disposable), at))
+
+    def forget_volume_owners(self, existing: set[str]) -> None:
+        """A pass listed every volume: owners of volumes that are gone are not needed any more."""
+        with self.transaction():
+            for (name,) in self.conn.execute("SELECT name FROM cleanup_volume_owners").fetchall():
+                if name not in existing:
+                    self.conn.execute("DELETE FROM cleanup_volume_owners WHERE name = ?", (name,))
+
+    def orphan_volumes(self) -> dict[str, tuple[str | None, str]]:
+        """Anonymous volumes seen unused: name → (its creation time, when a pass first saw it unused)."""
+        return {r["name"]: (r["created"], r["unused_since"])
+                for r in self.conn.execute("SELECT name, created, unused_since FROM cleanup_orphans")}
+
+    def remember_orphans(self, seen: dict[str, str | None], at: str) -> None:
+        """The anonymous volumes a pass found unused (name → creation time). One seen before keeps its first time;
+        a volume of the same name made anew starts again; one no longer unused (or gone) is forgotten."""
+        with self.transaction():
+            known = self.orphan_volumes()
+            for name, created in seen.items():
+                if name not in known or known[name][0] != created:
+                    self.conn.execute("INSERT INTO cleanup_orphans (name, created, unused_since) VALUES (?, ?, ?)"
+                                      " ON CONFLICT (name) DO UPDATE SET created = excluded.created,"
+                                      " unused_since = excluded.unused_since", (name, created, at))
+            for name in set(known) - set(seen):
+                self.conn.execute("DELETE FROM cleanup_orphans WHERE name = ?", (name,))
+
     def cleanup_started(self, run_id: str, trigger: str, scope: str, mode: str, at: str) -> None:
         self.conn.execute("INSERT INTO cleanups (id, trigger, scope, mode, status, started_at)"
                           " VALUES (?, ?, ?, ?, 'running', ?)", (run_id, trigger, scope, mode, at))
@@ -967,6 +1031,14 @@ class TaskStore(Store):
             "INSERT INTO cleanup_items (run_id, kind, ref, action, result, task_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (run_id, kind, ref) DO UPDATE SET action = excluded.action, result = excluded.result,"
             " detail = excluded.detail", (run_id, kind, ref, action, result, task_id, json.dumps(detail, default=str)))
+
+    def cleanup_removed(self, task_id: str) -> list[tuple[str, str, dict]]:
+        """What passes that acted removed of a task: (pass start, kind, detail), oldest first."""
+        rows = self.conn.execute(
+            "SELECT c.started_at, i.kind, i.detail FROM cleanup_items i JOIN cleanups c ON c.id = i.run_id"
+            " WHERE i.task_id = ? AND i.result = 'done' AND c.mode = 'act' ORDER BY c.started_at, i.kind, i.ref",
+            (task_id,)).fetchall()
+        return [(r[0], r[1], json.loads(r[2] or "{}")) for r in rows]
 
     def cleanup_finished(self, run_id: str, status: str, at: str, summary: dict) -> None:
         self.conn.execute("UPDATE cleanups SET status = ?, finished_at = ?, summary = ? WHERE id = ?",
@@ -1399,6 +1471,15 @@ class ReviewStore(TaskStore):
 
     def mark_replied(self, sig_id: str) -> None:
         self.conn.execute("UPDATE signals SET replied = 1 WHERE id = ?", (sig_id,))
+
+    def pending_review_tasks(self) -> set[str]:
+        """Tasks in review with comments or a batch not yet given to the agent: a round that is about to start."""
+        rows = self.conn.execute(
+            "SELECT s.task_id FROM signals s JOIN tasks t ON t.task_id = s.task_id"
+            " WHERE t.state = 'code_review' AND s.batch_id IS NULL"
+            " UNION SELECT b.task_id FROM batches b JOIN tasks t ON t.task_id = b.task_id"
+            " WHERE t.state = 'code_review' AND b.sent_at IS NULL").fetchall()
+        return {r[0] for r in rows}
 
     def has_pending_review(self) -> bool:
         """Anything from an open MR waiting for the agent: it goes before new tasks."""
