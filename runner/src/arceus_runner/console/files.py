@@ -5,14 +5,23 @@ project's notes. The same rules for each:
   over SSH) is refused, and the page shows what is there now against what was sent;
 - the write is atomic (a temporary file beside it, flushed, renamed over), keeps the file's mode, and never leaves
   a half-written file for the runner to read;
-- every saved version is kept in console.db with who saved it, so any earlier one can be brought back.
+- the check and the write happen under one lock, held across the console's threads and processes: two saves made
+  from the same page never both succeed, the second is a conflict;
+- every saved version is kept in console.db with who saved it, so any earlier one can be brought back. The version
+  is recorded before the file is replaced, taken back only if the file was not replaced, so a crash between the two can leave an
+  entry for a write that did not happen, never a replaced file whose earlier text is lost.
 """
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import fcntl
 import hashlib
 import os
+import secrets
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,7 +78,7 @@ def diff(before: str, after: str, a: str = "on the server now", b: str = "yours"
 
 def write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.console-{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.console-{secrets.token_hex(8)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -88,9 +97,36 @@ def write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
         os.close(dfd)
 
 
+_threads: dict[str, threading.Lock] = {}
+_threads_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def locked(store: ConsoleStore, path: Path) -> Iterator[None]:
+    """Hold the save lock of `path`: a thread lock for the web server's threadpool, and an flock on a file beside
+    console.db for another console process (the CLI, a second server). The lock file is kept beside console.db, not
+    the edited file, because that folder may be read-only to the console."""
+    key = str(path.absolute())
+    with _threads_guard:
+        lock = _threads.setdefault(key, threading.Lock())
+    with lock:
+        name = store.path.parent / f".file-{digest(key.encode())[:16]}.lock"
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+
 def save(store: ConsoleStore, kind: str, path: Path, text: str, expected_sha: str, by: User, note: str = "") -> bool:
     """Write `text` if the file is still what the page showed (`expected_sha`). Returns False when nothing changed.
     Raises Conflict when it changed meanwhile, OSError when it cannot be written."""
+    with locked(store, path):
+        return _save(store, kind, path, text, expected_sha, by, note)
+
+
+def _save(store: ConsoleStore, kind: str, path: Path, text: str, expected_sha: str, by: User, note: str) -> bool:
     current = read(path)
     if current.problem:
         raise OSError(current.problem)
@@ -103,8 +139,19 @@ def save(store: ConsoleStore, kind: str, path: Path, text: str, expected_sha: st
     if len(data) > MAX_FILE:
         raise OSError(f"the text is larger than {MAX_FILE // 1024} KB")
     mode = (path.stat().st_mode & 0o777) if current.exists else 0o600
-    write_atomic(path, data, mode)
-    store.add_version(kind, path, current.sha, current.text if current.exists else None, digest(data), text, by, note)
-    store.log(by, by.label, "file_saved", kind, {"path": str(path), "sha": digest(data)[:12],
-                                                  "lines": text.count("\n")})
+    version = store.add_version(kind, path, current.sha, current.text if current.exists else None, digest(data), text,
+                                by, note)
+    detail = {"path": str(path), "sha": digest(data)[:12], "lines": text.count("\n")}
+    try:
+        write_atomic(path, data, mode)
+    except BaseException as e:
+        if read(path).sha != digest(data):
+            store.drop_version(version)  # the file was not replaced: nothing to keep
+            raise
+        if not isinstance(e, Exception):
+            raise  # an interrupt after the rename: the version stays, the interrupt goes on
+        # Replaced, and then syncing the folder failed: the new text is what the runner reads, so it is a save;
+        # its version, with the text it replaced, stays in the history to bring that back.
+        detail["folder_sync"] = f"{type(e).__name__}: {e}"
+    store.log(by, by.label, "file_saved", kind, detail)
     return True

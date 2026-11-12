@@ -632,6 +632,10 @@ class ConsoleStore:
             (kind, str(path), before_sha, before_text, after_sha, after_text, by.id, by.label, note[:300]))
         return cur.lastrowid
 
+    def drop_version(self, version_id: int) -> None:
+        """Take back a version whose write failed (files.save records it first)."""
+        self.conn.execute("DELETE FROM file_versions WHERE id = ?", (version_id,))
+
     def versions(self, kind: str, limit: int = 50) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM file_versions WHERE kind = ? ORDER BY id DESC LIMIT ?",
                                  (kind, limit)).fetchall()

@@ -158,10 +158,13 @@ the file and replaces those alone, so comments, order, quoting, the way lists ar
 stay byte for byte; a setting the file did not have is added as its own line under its section. A text value YAML would read as something else (`off`, `09:00`) is written quoted. The
 write is atomic and keeps the file's mode. If `config.yaml` changed since the page was opened (another admin, an
 edit over SSH), nothing is written: the page shows what changed on the server, then the person's own changes put
-on top of the file as it is now, to save or drop. Saving restarts
-nothing.
+on top of the file as it is now, to save or drop. Two people saving from the same page at the same moment get the
+same treatment: the check and the write hold one lock (beside `console.db`), so one save goes through and the other is
+shown the difference. Saving restarts nothing.
 
-**History** lists every version saved from the console, with who saved it and why, and shows which one is in the
+**History** lists every version saved from the console, with who saved it and why (the version is recorded before the
+file is replaced and removed again only if the file was not replaced, so the text a save replaced is always there to
+bring back; a failure after the replacement, such as syncing the folder, counts as a save and is noted in the journal), and shows which one is in the
 file now and which one the runner runs with. Any version, or what was there before it, opens in the YAML editor
 and goes back through the same check. The runner records which `config.yaml` it started with (`runner_state` in
 `runner.db`), so Settings says when the file has changed since the runner started and needs a restart to apply.
