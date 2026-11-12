@@ -515,14 +515,14 @@ def test_a_commented_out_key_is_not_the_hint_of_the_key_above_it():
 def test_cleanup_shows_no_help_of_the_section_after_it(w):
     # A server's file: cleanup ends with a bare `mode: act`, and the qa section comes right after it.
     text = w.config.read_text()
-    qa = text[text.index("# Optional. The agent tests the whole platform"):text.index("# Optional. The agent reviews")]
+    qa = text[text.index("# Optional. The agent tests the platform"):text.index("# Optional. The agent reviews")]
     mode = next(line for line in text.splitlines(keepends=True) if line.startswith("  mode: report "))
     text = text.replace(qa, "").replace(mode, "")
-    text = text.replace("# The web console", "  mode: act\n\n" + qa + "# The web console", 1)
+    text = text.replace("# Web console", "  mode: act\n\n" + qa + "# Web console", 1)
     w.config.write_text(text)
     admin = signed_in(w.settings, "owner@example.com")
     page = admin.get("/settings/cleanup/")
     assert page.status_code == 200 and "<option selected>act</option>" in page.text
-    assert "tests the whole platform" not in page.text and "qa.py" not in page.text
+    assert "tests the platform" not in page.text and "qa.py" not in page.text
     qa_page = admin.get("/settings/qa/")
-    assert qa_page.status_code == 200 and "past it the run is stopped and reported as unfinished" in qa_page.text
+    assert qa_page.status_code == 200 and "past it the run stops, reported as unfinished" in qa_page.text

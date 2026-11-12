@@ -1,91 +1,78 @@
-# Runner settings for one project. No secrets here: the bot tokens are in secrets.env
-# (YOUTRACK_TOKEN, GITLAB_TOKEN, SLACK_WEBHOOK_URL with the providers below). Unknown keys are errors.
-# Check it with: arceus-runner check
+# Runner settings for one project. Tokens go to secrets.env, not here. Unknown keys are errors.
+# Check with: arceus-runner check
 
-project: acme-shop                     # name for logs, metrics and dashboards (a-z, 0-9, -)
+project: acme-shop                     # for logs, metrics, dashboards (a-z, 0-9, -)
 
-# observe: read the tracker and the code host, write what would happen to events.jsonl, change nothing.
-# live:    take tasks, run Bulava, push exactly the commit Codex reviewed and open MRs.
+# observe: read tracker and code host, log what would happen to events.jsonl, change nothing.
+# live:    take tasks, run Bulava, push the commit Codex reviewed, open MRs.
 mode: observe
 
-# Where tasks come from. `type` picks the implementation: youtrack ships with Arceus; another tracker
-# is a module of your own (see docs/integrations.md). The keys up to `states` mean the same for
-# every tracker; the rest belong to the type.
+# Where tasks come from. `type`: youtrack, or your own module (docs/integrations.md).
+# Keys up to `states` are common to all trackers; the rest are per type.
 tracker:
   type: youtrack
-  bot_user: agent-runner               # the bot's login: the runner ignores this user's comments
-  allowed_users:                       # who may start the agent with the queue tag (tracker logins)
+  bot_user: agent-runner               # the bot's login; its comments are ignored
+  allowed_users:                       # who may start the agent with the queue tag
     - j.doe
     - a.smith
   tags:
     queue: agent
     needs_input: agent-needs-input
     failed: agent-failed
-    research: agent-research           # with the queue tag: answer the ticket's question, open no merge request
+    research: agent-research           # with the queue tag: answer the question, no MR
   states:
     queued: To Do
     in_progress: In Progress
     code_review: Code Review
-    # merged: Testing                  # where the ticket goes once every MR is merged; Testing by default.
-                                       # Set the board's own name for it, or null to leave it in Code Review.
-    # answered: Code Review            # where a research ticket goes once its answer is posted; code_review
-                                       # by default. null leaves it In Progress for a person to move.
+    # merged: Testing                  # after every MR is merged (default Testing); null: stay in Code Review
+    # answered: Code Review            # after a research answer (default code_review); null: stay In Progress
   # YouTrack
   url: https://youtrack.example.com
-  project: ACME                        # short name (ID) of the YouTrack project
-  state_field: State                   # name of the state field in the project's workflow
-  assignee_field: Assignee             # set to the bot when a task is taken; null to leave it alone
+  project: ACME                        # YouTrack project ID
+  state_field: State
+  assignee_field: Assignee             # set to the bot on take; null: leave alone
 
-# Where the repositories live: merge requests, their discussions and CI. `type` picks the
-# implementation: gitlab ships with Arceus. Git itself is the transport whatever the host.
+# Repositories, MRs and CI. `type`: gitlab.
 code_host:
   type: gitlab
-  bot_user: acme-agent-bot             # the bot's username: its notes, and who a mention addresses
+  bot_user: acme-agent-bot             # the bot's username
   git_author: { name: "ACME Agent", email: "acme-agent-bot@example.com" }
-  exclude_repos: []                    # repositories of the group the agent never gets, e.g. [acme-infra]
+  exclude_repos: []                    # repositories the agent never gets, e.g. [acme-infra]
   branch_prefix: agent/
   mr_label: agent
   # GitLab
   url: https://gitlab.example.com
-  group: clients/acme                  # the group that holds all the project's repositories.
-                                       # A task gets all of them; the agent changes whichever it needs,
-                                       # and MRs are opened only where it changed something
+  group: clients/acme                  # every task gets all its repositories; MRs only where something changed
   include_subgroups: true
-  # Who approves for review_agent: a second GitLab account (the bot authors the MRs, and GitLab does not let an
-  # author approve by default), at least Developer in the group's repositories, its token in secrets.env.
-  # Without it the review only comments.
-  # approver: { user: acme-review-bot, token_env: GITLAB_REVIEW_TOKEN }   # approves and signs the review's notes
+  # For review_agent approvals: a second account (an author cannot approve its own MR), Developer or higher,
+  # token in secrets.env. Without it the review only comments.
+  # approver: { user: acme-review-bot, token_env: GITLAB_REVIEW_TOKEN }
 
-# Optional. The project's channel: the runner reports there what the agent starts, asks, finishes and fails, and when
-# it has nothing to do (the table is in runner/src/arceus_runner/notify.py). Remove the section for no Slack.
+# Optional: reports to the project's channel (what is told: runner/src/arceus_runner/notify.py).
+# Remove the section for no Slack.
 slack:
-  # An incoming webhook of the channel (Slack app → Incoming Webhooks → Add New Webhook); its URL goes into
-  # secrets.env. `arceus-runner slack-test` posts one message through it.
-  webhook_env: SLACK_WEBHOOK_URL
-  # Optional, and no bot or token: only who gets pinged. The webhook's message carries `<@U012AB3CD>`, which Slack
-  # shows as a mention of that member. Tracker login → Slack member ID (their profile → ⋮ → Copy member ID): the
-  # person who tagged the ticket on questions and failures, security.reviewers on held texts. Empty: messages name
-  # people as plain text and ping nobody.
+  webhook_env: SLACK_WEBHOOK_URL       # incoming webhook URL in secrets.env; test: arceus-runner slack-test
+  # Who gets pinged: tracker login → Slack member ID (profile → ⋮ → Copy member ID). Empty: plain names.
   people: {}
   #   j.doe: U012AB3CD
-  # alerts_channel: "#acme-agent"     # with SLACK_BOT_TOKEN: `check` verifies the bot token and finds the channel
+  # alerts_channel: "#acme-agent"     # with SLACK_BOT_TOKEN: `check` verifies the token and the channel
   notify:
-    summary_every: 30m          # what a running task did, only when it did something
-    summaries_off_hours: false  # off hours the summary waits for the working day
-    idle_after: 15m             # nothing to take this long, in working hours: said once, with what the agent can take
-    question_reminder: 24h      # an unanswered question or held text again, in working hours
-    service_down_after: 10m     # the tracker or the code host not answering this long
-    runner_lifecycle: false     # true: the runner's starts (with how long it was down) and stops go to the channel
-    restart_quiet: 10m          # with runner_lifecycle: starts and stops closer than this are counted, not told one by one
-    daily_status: true          # where everything stands, at the start of each working day
+    summary_every: 30m          # a running task's progress, only when there is some
+    summaries_off_hours: false  # false: off-hours summaries wait for the working day
+    idle_after: 15m             # nothing to take this long in working hours: said once
+    question_reminder: 24h      # repeat an unanswered question or held text, in working hours
+    service_down_after: 10m     # tracker or code host silent this long
+    runner_lifecycle: false     # tell runner starts and stops
+    restart_quiet: 10m          # starts/stops closer than this are counted, not told one by one
+    daily_status: true          # a summary at the start of each working day
 
 schedule:
   timezone: Europe/Kyiv
   working_hours: { days: [mon, tue, wed, thu, fri], from: "09:00", to: "19:00" }
   poll_working: 2m
   poll_off_hours: 10m
-  poll_local: 2m                       # local health and, later, `task show` for active tasks
-  poll_progress: 30s                   # a running task's engine steps and agent activity (files only)
+  poll_local: 2m                       # local health
+  poll_progress: 30s                   # a running task's steps and activity
   review_debounce: 5m
   repo_sync: 24h
 
@@ -97,177 +84,137 @@ http:
 
 limits:
   max_review_rounds: 5          # review rounds that changed code
-  max_review_answers: 20        # review rounds answered without a code change
+  max_review_answers: 20        # review rounds answered without a change
   max_ci_fix_attempts: 3
   needs_input_reminder: 24h
   needs_input_fail_after: 5d
   in_progress_alert_after: 6h
-  attempt_timeout: 8h                  # no verdict this long: the task fails as "agent hung"
-  agent_quiet_after: 20m               # the agent wrote nothing this long in its own step: agent_quiet
-  continue_window: 14d                 # a `/continue` comment this long after a failure resumes the task
+  attempt_timeout: 8h                  # no verdict this long: fails as "agent hung"
+  agent_quiet_after: 20m               # agent silent this long: agent_quiet
+  continue_window: 14d                 # `/continue` resumes a failed task within this
 
 health:
   disk_warn_percent: 25
   disk_fail_percent: 10
   ram_warn_gb: 2
   token_expiry_warn_days: 14
-  # A command that exits 0 only while the project's dev stack is up; run in the workspace every
-  # poll_local. A failure stops new tasks. Leave it out until the stack exists on this VM, e.g.
+  # Exits 0 only while the dev stack is up; a failure stops new tasks. Leave out until the stack exists.
   #   devstack_check: "cd ~/arceus/acme/<repo> && docker compose ps --status running --quiet | grep -q ."
   #   devstack_check: "make devstack-status"
 
 bulava:
   codex_unavailable: fail              # fail | wait, when Codex is out of quota or signed out
-  report_language: English             # the agent's fallback language (commits, its summary in the MR)
+  report_language: English             # the agent's fallback language (commits, MR summary)
   codex_unavailable_after_hours: 3
-  mcp_config: /opt/bulava-local/mcp.json   # the preinstalled headless browser, instead of npx
-  # Models and depth for the tasks dispatched from now on; a task keeps what it started with.
-  # auto: pass nothing (depth high, the CLI's default model for the server's account).
-  claude_model: auto                   # auto | opus | sonnet | haiku | fable | an exact id (claude-opus-5-5)
+  mcp_config: /opt/bulava-local/mcp.json   # the preinstalled headless browser
+  # Models for newly dispatched tasks. auto: the CLI's defaults.
+  claude_model: auto                   # auto | opus | sonnet | haiku | fable | exact id (claude-opus-5-5)
   claude_effort: auto                  # auto | none (haiku) | low | medium | high | xhigh | max | ultracode
-  codex_model: auto                    # auto | a slug from `night-shift models codex`; review, consultations, report
+  codex_model: auto                    # auto | a slug from `night-shift models codex`
   codex_effort: auto                   # auto | low | medium | high | xhigh | max | ultra
-  start_handshake_wait: 30s            # 5s–2m: a new session's hooks confirm the run, or the start is rolled back
-  # Independent checks before Codex (engine/SERVER.md): after a green build, a code review and a
-  # security review in Claude sessions that never saw the ticket. Findings at min_severity or above go
-  # back to the agent `rounds` times per task; it fixes or declines each, and Codex decides, seeing
-  # them all. Once the rounds are spent the engine does not run the checks again for that task, so
-  # fixes after review comments and red CI go to Codex alone. The review gate reads these from
-  # bulava-engine.service: after a change run `sudo ./setup.sh` and restart bulava-engine between
-  # tasks; `arceus-runner doctor` says FAIL until the running engine has them. `enabled: false` is a
-  # choice, not a warning: Bulava's Codex review (on a server a team of contract, security and state
-  # reviewers) is then the review.
+  start_handshake_wait: 30s            # 5s–2m for a new session to confirm its start
+  # Claude code and security reviews of the diff before Codex (engine/SERVER.md). Findings at
+  # min_severity or above go back to the agent, `rounds` times per task. After a change: sudo ./setup.sh
+  # and restart bulava-engine between tasks (`doctor` says FAIL until then). enabled: false is fine:
+  # Codex's review team (contract, security, state) then reviews alone.
   claude_checks:
     enabled: true
     kinds: [code, security]
     min_severity: high                 # critical | high | medium | low
     rounds: 1                          # 1–5
-    timeout: 15m                       # per check, 1m–30m; they run side by side
-    required: true                     # a check that did not run stops the task for a person; false: Codex alone
+    timeout: 15m                       # per check, 1m–30m
+    required: true                     # a check that did not run stops the task; false: go on to Codex
 
-# The security screen: every ticket, comment and CI log is read by a classifier (Claude, no tools)
-# before the agent gets it. A suspicious text is held, and the task waits for a reviewer's
-# `/security-allow <code>` or `/security-reject <code>` on the ticket.
+# Every ticket, comment and CI log is screened by Claude before the agent sees it. A suspicious text
+# waits for `/security-allow <code>` or `/security-reject <code>` on the ticket.
 security:
-  reviewers:                           # tracker logins who decide on held texts; required in live mode
+  reviewers:                           # who decides on held texts; required in live mode
     - a.smith
-  model: auto                          # the classifier's model: auto | sonnet | opus | an exact id
+  model: auto                          # auto | sonnet | opus | exact id
   timeout: 3m
 
-# Code review on request (code_review.py). Off by default. With it on, someone in tracker.allowed_users
-# writes `/review` (or "@<tracker bot> review") on a ticket in Code Review, and a separate Bulava task reviews
-# the task's open MRs against the ticket, builds and tests them, and never asks anyone a question. The runner
-# approves an MR (as code_host.approver) only when the review found it ready, CI passed on the reviewed commit
-# and nothing moved meanwhile; otherwise the MR gets a note saying what has to change. An approved MR that
-# changes attention_paths, or something the reviewer says a person has to decide (a security boundary, a weakened
-# CI check, a destructive data change, behaviour the ticket did not ask for), also gets a note listing it for a
-# person before merge. What only whoever deploys it needs to know (an environment variable, a requested upgrade)
-# is listed under its own heading and keeps the MR approved. What has to change goes back to the author, and its
-# new commits are reviewed again without anyone asking, fix_rounds times per ticket; then a person takes over.
-# The ticket need not be the agent's: on one people worked on, the MRs of the group it links to are reviewed, and
-# what has to change is for their author (no fix loop).
+# `/review` on a ticket in Code Review (by tracker.allowed_users): a separate task reviews, builds and
+# tests the open MRs. Approves (as code_host.approver) only when ready, CI green on the reviewed commit
+# and nothing moved; otherwise notes what to change, and the author fixes it (fix_rounds). Risky changes
+# get a note for a person even when approved. Details: docs/reviews.md.
 review_agent:
   enabled: false
   command: /review
-  require_green_ci: true               # approve only when the newest CI run is for the reviewed commit and passed
-  timeout: 2h                          # the review's run; past it the run is stopped and nothing is approved
+  require_green_ci: true               # newest CI run is for the reviewed commit and passed
+  timeout: 2h                          # past it nothing is approved
   max_suggestions: 5                   # non-blocking ideas per MR
   max_per_ticket: 10
-  fix_rounds: 3                        # review -> author fixes -> review again, unasked; 0: people pass findings on
-  # What each repository needs of the build and the tests, by its path in the group (* and ? allowed; the exact
-  # path wins, then the first pattern). A repository none matches needs both, as the reviewer ran them.
-  # build/tests: required | none (none: not needed in a review, e.g. an image built at deploy; a build or tests
-  # the reviewer did not run then stop nothing, ones it saw fail still do).
-  # ci_build_jobs/ci_test_jobs: jobs of the reviewed commit's CI run that stand for what the reviewer cannot run
-  # itself (a private image, a service): they count when one matches and every match succeeded.
+  fix_rounds: 3                        # 0: people pass findings on
+  # Per repository (path or * ? pattern; exact path wins): build/tests required (default) | none.
+  # ci_build_jobs/ci_test_jobs: CI jobs that stand in for what the reviewer cannot run itself.
   # repos:
   #   services/api: {ci_build_jobs: ["build"], ci_test_jobs: ["pytest", "pytest-*"]}
   #   infra/deploy: {build: none}
-  # attention_paths: changed files a person is always asked to look at, whatever the reviewer says. The default
-  # (config.py, ATTENTION_PATHS) is the security boundary and secrets: auth, permission, crypt, secret, .env;
-  # ordinary test files and docs are left out of it. A list set here replaces it and applies to tests too.
-  # review_hint_paths: files the reviewer reads with extra care (CI, Docker, Makefile, dependencies, settings,
-  # migrations, SQL); they go to a person only when the reviewer names them. Default in config.py (REVIEW_HINT_PATHS). A pattern without /
-  # matches the file name anywhere; ** crosses folders.
+  # attention_paths: changed files always shown to a person (default: auth, permission, crypt, secret, .env).
+  # review_hint_paths: files read with extra care (default: CI, Docker, deps, migrations…). See config.py.
+  # Pattern without / matches the file name anywhere; ** crosses folders. A list here replaces the default.
   #   attention_paths: ["**/migrations/**", "*auth*", ".gitlab-ci.yml"]
 
-# Optional. The agent tests the whole platform by your instructions and writes a report per run (qa.py).
-# `arceus-runner qa run` queues a run; `schedule` queues one by itself. A run is a Bulava task of its own: it holds
-# the workspace like a ticket (a queued run goes before new tickets), reads the code at each repository's default
-# branch to explain what it finds, and changes nothing. Reports: http://localhost:3300/ through the SSH tunnel
-# (ssh -L 3300:127.0.0.1:3300 …). Slack hears when a run starts and how it ended, with the agent's short summary.
+# Optional. The agent tests the platform by your instructions and writes a report (qa.py).
+# `arceus-runner qa run` or `schedule` queues a run; it changes nothing.
+# Reports: http://localhost:3300/ over an SSH tunnel (ssh -L 3300:127.0.0.1:3300 …).
 qa:
   enabled: false
-  # The URL, test accounts and what to test, in any shape. setup.sh creates it once from
-  # config/qa-instructions.example.md, as comments only: a run needs them written first.
-  instructions: ~/arceus/data/qa/instructions.md
-  reports: ~/arceus/data/qa/runs                   # a folder per run: report.html, result.json, media/
-  # schedule: { days: [mon, tue, wed, thu, fri], at: "02:00" }   # schedule.timezone; none: only by the command
-  timeout: 8h                                      # past it the run is stopped and reported as unfinished
-  port: 3300                                       # 127.0.0.1 only (qa.address)
+  instructions: ~/arceus/data/qa/instructions.md   # what to test; setup.sh creates a template to fill in
+  reports: ~/arceus/data/qa/runs                   # report.html, result.json, media/ per run
+  # schedule: { days: [mon, tue, wed, thu, fri], at: "02:00" }   # in schedule.timezone
+  timeout: 8h                                      # past it the run stops, reported as unfinished
+  port: 3300                                       # 127.0.0.1 only
 
-# Optional. The agent reviews how the code fits together and reports what is worth a person's decision (architect.py,
-# docs/architect.md). `arceus-runner arch run` queues a review; `schedule` queues one by itself (weekly is enough).
-# A review reads only the repositories that changed since the last one, holds the workspace like a test run (plan
-# both for nights without tickets, on different days), and changes nothing. Codex checks the findings before the
-# report goes out. Reports and the decisions on findings: http://localhost:3301/ through the SSH tunnel.
+# Optional. The agent reviews the architecture and reports what needs a decision (docs/architect.md).
+# `arceus-runner arch run` or `schedule` (weekly is enough); reads only repositories changed since the last
+# review, changes nothing. Reports: http://localhost:3301/ over an SSH tunnel.
 architect:
   enabled: false
-  # Optional: the runner's own criteria work without it. setup.sh creates it once from
-  # config/architect-instructions.example.md, as comments only.
-  instructions: ~/arceus/data/architect/instructions.md
-  reports: ~/arceus/data/architect/runs              # a folder per run: report.html, result.json
-  # schedule: { days: [sun], at: "03:00" }           # schedule.timezone; none: only by the command
+  instructions: ~/arceus/data/architect/instructions.md   # optional; setup.sh creates a template
+  reports: ~/arceus/data/architect/runs              # report.html, result.json per run
+  # schedule: { days: [sun], at: "03:00" }           # in schedule.timezone
   timeout: 4h
-  # Patterns of repository paths in the group; `repo:path` patterns name paths in a repository.
-  # repos: []                    # which repositories are reviewed at all; empty: every one
-  # skip: []                     # never reviewed: generated code, vendored copies, e.g. ["*:**/migrations/**"]
-  # not_ours: []                 # code the team builds on but does not own (an upstream platform, a fork of one):
-  #                              # read for context, never to be changed; edits inside it that could live outside
-  #                              # are raised, since the next upgrade undoes them
-  first_look: 30d                # the first review looks at what changed this long before it
-  max_findings: 7                # per review, the most important first
-  second_opinion: true           # Codex reads the findings against the code before the report goes out
+  # Repository path patterns; `repo:path` for paths inside a repository.
+  # repos: []                    # what to review; empty: everything
+  # skip: []                     # never reviewed, e.g. ["*:**/migrations/**"]
+  # not_ours: []                 # code you build on but do not own: read only; edits inside it are flagged
+  first_look: 30d                # how far back the first review looks
+  max_findings: 7
+  second_opinion: true           # Codex checks the findings before the report
   second_opinion_timeout: 20m
-  port: 3301                     # 127.0.0.1 only (architect.address)
+  port: 3301                     # 127.0.0.1 only
 
-# What agents leave behind: containers, test volumes, dev servers, files in the repositories, old media.
-# A thing is removed only when it belongs to a task that is over (done, stopped, or failed longer ago than
-# limits.continue_window): by the label arceus.task=<KEY> the agent puts on it, by its place
-# (.arceus/<kind>/<KEY>, a task branch), or because it was made while that task held the workspace.
-# A task waiting release_after with no work loses what is marked arceus.disposable=true (or --rm), its networks,
-# images and dev servers; the next message tells the agent what to make again. Its branch and notes stay.
-# Anything else is only reported: `arceus-runner cleanup` shows the plan, `cleanup --last` the last pass.
+# Removes what finished tasks left: containers, volumes, dev servers, files, media. Only things tied to a
+# task that is over (label arceus.task=<KEY>, .arceus/<kind>/<KEY>, its branch, or made while it held the
+# workspace). `arceus-runner cleanup` shows the plan.
 cleanup:
-  mode: report                         # report: log what would go | act: remove it. Start with report.
-  idle_after: 15m                      # a pass once the workspace is free and no work waits this long
-  min_interval: 6h                     # but not more often than this
-  force_every: 24h                     # at least this often; while a task works, only what cannot be its own
+  mode: report                         # report: only log | act: remove. Start with report.
+  idle_after: 15m                      # run once the workspace is free this long
+  min_interval: 6h
+  force_every: 24h
   release_after: 3d                    # a waiting task idle this long loses what is marked disposable
-  orphaned_volumes_after: 24h          # anonymous volumes a task's container left, unused this long, follow its task
-  prune_unowned_volumes: false         # true: also those no task's container used, host-wide (docker volume prune)
-  keep_media: 14d                      # .arceus/media/<KEY> after the task is over
-  keep_notes: 90d                      # .arceus/notes/<KEY>: reviewers ask about decisions weeks later
-  llm: off                             # advise: Claude (no tools) comments on what nobody owns; never removes
-  protect:                             # never touched, besides arceus-observability and arceus.keep=true
-    compose_projects: []               # e.g. the dev stack's compose project, if it lives in the workspace
+  orphaned_volumes_after: 24h          # a task's leftover anonymous volumes
+  prune_unowned_volumes: false         # true: also unused volumes of no task (docker volume prune)
+  keep_media: 14d
+  keep_notes: 90d
+  llm: off                             # advise: Claude comments on what nobody owns; never removes
+  protect:                             # never touched (plus arceus-observability and arceus.keep=true)
+    compose_projects: []               # e.g. the dev stack's compose project
 
-# The web console (docs/console.md): one address with a sign-in for the status, the reports, Grafana, the
-# settings and the operations, instead of SSH tunnels. setup.sh installs it once this is on.
+# Web console (docs/console.md): status, reports, Grafana, settings behind one sign-in.
 console:
   enabled: false
-  # public_url: https://console.example.com   # required when on: the address people open
-  port: 80                                  # nginx on this machine; the load balancer forwards public_url here
-  tls: false                                # true when the load balancer talks HTTPS to its backends
+  # public_url: https://console.example.com   # required when enabled
+  port: 80                                  # nginx here; the load balancer forwards public_url to it
+  tls: false                                # true if the load balancer talks HTTPS to backends
 
 paths:
   workspace: ~/arceus/workspace
-  bulava: /opt/bulava/engine           # the engine folder (bin/dispatch.sh is in it)
-  bulava_state: ~/.claude/supervisor   # SUPERVISOR_STATE_DIR: tasks/<key>/task.json and friends
-  bulava_env: ~/arceus/data/bulava.env # Claude token; passed to Bulava's processes only
-  secrets: ~/arceus/data/secrets.env # the runner reads it itself; tokens never enter its environment
+  bulava: /opt/bulava/engine           # engine folder
+  bulava_state: ~/.claude/supervisor   # SUPERVISOR_STATE_DIR
+  bulava_env: ~/arceus/data/bulava.env # Claude token, for Bulava only
+  secrets: ~/arceus/data/secrets.env   # read by the runner, never put in its environment
   db: ~/arceus/data/runner.db
   events: ~/arceus/data/events.jsonl
-  # The project's own notes for the agent (setup.sh creates it from config/project-notes.example.md):
-  # added to the AGENTS.md every task starts with. Remove the line for none.
-  project_notes: ~/arceus/data/project-notes.md
+  project_notes: ~/arceus/data/project-notes.md   # added to every task's AGENTS.md; remove for none
