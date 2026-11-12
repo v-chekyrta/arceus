@@ -343,6 +343,22 @@ def test_what_only_whoever_deploys_it_needs_to_know_does_not_call_a_person(w):
     assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
 
 
+def test_what_the_reviewer_ran_reaches_the_note_whole_and_an_overlong_text_ends_on_a_whole_word(w):
+    publish(w)
+    ask(w)
+    # JS-4524: 835 characters of commands and results lost their last words to an 800-character cut.
+    checked = ("make verify: ruff clean, 20 import contracts kept, 2362 tests passed. " * 11
+               + "Read by inspection: configs._create_trust_version_configs and copy_permissions.get_copy_permissions.")
+    finding = "The docstring of _create_trust_version_configs misleads. " * 30
+    write_verdict(w, checked=checked, findings=[{"severity": "suggestion", "text": finding}])
+    finish(w)
+    [note] = review_notes(w)
+    assert len(checked) > 800 and checked in note
+    [line] = [ln for ln in note.splitlines() if "docstring" in ln]
+    kept = line.removeprefix("- ").removesuffix(" …")
+    assert line.endswith(" …") and finding.startswith(kept) and finding[len(kept)] == " "
+
+
 def test_an_unreadable_note_for_whoever_deploys_it_is_not_a_pass(w):
     publish(w)
     ask(w)

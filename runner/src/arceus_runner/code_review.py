@@ -182,7 +182,16 @@ def _clean(value: object, limit: int = MAX_TEXT) -> str:
     if not isinstance(value, str):
         return ""
     text = unattributed(_MARKER.sub("<!-- ", value)).strip()
-    return text if len(text) <= limit else text[:limit].rstrip() + " …"
+    if len(text) <= limit:
+        return text
+    # Cut at the last whole word, so a name in the text is never left half there; a text with no space in its
+    # second half (a path, a long identifier) is cut where the limit falls.
+    head = text[:limit]
+    if not text[limit].isspace():
+        space = max(head.rfind(" "), head.rfind("\n"))
+        if space > limit // 2:
+            head = head[:space]
+    return head.rstrip() + " …"
 
 
 def load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[dict[str, dict], str, list[str]]:
@@ -257,7 +266,8 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             "requirements_met": met if isinstance(met, bool) else None,
             "build": e.get("build") if e.get("build") in BUILD else "not_run",
             "tests": e.get("tests") if e.get("tests") in TESTS else "not_run",
-            "checked": _clean(e.get("checked"), 800),
+            # The commands and what they showed: a careful review lists many, and a note has room for them.
+            "checked": _clean(e.get("checked")),
             "unsure_because": _clean(e.get("unsure_because"), 800),
             "findings": findings[:MAX_ITEMS],
             "attention": attention[:MAX_ITEMS],
