@@ -255,6 +255,12 @@ class FakeGitLab:
                     mr.update(state="closed", closed_by={"username": self.username})
                 mr.update(body)
                 return json_response(mr)
+            if tail == ["versions"]:  # `versions_page`: how many a page holds, to read past the first page
+                n, page = mr.get("versions_page", 100), int(request.url.params.get("page", 1))
+                versions = mr.get("versions", [])
+                more = len(versions) > page * n
+                return json_response(versions[(page - 1) * n:page * n],
+                                     headers={"x-next-page": str(page + 1) if more else ""})
             if tail == ["approvals"]:
                 return json_response({"approved_by": [{"user": {"username": u}} for u in mr.get("approved_by", [])]})
             if tail == ["approve"] and request.method == "POST":

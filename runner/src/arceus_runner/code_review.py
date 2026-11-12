@@ -456,7 +456,7 @@ class ReviewAgent:
 
     def watch(self, task: Task) -> None:
         """A ticket whose merge requests people wrote, on the code host's poll: an approval that no longer holds is
-        taken back, and the runner lets go of the ticket once no review of it is under way and it has left Code
+        taken back, a merge the review did not let through is reported, and the runner lets go of the ticket once no review of it is under way and it has left Code
         Review or none of its merge requests is open."""
         opened = False
         for m in self.store.task_mrs(task.task_id):
@@ -466,6 +466,8 @@ class ReviewAgent:
             if st.state == "opened":
                 opened = True
                 self.approval_outlived(task, m.project_id, m.iid, st)
+            elif st.state == "merged":
+                self.merged_check(task, m.project_id, m.iid, st)
         if self.store.reviews(*REVIEW_UNDER_WAY, task_id=task.task_id):
             return
         state = self.tracker.issue(task.task_id).state
@@ -1251,6 +1253,94 @@ class ReviewAgent:
                                  task_id=task.task_id, review=row.id, url=mr["url"], reason=why, sha=st.sha, by=by)
             self.store.action_done(key)
             return
+
+    def merged_check(self, task: Task, project_id, iid, st: MRStatus) -> None:
+        """A merge request the code review judged is merged: if what was merged is not what the review let through
+        (the newest finished review asked for changes, or the merge is at commits the review never saw), say so
+        on the ticket and in Slack, once per merge request across failures and restarts. A merge request no review
+        judged, or one merged at the commit (or the same source diff) the review found ready, is left alone. What
+        the merge did against a target branch that moved on is not compared: the check is of the source diff. While a
+        review of the ticket is under way nothing is decided: its own result says it was merged meanwhile."""
+        key = f"{task.task_id}:merged-check:{project_id}:{iid}"
+        act = self.store.action(key)
+        if act and act[0] == "done":
+            return
+        if act and act[1]:  # begun before a failure or a crash: finished for the reason it began with
+            begun = json.loads(act[1])
+            row, mr, why = self.store.review(begun["review"]), begun["mr"], begun["why"]
+        else:
+            if self.store.reviews(*REVIEW_UNDER_WAY, task_id=task.task_id):
+                return
+            row, mr = self._last_judged(task, project_id, iid)
+            why = self._merged_unchecked(row, mr, project_id, iid, st) if row else ""
+            if not why:
+                self.store.action_intent(key, task.task_id, "merged-check")
+                self.store.action_done(key, json.dumps({"why": "", "review": row.id if row else None}))
+                return
+            self.store.action_intent(key, task.task_id, "merged-check",
+                                     json.dumps({"review": row.id, "mr": mr, "why": why, "sha": st.sha}))
+        findings = [f for f in mr.get("verdict", {}).get("findings", []) if f.get("severity") == "blocker"]
+        lines = [f"**Merged without a passing code review.** {mr['url']} ({mr['repo']}) was merged {why}."]
+        if findings:
+            lines += ["", "What the review found that blocks the merge:",
+                      *(f"- {self._finding(f)}" for f in findings[:10])]
+        lines += ["", "Decide whether it needs a fix in a follow-up."]
+        self.d.comment_once(task, f"merged-unchecked:{project_id}:{iid}", "\n".join(lines))
+        self.events.emit("review_merged_unchecked", task_id=task.task_id, review=row.id if row else None,
+                         url=mr["url"], repo=mr["repo"], reason=why, sha=st.sha, reviewed=mr["sha"])
+        self.store.action_done(key)
+
+    def watch_merges(self) -> None:
+        """The merge requests a review judged, of tickets the runner has let go of (moved out of Code Review, for
+        instance back to In Progress for the fixes, or a task that ended): each open one is read on the code
+        host's poll until it is merged or closed, so a later merge the review did not let through is still
+        reported (merged_check). Tickets in Code Review are watched by their own poll; a task under way is left to
+        it as well, since it comes back to Code Review before its MRs can be merged by the runner's loop."""
+        for task in self.store.tasks("done", "stopped", "failed"):
+            for m in self.store.task_mrs(task.task_id):
+                if m.state != "opened" or self._last_judged(task, m.project_id, m.iid)[0] is None:
+                    continue
+                if (act := self.store.action(f"{task.task_id}:merged-check:{m.project_id}:{m.iid}")) \
+                        and act[0] == "done":
+                    continue
+                try:
+                    st = self.host.mr_status(m.project_id, m.iid)
+                    if st.state == "merged":
+                        self.merged_check(task, m.project_id, m.iid, st)
+                    if st.state != "opened" and not self.store.reviews(*REVIEW_UNDER_WAY, task_id=task.task_id):
+                        self.store.update_mr(task.task_id, m.repo, state=st.state)
+                except ServiceError as e:
+                    self.events.emit("review_poll_failed", task_id=task.task_id, reason=str(e))
+
+    def _last_judged(self, task: Task, project_id, iid) -> tuple[ReviewRequest | None, dict | None]:
+        """The newest finished review that judged this MR, and its entry for it. A review whose MR was merged or
+        closed while it ran judged nothing."""
+        for row in reversed([r for r in self.store.reviews("done", task_id=task.task_id) if r.result]):
+            mr = next((m for m in json.loads(row.result).get("mrs", [])
+                       if str(m["project_id"]) == str(project_id) and str(m["iid"]) == str(iid)), None)
+            if mr is not None and mr["kind"] != "closed":
+                return row, mr
+        return None, None
+
+    def _merged_unchecked(self, row: ReviewRequest, mr: dict, project_id, iid, st: MRStatus) -> str:
+        """Why the merge is not what the review let through, in words for the ticket, or "" when it is."""
+        then = f"commit `{mr['sha'][:12]}`"
+        if not st.sha:  # the host does not say what was merged: only a review that asked for changes is news
+            return f"although the code review asked for changes at {then}" if mr["kind"] == "changes" else ""
+        moved = st.sha != mr["sha"]
+        if moved:
+            same = getattr(self.host, "same_change", None)
+            if same is not None and same(project_id, iid, mr["sha"], st.sha) is True:
+                moved = False  # rebased: the source diff the review read is the one that was merged
+        if mr["kind"] == "changes":
+            if moved:
+                return (f"after the code review asked for changes at {then}; the commits pushed since (merged at "
+                        f"`{st.sha[:12]}`) were never reviewed")
+            return f"although the code review asked for changes at {then}, and the code was not changed after it"
+        if moved:
+            return (f"at `{st.sha[:12]}`, but the code review read {then}; the changes between them were never "
+                    "reviewed")
+        return ""
 
     def _outlived_by(self, row: ReviewRequest, task: Task, mr: dict, st: MRStatus) -> str:
         """Why the approval no longer holds, in words for the MR note, or "" while it does."""

@@ -1554,3 +1554,153 @@ def test_a_verdict_judged_by_older_rules_does_not_stand_for_the_same_commits(w):
     w.tick()
     again = w.store.review("ACME-1.review-2")
     assert again.state != "refused" and again.reason != "already_reviewed"
+
+
+# -- a merge the review did not let through -------------------------------------------------------------------------
+
+
+def _blocked_people_mr(w: World) -> tuple[str, str, str]:
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    people_verdict(w, verdict="changes", findings=[{"severity": "blocker", "file": "uk.po", "line": 3,
+                                                    "text": "The plural forms are missing"}])
+    finish(w, PEOPLE_RID)
+    assert w.store.review(PEOPLE_RID).outcome == "changes"
+    return url, sha, db_id
+
+
+def _merged_notes(w: World, db_id: str) -> list[str]:
+    return [c for c in ticket_comments(w, db_id) if c.startswith("**Merged without a passing code review.**")]
+
+
+def test_a_merge_over_the_reviews_blockers_is_reported_once_on_the_ticket(w):
+    url, sha, db_id = _blocked_people_mr(w)
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    [note] = _merged_notes(w, db_id)
+    assert f"{url} (acme-platform) was merged although the code review asked for changes at commit `{sha[:12]}`, " \
+           "and the code was not changed after it." in note
+    assert "- `uk.po:3`: The plural forms are missing" in note
+    [event] = w.events_named("review_merged_unchecked")
+    assert (event["url"], event["reviewed"]) == (url, sha)
+    assert w.store.task(PEOPLE).state == "done"
+    later(w)
+    assert len(_merged_notes(w, db_id)) == 1
+
+
+def test_a_merge_of_commits_pushed_after_the_blockers_says_they_were_never_reviewed(w):
+    url, sha, db_id = _blocked_people_mr(w)
+    w.gl.mr(5).update(state="merged", sha="f" * 40)
+    w.tick()
+    [note] = _merged_notes(w, db_id)
+    assert f"after the code review asked for changes at commit `{sha[:12]}`; the commits pushed since " \
+           f"(merged at `ffffffffffff`) were never reviewed" in note
+
+
+def test_a_merge_at_the_approved_commit_is_not_reported(w):
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    assert _merged_notes(w, db_id) == [] and w.store.task(PEOPLE).state == "done"
+    assert not w.events_named("review_merged_unchecked")
+
+
+@pytest.mark.parametrize("patch, reported", [("p1", False), ("p2", True), (None, True)])
+def test_a_rebased_merge_is_reported_only_when_its_diff_differs_from_the_reviewed_one(w, patch, reported):
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    w.gl.mr(5).update(state="merged", sha="e" * 40, versions_page=1, versions=[  # the reviewed one on page 2
+        {"head_commit_sha": "e" * 40, "patch_id_sha": patch}, {"head_commit_sha": sha, "patch_id_sha": "p1"}])
+    w.tick()
+    notes = _merged_notes(w, db_id)
+    assert bool(notes) == reported
+    if reported:
+        assert f"was merged at `eeeeeeeeeeee`, but the code review read commit `{sha[:12]}`" in notes[0]
+
+
+def test_a_merge_no_review_judged_is_left_alone(w):
+    url, _ = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    w.gl.mr(5)["state"] = "merged"  # merged while the review runs: that review's own result says so
+    w.tick()
+    assert _merged_notes(w, db_id) == []
+
+
+def test_a_merge_report_lost_to_a_tracker_outage_is_posted_once_it_is_back(w):
+    _, _, db_id = _blocked_people_mr(w)
+    w.gl.mr(5)["state"] = "merged"
+    comments = f"/api/issues/{db_id}/comments"
+    w.yt.fail[comments] = 503
+    w.tick()
+    del w.yt.fail[comments]
+    assert w.store.task(PEOPLE).state == "code_review" and not w.events_named("review_merged_unchecked")
+    later(w)
+    later(w)
+    assert len(_merged_notes(w, db_id)) == 1 and len(w.events_named("review_merged_unchecked")) == 1
+    assert w.store.task(PEOPLE).state == "done"
+
+
+def test_blockers_merged_after_a_rebase_with_the_same_diff_are_still_reported(w):
+    url, sha, db_id = _blocked_people_mr(w)
+    w.gl.mr(5).update(state="merged", sha="e" * 40, versions=[
+        {"head_commit_sha": "e" * 40, "patch_id_sha": "p1"}, {"head_commit_sha": sha, "patch_id_sha": "p1"}])
+    w.tick()
+    [note] = _merged_notes(w, db_id)
+    assert "although the code review asked for changes" in note and "The plural forms are missing" in note
+
+
+def test_a_merge_whose_head_the_host_does_not_name_is_reported_only_over_blockers(w):
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    people_verdict(w)
+    finish(w, PEOPLE_RID)
+    w.gl.mr(5).update(state="merged", sha="")
+    w.tick()
+    assert _merged_notes(w, db_id) == []
+
+
+def test_a_merge_after_the_ticket_left_code_review_and_a_restart_is_still_reported_once(w):
+    url, sha, db_id = _blocked_people_mr(w)
+    w.yt.issue_fields[db_id] = {"State": {"name": "In Progress"}}  # back to the author for the fixes
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done"  # the runner let go of the ticket
+    w.gl.mr(5)["sha"] = "f" * 40  # the fixes, never reviewed
+    w.tick()
+    assert _merged_notes(w, db_id) == []
+    w.restart()
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    later(w)
+    [note] = _merged_notes(w, db_id)
+    assert f"after the code review asked for changes at commit `{sha[:12]}`" in note
+    assert len(w.events_named("review_merged_unchecked")) == 1
+    calls = len(w.gl.requests)
+    later(w)
+    assert not [r for r in w.gl.requests[calls:] if r.url.path.endswith("/merge_requests/5")]  # no longer read
+
+
+def test_a_judged_merge_request_closed_after_the_ticket_was_let_go_is_no_longer_read(w):
+    _, _, db_id = _blocked_people_mr(w)
+    w.yt.issue_fields[db_id] = {"State": {"name": "Done"}}
+    w.tick()
+    w.gl.mr(5)["state"] = "closed"
+    w.tick()
+    calls = len(w.gl.requests)
+    later(w)
+    assert _merged_notes(w, db_id) == []
+    assert not [r for r in w.gl.requests[calls:] if r.url.path.endswith("/merge_requests/5")]

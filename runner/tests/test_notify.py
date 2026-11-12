@@ -408,6 +408,20 @@ def test_a_code_review_is_told_when_it_starts_and_with_its_result_per_merge_requ
     assert mixed.startswith("☑️ Code review found no problems, not everything is approved")
 
 
+def test_a_merge_the_code_review_did_not_let_through_is_told_once(b):
+    b.task(state="code_review")
+    b.notifier.tick("waiting")
+    b.flush()
+    url = "https://gl.example/acme/acme-platform/mr/4"
+    for _ in range(2):
+        b.events.emit("review_merged_unchecked", task_id="ACME-1", review="ACME-1.review-1", url=url,
+                      repo="acme-platform", reason="although the code review asked for changes at commit `abc`",
+                      sha="def", reviewed="abc")
+    [told] = [m for m in b.flush() if "Merged without" in m]
+    assert told.startswith("⚠️ Merged without a passing code review: *<https://yt.example/issue/ACME-1|ACME-1>*")
+    assert f"• <{url}|acme-platform> was merged although the code review asked for changes" in told
+
+
 def test_a_test_run_of_the_platform_is_told_when_it_starts_and_ends_with_its_summary(b):
     run = b.store.add_run("qa", "schedule", "schedule", slot="2026-10-20T02:00:00+03:00")
     b.events.emit("qa_dispatched", task_id=run.id, run=run.n, source="schedule", by="schedule")

@@ -562,6 +562,12 @@ class Notifier:
         lines.append(f"Details on the ticket: {self.issue_url(row.task_id)}")
         self.put(f"review:{row.id}:published", "review_published", TRANSITION, "\n".join(lines), task_id=row.task_id)
 
+    def _on_review_merged_unchecked(self, r: dict) -> None:
+        self.put(f"merged-unchecked:{r['task_id']}:{r.get('url')}", "review_merged_unchecked", TRANSITION,
+                 f"⚠️ Merged without a passing code review: {self.line(r['task_id'])}\n"
+                 f"• <{r.get('url')}|{esc(r.get('repo'))}> was merged {esc(clip(r.get('reason'), 300))}.\n"
+                 f"Details on the ticket: {self.issue_url(r['task_id'])}", task_id=r["task_id"])
+
     def _on_qa_dispatched(self, r: dict) -> None:
         self.put(f"qa:{r['task_id']}:started", "qa_started", TRANSITION,
                  f"🧪 Platform test started: run {esc(r.get('run'))}{started_how(r)}.")

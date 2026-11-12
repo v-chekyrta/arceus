@@ -169,6 +169,9 @@ class ReviewLoop:
                     self._maybe_send(self.store.task(task.task_id))
             except (ServiceError, EngineError, GitError) as e:
                 self.events.emit("review_poll_failed", task_id=task.task_id, reason=str(e))
+        if self.d.reviewer and only is None:
+            # MRs a review judged, of tickets the runner let go of: a merge after them is still checked.
+            self.d.reviewer.watch_merges()
 
     def _watch(self, task: Task) -> bool:
         """Read every MR of the task. False once the task is over (merged, closed, moved on)."""
@@ -185,6 +188,8 @@ class ReviewLoop:
                 self.events.emit("mr_state", task_id=task.task_id, repo=mr.repo, mr_iid=mr.iid, state=st.state)
                 if st.state == "opened":  # reopened before the agent got to it: nothing to take out
                     self.store.withdraw_signal(_closed_id(mr))
+            if st.state == "merged" and self.d.reviewer:
+                self.d.reviewer.merged_check(task, mr.project_id, mr.iid, st)
             if st.state != "opened":
                 continue
             if self.d.reviewer:

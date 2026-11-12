@@ -305,6 +305,8 @@ class CodeHost(Protocol):
       agent then says what it found in a note and approves nothing.
     - Merge requests people opened: mr_link and mr_head_ref; without them the review agent reviews only the
       merge requests the runner opened itself.
+    - Comparing diffs: same_change; without it a merge at another commit than the reviewed one is reported as
+      a merge of commits nobody reviewed, also when it was only rebased.
     """
 
     name: str          # the service in health checks, metrics and events: "gitlab"
@@ -372,6 +374,10 @@ class CodeHost(Protocol):
 
     def revoke(self, repo_id: Id, iid: Id) -> bool:
         """Take the approver's approval back, if it is there. True when one was taken back."""
+
+    def same_change(self, repo_id: Id, iid: Id, a: str, b: str) -> bool | None:
+        """Whether the merge request's diff with head `a` and with head `b` is the same change. None when the
+        host cannot tell. Optional (see above)."""
 
     def mr_link(self, url: str, repos: list[Repo]) -> tuple[Repo, Id] | None:
         """The repository (one of `repos`) and the number of the merge request a link points at, or None when it

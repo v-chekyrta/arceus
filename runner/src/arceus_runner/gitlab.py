@@ -151,6 +151,20 @@ class GitLabReview(GitLabWriter):
             closed_by=(d.get("closed_by") or {}).get("username") or "", target=d.get("target_branch") or "",
             source=d.get("source_branch") or "")
 
+    def same_change(self, project_id: int, iid: int, a: str, b: str) -> bool | None:
+        """Whether the merge request's source diff at head `a` and at head `b` is the same change (the same commits
+        rebased): GitLab keeps a patch id for each diff version of a merge request (16.4 and later, and it may be
+        empty). None when either version or its patch id is not there, or a head is unknown."""
+        if not a or not b:
+            return None
+        if a == b:
+            return True
+        ids = {v.get("head_commit_sha"): v.get("patch_id_sha")
+               for v in self.paged(f"/api/v4/projects/{project_id}/merge_requests/{iid}/versions")}
+        if not ids.get(a) or not ids.get(b):
+            return None
+        return ids[a] == ids[b]
+
     def notes(self, project_id: int, iid: int, mr_url: str) -> list[Note]:
         """Every note of every discussion, so a late reply in an old thread is seen too."""
         out = []
@@ -300,6 +314,9 @@ class GitLabHost:
 
     def mr_status(self, repo_id: Id, iid: Id) -> MRStatus:
         return self.api.mr_status(repo_id, iid)
+
+    def same_change(self, repo_id: Id, iid: Id, a: str, b: str) -> bool | None:
+        return self.api.same_change(repo_id, iid, a, b)
 
     def notes(self, repo_id: Id, iid: Id, mr_url: str) -> list[Note]:
         return self.api.notes(repo_id, iid, mr_url)
