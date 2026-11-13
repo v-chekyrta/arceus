@@ -42,7 +42,7 @@ TITLES = {
     "http": ("HTTP", "Timeouts and backoff of the calls to the tracker and the code host."),
     "limits": ("Limits", "Review rounds, CI fixes, reminders and timeouts of a task."),
     "health": ("Health", "When disk, memory and tokens are a warning or a failure."),
-    "bulava": ("Engine and models", "Claude's and Codex's models and depth, the checks before Codex."),
+    "bulava": ("Engine and models", "Claude's and Codex's models and depth, and what a task does without Codex."),
     "security": ("Security screen", "Who decides on held texts, the classifier's model."),
     "review_agent": ("Code review on request", "/review on a ticket: what it checks per repository."),
     "qa": ("Test runs", "Testing the platform: on/off, schedule, where reports go."),
@@ -54,7 +54,7 @@ TITLES = {
 }
 # What a change needs before it takes effect. Everything the runner reads needs it restarted; these are also read by
 # setup.sh, which writes them into systemd units, Docker files or nginx, so setup has to run first.
-SETUP_KEYS = ("console", "paths", "bulava.claude_checks", "bulava.mcp_config", "metrics")
+SETUP_KEYS = ("console", "paths", "bulava.mcp_config", "metrics")
 
 # Settings the console shows and never changes: they decide what runs on the machine (a shell command, the engine,
 # the agent's MCP servers, the files the runner reads its environment and tokens from) or where the tokens go (the

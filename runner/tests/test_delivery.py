@@ -65,7 +65,7 @@ def _origins_template() -> Path:
 
 class World:
     def __init__(self, tmp: Path, secrets, engine_dir: Path | None = None, engine_env: dict | None = None,
-                 claude_checks: dict | None = None, settings: dict | None = None):
+                 settings: dict | None = None):
         self.tmp = tmp
         self.engine_env = engine_env or {}
         if engine_dir is None:
@@ -77,10 +77,6 @@ class World:
                 f = engine_dir / "bin" / script
                 f.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_ENGINE}" {cmd} "$@"\n')
                 f.chmod(0o755)
-            # A review gate that runs the independent checks, as the probe looks for it.
-            (engine_dir / "hooks").mkdir()
-            (engine_dir / "hooks" / "review-gate.sh").write_text(
-                '#!/bin/bash\nif [ -n "${IDIR_SCOPE:-}" ] && claude_checks_enabled; then :; fi\n')
         (tmp / "bulava.env").write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test\n")
         (tmp / "bulava.env").chmod(0o600)
 
@@ -100,7 +96,6 @@ class World:
             "db": str(tmp / "runner.db"), "events": str(tmp / "events.jsonl"),
         }
         raw["bulava"]["mcp_config"] = None
-        raw["bulava"]["claude_checks"].update(claude_checks or {})
         raw["health"].pop("devstack_check", None)
         for section, values in (settings or {}).items():  # a test's own settings, section by section
             raw[section] = {**raw.get(section, {}), **values} if isinstance(values, dict) else values
@@ -1356,18 +1351,21 @@ def test_uncommitted_work_on_the_tasks_own_branch_does_not_hold_its_follow_up(w)
     assert (w.repo / "wip.txt").exists()
 
 
-def test_the_engine_gets_the_independent_checks_from_config_and_never_from_bulava_env(w):
-    (w.tmp / "bulava.env").write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test\nSUPERVISOR_CLAUDE_CHECKS=0\n"
+def test_the_engine_never_gets_claude_check_settings_not_even_from_bulava_env(w):
+    """Bulava 1.19.2 removed the Claude checks before Codex: a dispatch names none, and the event says
+    nothing of them."""
+    (w.tmp / "bulava.env").write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test\nSUPERVISOR_CLAUDE_CHECKS=1\n"
                                       "SUPERVISOR_CLAUDE_CHECKS_ROUNDS=5\n")
     take(w)
     [d] = w.calls("dispatch")
-    assert (d["env"]["SUPERVISOR_CLAUDE_CHECKS"], d["env"]["SUPERVISOR_CLAUDE_CHECKS_LIST"],
-            d["env"]["SUPERVISOR_CLAUDE_CHECKS_ROUNDS"]) == ("1", "code security", "1")
+    assert not [k for k in d["env"] if k.startswith("SUPERVISOR_CLAUDE_CHECKS")]
     [e] = w.events_named("task_dispatched")
-    assert (e["claude_checks"], e["claude_checks_rounds"], e["claude_checks_required"]) == ("code security", 1, True)
+    assert not [k for k in e if k.startswith("claude_checks")]
 
 
-def test_a_required_check_that_did_not_run_is_not_called_codex_s_decision(w):
+def test_a_check_failure_from_an_older_engine_still_fails_the_task(w):
+    """A task started on 1.19.1 can still end with its gate's "independent check failed". That path is
+    gone from the runner: it reads as a person's decision, never as a pass, and nothing is published."""
     take(w)
     w.agent_commits()
     w.settle("ACME-1", "failed", review="failed", state_reason="needs-user")
@@ -1375,14 +1373,9 @@ def test_a_required_check_that_did_not_run_is_not_called_codex_s_decision(w):
         review_why="independent check failed (security) and SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1"))
     w.tick()
     task = w.store.task("ACME-1")
-    assert task.state == "failed"
-    assert task.reason.startswith("a required pre-review check (code or security) did not run")
+    assert task.state == "failed" and task.reason == "the review asked for a person's decision"
     assert w.remote_branch("agent/ACME-1-fix-login-page") is None and w.gl.mrs == []
-    [note] = [t for t in w.bot_comments() if "pre-review check" in t]
-    assert "Checks that did not run: security." in note
-    assert not re.search(r"Codex|Claude|Bulava|SUPERVISOR_|independent check failed", note)
-    [missed] = [e for e in read_events(w.cfg.paths.events) if e["event"] == "required_check_missed"]
-    assert missed["review_why"].startswith("independent check failed (security)")  # the gate's words stay inside
+    assert not [e for e in read_events(w.cfg.paths.events) if e["event"] == "required_check_missed"]
 
 
 def test_a_person_asked_by_codex_is_still_codex_s_decision(w):

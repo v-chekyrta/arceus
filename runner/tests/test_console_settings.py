@@ -210,12 +210,26 @@ def test_the_whole_file_as_yaml_and_putting_a_version_back(w):
     assert w.config.read_text() == original
 
 
-def test_a_change_setup_applies_says_so(w):
+def test_a_change_setup_applies_is_told_apart(w):
+    """Every key setup.sh reads is locked in the form, so the check is on the texts: a hand edit of
+    config.yaml that moves one needs setup, one the runner alone reads does not."""
+    text = w.config.read_text()
+    raw = yaml.safe_load(text)
+    raw["metrics"] = {"port": 9465}
+    assert sf.needs_setup(text, yaml.safe_dump(raw))
+    raw = yaml.safe_load(text)
+    raw["limits"]["max_ci_fix_attempts"] = 4
+    assert not sf.needs_setup(text, yaml.safe_dump(raw))
+
+
+def test_the_engine_section_has_no_claude_checks(w):
+    """Bulava 1.19.2 removed them: a save from the form must never write the block back."""
     admin = signed_in(w.settings, "owner@example.com")
-    r = change(admin, "bulava", **{"bulava.claude_checks.rounds": "2"})
-    assert "setup.sh" in r.text and "run setup, then restart the runner" in r.text
-    r = save_preview(admin, r.text)
-    assert "run+setup" in r.headers["location"] or "setup" in r.headers["location"]
+    page = admin.get("/settings/bulava/").text
+    assert "claude_checks" not in page and "bulava.claude_checks" not in dict(form_values(page))
+    r = change(admin, "bulava", **{"bulava.start_handshake_wait": "45s"})
+    assert save_preview(admin, r.text).status_code == 303
+    assert "claude_checks" not in w.config.read_text()
 
 
 def test_a_map_is_edited_as_yaml_in_place(w):

@@ -164,17 +164,15 @@ def test_review_round_through_the_real_engine(w):
     assert sha[:12] in reply["body"]
 
 
-def test_check_settings_reach_the_worker_only_when_the_engine_carries_them(tmp_path, secrets):
+def test_a_worker_is_launched_with_no_claude_check_settings(tmp_path, secrets):
     """On a server the workers' tmux server is bulava-engine.service's, started before any task with the
-    unit's environment, and a worker's review gate reads the environment it was launched with. A check
-    setting the runner passes on the dispatch reaches that gate only if the engine puts it on the
-    worker's launch line; the probe's `settings.claude_checks` must say which is the case."""
-    from arceus_runner import bulava
+    unit's environment, and a worker's review gate reads the environment it was launched with. Bulava
+    1.19.2 removed the Claude checks before Codex: nothing the unit or the runner gives names them."""
     seen = tmp_path / "worker-env"
     worker = tmp_path / "worker.sh"
     worker.write_text(f"#!/bin/bash\nenv > {seen}\nexec cat\n")
     worker.chmod(0o755)
-    gen = _world(tmp_path, secrets, SUPERVISOR_CLAUDE_CMD=str(worker), SUPERVISOR_CLAUDE_CHECKS_ROUNDS="2")
+    gen = _world(tmp_path, secrets, SUPERVISOR_CLAUDE_CMD=str(worker))
     world = next(gen)
     try:
         # What the unit starts: the engine's tmux server with the server profile and nothing from a task.
@@ -190,9 +188,8 @@ def test_check_settings_reach_the_worker_only_when_the_engine_carries_them(tmp_p
             time.sleep(0.3)
         env = dict(line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line)
         assert env.get("SUPERVISOR_PROFILE") == "server" and env.get("ORCHESTRATOR_RUN_ID")
-        carried = bulava.probe(Path(ENGINE)).advertised["settings.claude_checks"]
-        assert (env.get("SUPERVISOR_CLAUDE_CHECKS_ROUNDS") == "2") == carried, (carried, sorted(
-            k for k in env if k.startswith("SUPERVISOR_")))
+        assert not [k for k in env if k.startswith("SUPERVISOR_CLAUDE_CHECKS")], sorted(
+            k for k in env if k.startswith("SUPERVISOR_"))
     finally:
         next(gen, None)
 

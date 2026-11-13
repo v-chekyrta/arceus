@@ -193,7 +193,7 @@ This needs both services enabled, not just started. `setup.sh` enables for good 
 The parts the operator configures but rarely reads end to end:
 
 - [docs/task-lifecycle.md](../docs/task-lifecycle.md): how a ticket goes in `live`, from the tag to the merged MR, `/continue`, research tickets, who pushes and describes the MR;
-- [docs/reviews.md](../docs/reviews.md): Claude checks before Codex (`bulava.claude_checks`) and code review on request (`review_agent`);
+- [docs/reviews.md](../docs/reviews.md): Codex as the only reviewer before a merge request, and code review on request (`review_agent`);
 - [docs/qa.md](../docs/qa.md): testing the platform (`qa`);
 - [docs/architect.md](../docs/architect.md): architecture reviews (`architect`);
 - [docs/console.md](../docs/console.md): the web console, its people and roles (`console`);

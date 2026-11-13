@@ -259,102 +259,65 @@ def test_a_chosen_model_needs_an_engine_that_takes_it(tmp_path, monkeypatch):
     assert new.missing_for_models() == [] and models_check(cfg, new).status == "ok"
 
 
-def test_independent_checks_turned_off_say_so_to_the_engine(tmp_path):
+def test_the_claude_checks_bulava_removed_are_refused_by_name(tmp_path):
+    """Bulava 1.19.2 removed the Claude checks before Codex. A config.yaml that still sets them is told
+    to delete the block, not that it has a typo; any other unknown key stays a typo."""
     raw = example_raw()
-    raw["bulava"]["claude_checks"] = {"enabled": False, "rounds": 3}
-    c = load_config(write(tmp_path, raw)).bulava.claude_checks
-    assert c.env() == {"SUPERVISOR_CLAUDE_CHECKS": "0"} and c.profile() == {"claude_checks": "off"}
-
-
-def test_independent_checks_as_chosen(tmp_path):
-    raw = example_raw()
-    raw["bulava"]["claude_checks"] = {"kinds": ["security", "security"], "min_severity": "medium",
-                                      "rounds": 2, "timeout": "20m", "required": True}
-    env = load_config(write(tmp_path, raw)).bulava.claude_checks.env()
-    assert (env["SUPERVISOR_CLAUDE_CHECKS_LIST"], env["SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY"],
-            env["SUPERVISOR_CLAUDE_CHECKS_ROUNDS"], env["SUPERVISOR_CLAUDE_CHECKS_TIMEOUT"],
-            env["SUPERVISOR_CLAUDE_CHECKS_REQUIRED"]) == ("security", "medium", "2", "1200", "1")
-
-
-@pytest.mark.parametrize("key,value", [
-    ("kinds", []), ("kinds", ["style"]), ("min_severity", "info"), ("rounds", 0), ("rounds", 6),
-    ("timeout", "45m"), ("timeout", "30s"), ("required", "maybe"),
-])
-def test_independent_checks_the_engine_would_not_take_are_refused(tmp_path, key, value):
-    raw = example_raw()
-    raw["bulava"]["claude_checks"] = {key: value}
+    raw["bulava"]["claude_checks"] = {"enabled": True, "rounds": 1}
     with pytest.raises(ConfigError) as e:
         load_config(write(tmp_path, raw))
-    assert all(p.startswith(f"bulava.claude_checks.{key}") for p in e.value.problems), e.value.problems
-
-
-def test_independent_checks_need_an_engine_that_runs_them(tmp_path, monkeypatch):
-    from arceus_runner import bulava
-    from arceus_runner.health import claude_checks
-    from arceus_runner.loop import LiveModeUnavailable, require_mode_ready
-    monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
-    old = _engine(tmp_path, "", "#!/bin/sh\n")
-    (old / "hooks").mkdir()
-    (old / "hooks" / "review-gate.sh").write_text("#!/bin/bash\n# claude_checks_enabled only in a comment\n")
-    old_probe = bulava.probe(old)
-    cfg = load_config(EXAMPLE)
-    c = claude_checks(cfg, old_probe)
-    assert c.status == "fail" and "update it (setup.sh)" in c.detail
-    with pytest.raises(LiveModeUnavailable, match="independent Claude checks"):
-        require_mode_ready(cfg.model_copy(update={"mode": "live"}), old_probe)
-
+    [problem] = e.value.problems
+    assert "bulava.claude_checks is no longer used" in problem and "remove this block" in problem
     raw = example_raw()
-    raw["bulava"]["claude_checks"] = {"enabled": False}
-    off = load_config(write(tmp_path, raw))
-    c = claude_checks(off, old_probe)                      # no engine server to compare with yet
-    assert (c.status, c.detail) == ("ok", "off in config.yaml")  # turned off on purpose: not a warning
-
-    new = _engine(tmp_path / "new", "", "#!/bin/sh\n")
-    (new / "hooks").mkdir()
-    (new / "hooks" / "review-gate.sh").write_text(
-        '#!/bin/bash\nif [ -n "${IDIR_SCOPE:-}" ] && claude_checks_enabled; then\n  :\nfi\n')
-    new_probe = bulava.probe(new)
-    assert new_probe.missing_for_checks() == []
-    c = claude_checks(cfg, new_probe)
-    assert c.status == "ok"
-    assert c.detail == "code + security, back to the agent from high, 1 round(s) per task, 15 min each, required"
+    raw["bulava"]["claude_check"] = {"enabled": True}
+    with pytest.raises(ConfigError) as e:
+        load_config(write(tmp_path, raw))
+    assert e.value.problems == ["bulava.claude_check: unknown key (typo?)"]
 
 
-def test_the_review_gate_must_run_with_what_config_yaml_says(tmp_path, monkeypatch):
-    """A worker's review gate reads the environment of the engine's tmux server (bulava-engine.service),
-    so that is what config.yaml is compared with: an engine server started from an older unit, or never
-    restarted, would run the checks on other terms, and no new task is taken until it is put right."""
-    from arceus_runner import bulava
-    from arceus_runner.health import claude_checks
-    monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
-    root = _engine(tmp_path / "engine", "", "#!/bin/sh\n")
-    (root / "hooks").mkdir()
-    (root / "hooks" / "review-gate.sh").write_text('#!/bin/bash\nif [ -n "${IDIR_SCOPE:-}" ] && claude_checks_enabled; then\n  :\nfi\n')
-    probe = bulava.probe(root)
+def test_the_engine_is_given_no_claude_check_settings(tmp_path):
+    """Nothing the runner starts the engine with names the removed checks, a bulava.env that still has
+    them included: only the tokens and the proxy pass from there."""
+    from arceus_runner.engine import Engine
+    env_file = tmp_path / "bulava.env"
+    env_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test\nSUPERVISOR_CLAUDE_CHECKS=1\n"
+                        "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1\n")
+    env_file.chmod(0o600)
     cfg = load_config(EXAMPLE)
-    unit = {"SUPERVISOR_PROFILE": "server", **cfg.bulava.claude_checks.env()}
-    assert claude_checks(cfg, probe, live_env=lambda: None).status == "ok"         # no server: the dispatch starts it
-    assert claude_checks(cfg, probe, live_env=lambda: unit).status == "ok"
-    old_unit = {"SUPERVISOR_PROFILE": "server"}                                    # the engine's own defaults
-    c = claude_checks(cfg, probe, live_env=lambda: old_unit)
-    assert c.status == "fail" and "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=0 (config.yaml: 1)" in c.detail and "restart bulava-engine" in c.detail
-    raw = example_raw()
-    raw["bulava"]["claude_checks"] = {"enabled": False}
-    off = load_config(write(tmp_path, raw))
-    c = claude_checks(off, probe, live_env=lambda: old_unit)                       # the gate would still run them
-    assert c.status == "fail" and "SUPERVISOR_CLAUDE_CHECKS=1 (config.yaml: 0)" in c.detail
-    assert claude_checks(off, probe, live_env=lambda: {"SUPERVISOR_CLAUDE_CHECKS": "0"}).status == "ok"
-    (root / "bin" / "supervisor-lib.sh").write_text('_RUN_ENV_VARS="SUPERVISOR_CODEX_EFFORT SUPERVISOR_CLAUDE_CHECKS"\n')
-    carries = bulava.probe(root)                                                    # an engine that takes them per task
-    assert claude_checks(cfg, carries, live_env=lambda: old_unit).status == "ok"
+    cfg = cfg.model_copy(update={"paths": cfg.paths.model_copy(update={"bulava_env": env_file})})
+    env = Engine(cfg).env()
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
+    assert not [k for k in env if k.startswith("SUPERVISOR_CLAUDE_CHECKS")], sorted(env)
 
 
-def test_engine_env_prints_what_setup_writes_into_the_engine_unit(capsys):
-    assert main(["--config", str(EXAMPLE), "engine-env"]) == EXIT_OK
-    assert sorted(capsys.readouterr().out.splitlines()) == [
-        "SUPERVISOR_CLAUDE_CHECKS=1", "SUPERVISOR_CLAUDE_CHECKS_LIST=code security",
-        "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY=high", "SUPERVISOR_CLAUDE_CHECKS_REQUIRED=1",
-        "SUPERVISOR_CLAUDE_CHECKS_ROUNDS=1", "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT=900"]
+def test_the_engine_command_for_the_old_check_settings_is_gone(capsys):
+    with pytest.raises(SystemExit):
+        main(["--config", str(EXAMPLE), "engine-env"])
+
+
+def test_an_engine_that_still_runs_claude_checks_is_a_warning(tmp_path):
+    """Bulava 1.19.2 reads its removed checks as ok and removed. An engine that says they are on is
+    older than the pinned one and would still run them before Codex."""
+    from types import SimpleNamespace
+    from arceus_runner.health import engine_doctor
+    cfg = load_config(EXAMPLE)
+
+    def doctor(*rows):
+        engine = SimpleNamespace(cfg=cfg, doctor=lambda: {"checks": list(rows)})
+        return {c.name: c for c in engine_doctor(engine)}
+
+    removed = {"name": "engine.claude_checks", "status": "ok", "detail": {"enabled": False, "removed": True}}
+    c = doctor(removed)["bulava.engine.claude_checks"]
+    assert c.status == "ok" and "removed" in c.detail
+    old = {"name": "engine.claude_checks", "status": "ok",
+           "detail": {"enabled": True, "list": ["code", "security"], "min_severity": "high", "rounds": "1",
+                      "required": False}}
+    c = doctor(old)["bulava.engine.claude_checks"]
+    assert c.status == "warn" and "install the pinned one (setup.sh)" in c.detail
+    failing = {**removed, "status": "fail"}
+    assert doctor(failing)["bulava.engine.claude_checks"].status == "fail"
+    unknown = {**removed, "status": "unexpected"}                                          # a status not understood
+    assert doctor(unknown)["bulava.engine.claude_checks"].status == "warn"
 
 
 def test_a_service_that_would_not_come_back_after_a_reboot_is_named(monkeypatch):
@@ -388,38 +351,3 @@ def test_slack_notify_idle_repeat_is_no_longer_a_setting(tmp_path):
     with pytest.raises(ConfigError) as e:
         load_config(write(tmp_path, raw))
     assert e.value.problems == ["slack.notify.idle_repeat: unknown key (typo?)"]
-
-
-def test_the_engine_warning_on_checks_turned_off_is_ok_when_config_yaml_turned_them_off(tmp_path):
-    """Bulava's doctor warns on a server whose Claude checks are off. Off in config.yaml and off in the
-    engine is what was asked for; the engine running them, or config.yaml wanting them, stays a warning."""
-    from types import SimpleNamespace
-    from arceus_runner.health import engine_doctor
-    raw = example_raw()
-    raw["bulava"]["claude_checks"] = {"enabled": False}
-    off, on = load_config(write(tmp_path, raw)), load_config(EXAMPLE)
-    team = {"name": "engine.review_team", "status": "ok",
-            "detail": {"enabled": True, "members": ["contract", "security", "state"], "calls_per_round": 3}}
-
-    def doctor(cfg, *rows):
-        engine = SimpleNamespace(cfg=cfg, doctor=lambda: {"checks": list(rows)})
-        return {c.name: c for c in engine_doctor(engine)}
-
-    def row(enabled):
-        return {"name": "engine.claude_checks", "status": "warn",
-                "detail": {"enabled": enabled, "list": ["code", "security"], "min_severity": "high",
-                           "rounds": "1", "required": False}}
-
-    c = doctor(off, row(False), team)["bulava.engine.claude_checks"]
-    assert (c.status, c.detail) == ("ok", "off, as config.yaml says; Codex review team: contract, security, state")
-    assert doctor(off, row(False))["bulava.engine.claude_checks"].detail == "off, as config.yaml says"
-    assert doctor(on, row(False), team)["bulava.engine.claude_checks"].status == "warn"   # config.yaml wants them
-    assert doctor(off, row(True), team)["bulava.engine.claude_checks"].status == "warn"   # the engine still has them
-    odd = {"name": "engine.claude_checks", "status": "warn", "detail": "off"}            # a reading not understood
-    assert doctor(off, odd)["bulava.engine.claude_checks"].status == "warn"
-    failing = {**row(False), "status": "fail"}
-    assert doctor(off, failing)["bulava.engine.claude_checks"].status == "fail"
-    unknown = {**row(False), "status": "unexpected"}                                     # a status not understood
-    assert doctor(off, unknown)["bulava.engine.claude_checks"].status == "warn"
-    nameless = {k: v for k, v in row(False).items() if k != "status"}                   # no status at all
-    assert doctor(off, nameless)["bulava.engine.claude_checks"].status == "warn"

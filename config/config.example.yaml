@@ -113,17 +113,6 @@ bulava:
   codex_model: auto                    # auto | a slug from `night-shift models codex`
   codex_effort: auto                   # auto | low | medium | high | xhigh | max | ultra
   start_handshake_wait: 30s            # 5s–2m for a new session to confirm its start
-  # Claude code and security reviews of the diff before Codex (engine/SERVER.md). Findings at
-  # min_severity or above go back to the agent, `rounds` times per task. After a change: sudo ./setup.sh
-  # and restart bulava-engine between tasks (`doctor` says FAIL until then). enabled: false is fine:
-  # Codex's review team (contract, security, state) then reviews alone.
-  claude_checks:
-    enabled: true
-    kinds: [code, security]
-    min_severity: high                 # critical | high | medium | low
-    rounds: 1                          # 1–5
-    timeout: 15m                       # per check, 1m–30m
-    required: true                     # a check that did not run stops the task; false: go on to Codex
 
 # Every ticket, comment and CI log is screened by Claude before the agent sees it. A suspicious text
 # waits for `/security-allow <code>` or `/security-reject <code>` on the ticket.

@@ -57,8 +57,6 @@ FAIL_REASONS = {
     "scope_violation": "the agent went outside the task's scope",
     "stalled": "the agent's session stopped at its prompt without finishing, again after being asked to finish",
 }
-# The review gate's words when a required independent check did not run (review-gate.sh, claude checks).
-CHECK_FAILED = "independent check failed"
 STALLED_NUDGE = ("Your previous session stopped at its prompt without finishing the turn, and Bulava parked it. "
                  "Pick the task up from where the work stands: finish it, commit in every repository you "
                  "changed, and declare the outcome.")
@@ -765,7 +763,7 @@ class Delivery:
             # `auto` means the CLI chose, and only its own transcripts say what that was.
             self.events.emit("task_dispatched", task_id=task.task_id, tier=reply.tier,
                              attempt=reply.data.get("attempt"), dispatch_id=reply.data.get("dispatch_id"),
-                             **self.cfg.bulava.model_profile(), **self.cfg.bulava.claude_checks.profile())
+                             **self.cfg.bulava.model_profile())
         elif reply.rc == 6:
             self.events.emit("dispatch_busy", task_id=task.task_id, reason=reply.why())
         else:
@@ -859,17 +857,6 @@ class Delivery:
                     verdict = "but the automated checks did not confirm it with the project's build and tests"
                 self.fail(task, f"The change passed review, {verdict}, so it was not published",
                           self._debt_details(task, receipt, outcome, failed + unproven), attempt=len(attempts))
-                return
-            review_why = receipt.get("review_why") or ""
-            if why == "needs-user" and CHECK_FAILED in review_why:
-                # bulava.claude_checks.required: the engine stopped before Codex, so it is not Codex's decision.
-                # The gate's own words stay in the event log; the ticket gets which checks did not run.
-                self.events.emit("required_check_missed", task_id=task.task_id, review_why=review_why)
-                kinds = re.search(rf"{CHECK_FAILED} \(([^)]*)\)", review_why)
-                self.fail(task, "a required pre-review check (code or security) did not run, "
-                                "so the work was not reviewed",
-                          f"Checks that did not run: {kinds.group(1) if kinds else 'code or security'}.",
-                          attempt=len(attempts))
                 return
             reason = FAIL_REASONS.get(why) or FAIL_REASONS.get(outcome.get("reason") or "") or why
             self.fail(task, reason, outcome.get("summary") or "", attempt=len(attempts))

@@ -1,4 +1,4 @@
-"""The whole pipeline with the real Claude and Codex: ticket → work → independent checks → Codex → MR,
+"""The whole pipeline with the real Claude and Codex: ticket → work → Codex → MR,
 then a review comment and a red pipeline on the MR, each a follow-up of the same task.
 
 Runs only in the sandbox (`sandbox/sandbox.sh live`), where setup.sh installed the engine and the
@@ -8,8 +8,7 @@ fakes of the other tests, with real git origins.
 
 The tests fail on what must never happen: a task that hangs, a published commit that is not the one
 Codex passed, a second MR. Everything else is written to ARCEUS_LIVE_REPORT as what was observed —
-each step of the engine with its time, what the checks found, what went back to the agent and what it
-answered, and the gaps worth a person's look — because a model's choices are not the runner's to assert.
+each step of the engine with its time and the gaps worth a person's look — because a model's choices are not the runner's to assert.
 """
 
 from __future__ import annotations
@@ -26,8 +25,6 @@ from pathlib import Path
 
 import pytest
 
-from arceus_runner.health import engine_tmux_env as REAL_ENGINE_TMUX_ENV
-from arceus_runner.progress import task_key
 
 from .conftest import read_events
 from .test_delivery import World, git
@@ -36,8 +33,7 @@ ENGINE = os.environ.get("ARCEUS_REAL_ENGINE")
 LIVE = os.environ.get("ARCEUS_LIVE") == "1"
 REPORT = Path(os.environ.get("ARCEUS_LIVE_REPORT") or "live-report")
 live = pytest.mark.skipif(not (ENGINE and LIVE), reason="sandbox only: sandbox/sandbox.sh live")
-# How hard Claude and Codex think in a live run: the work, the independent checks and the review gate
-# alike (bulava.claude_effort and codex_effort). sandbox.sh live sets low; unset, config.yaml's own.
+# How hard Claude and Codex think in a live run: the work and the review gate alike (bulava.claude_effort and codex_effort). sandbox.sh live sets low; unset, config.yaml's own.
 EFFORT = os.environ.get("ARCEUS_LIVE_EFFORT") or None
 
 
@@ -47,7 +43,7 @@ def live_settings(**sections) -> dict:
         sections["bulava"] = {"claude_effort": EFFORT, "codex_effort": EFFORT, **sections.get("bulava", {})}
     return sections or None
 
-ATTEMPT_LIMIT = timedelta(minutes=75)   # one attempt: the work, two checks, Codex, the fix rounds
+ATTEMPT_LIMIT = timedelta(minutes=75)   # one attempt: the work, Codex, the fix rounds
 POLL = 15                               # seconds between looks, as the runner's poll_local would
 STILL = timedelta(minutes=20)           # one engine step this long without a new one: worth a look
 
@@ -96,13 +92,6 @@ if __name__ == "__main__":
 KEEPER = Path(__file__).resolve().parents[2] / "sandbox" / "keeper.py"
 
 
-@pytest.fixture(autouse=True)
-def real_engine_tmux_server(monkeypatch):
-    """Here the engine's tmux server is the one the scenarios run on: its settings are what the review
-    gates see, and the runner's health check must compare config.yaml with them."""
-    monkeypatch.setattr("arceus_runner.health.engine_tmux_env", REAL_ENGINE_TMUX_ENV)
-
-
 def ensure_keeper() -> str:
     """The engine's tmux server as bulava-engine.service keeps it. On the server systemd restarts it;
     in the box nothing would, and an engine that finds no server starts one from the runner's
@@ -119,12 +108,11 @@ def w(request, tmp_path, secrets):
     if "started" in keeper:
         say(f"the engine's tmux server was gone and is started again ({keeper})")
     param = dict(getattr(request, "param", None) or {})
-    checks = param.pop("claude_checks", None)   # config.yaml's bulava.claude_checks; the rest: engine env
     settings = {}
     if param.pop("project_notes", False):
         (tmp_path / "project-notes.md").write_text(PROJECT_NOTES)
         settings["paths"] = {"project_notes": str(tmp_path / "project-notes.md")}
-    world = World(tmp_path, secrets, engine_dir=Path(ENGINE), engine_env=param, claude_checks=checks,
+    world = World(tmp_path, secrets, engine_dir=Path(ENGINE), engine_env=param,
                   settings=live_settings(**settings))
     world.keeper_at_start = keeper
     # The sandbox's Claude is the user's /login; the test token of the other tests would replace it.
@@ -172,24 +160,6 @@ class Observer:
     def steps(self) -> list[dict]:
         return [e for e in self.events() if e["event"] == "engine_step"]
 
-    def checks_dir(self) -> Path:
-        return self.w.cfg.paths.bulava_state / "tasks" / task_key(self.task_id) / "checks"
-
-    def checks(self) -> dict:
-        d = self.checks_dir()
-        out: dict = {"rounds_used": (d / "rounds").read_text().strip() if (d / "rounds").exists() else "0",
-                     "readings": [], "returned": [], "replies": []}
-        for summary in sorted(d.glob("*/summary.json")):
-            s = json.loads(summary.read_text())
-            out["readings"].append({"snapshot": s.get("snapshot"), "state": s.get("state"),
-                                    "checks": [{k: c.get(k) for k in ("kind", "state", "error")} for c in s.get("checks", [])],
-                                    "findings": s.get("findings", [])})
-        for name, key in (("returned.jsonl", "returned"), ("replies.jsonl", "replies")):
-            f = d / name
-            if f.exists():
-                out[key] = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
-        return out
-
     def gaps(self) -> list[str]:
         """What a person should look at: not failures of the test, findings about the pipeline."""
         out = []
@@ -197,14 +167,8 @@ class Observer:
         attempts = sorted({s.get("attempt") for s in steps if s.get("attempt") is not None})
         for a in attempts:
             mine = [s for s in steps if s.get("attempt") == a]
-            checks = [s for s in mine if s["stage"] == "gate.check"]
-            if not checks:
-                out.append(f"attempt {a}: the independent checks never ran")
-            for s in checks:
-                if s["state"] == "skipped":
-                    out.append(f"attempt {a}: checks skipped — {s.get('note')}")
-                if s["state"] == "failed":
-                    out.append(f"attempt {a}: a check did not work — {s.get('note')}")
+            if [s for s in mine if s["stage"] == "gate.check"]:
+                out.append(f"attempt {a}: the engine ran Claude checks before Codex (an engine older than 1.19.2)")
         for prev, nxt in zip(steps, steps[1:]):
             gap = epoch(nxt) - epoch(prev)
             if gap > STILL.total_seconds():
@@ -218,11 +182,8 @@ class Observer:
                            ("SeccompInstall", "its seccomp filter could not be installed")):
             if sign in text:
                 out.append(f"Codex could not run its read-only sandbox ({what}): its review is not a verdict on the work")
-        c = self.checks()
         if "started" in (getattr(self.w, "keeper_at_start", "") or ""):
             out.append("the engine's tmux server had died before this scenario (systemd would restart it)")
-        if c["returned"] and not c["replies"]:
-            out.append("findings went back to the agent, and no answer of its was recorded")
         return out
 
     def write(self, extra: dict | None = None) -> None:
@@ -240,7 +201,7 @@ class Observer:
                              for a in show.get("attempts") or []],
                 "review_why": ((show.get("receipt") or {}).get("review_why") or "")[:4000],
                 "codex_verdict": codex_verdict(self.w),
-                "checks": self.checks(), "gaps": self.gaps(), "timeline": timeline,
+                "gaps": self.gaps(), "timeline": timeline,
                 "mrs": [{k: m.get(k) for k in ("iid", "title", "source_branch")} for m in self.w.gl.mrs],
                 "keeper_at_start": getattr(self.w, "keeper_at_start", ""), "keeper_at_end": ensure_keeper(),
                 **(extra or {})}
@@ -248,15 +209,7 @@ class Observer:
         lines = [f"# {self.name}", "", f"{data['minutes']} min · runner `{data['runner_state']}` · engine "
                  f"`{data['engine_state']}` · attempts {len(data['attempts'])} · MRs {len(data['mrs'])}",
                  "models: " + ", ".join(f"{k} {v}" for k, v in data["models"].items()), "",
-                 "## Gaps", *([f"- {g}" for g in data["gaps"]] or ["- none seen"]), "",
-                 "## Checks", f"rounds used: {data['checks']['rounds_used']}"]
-        for r in data["checks"]["readings"]:
-            lines.append(f"- snapshot {r['snapshot']}: {r['state'] or ''} "
-                         + ", ".join(f"{c['kind']} {c['state']}" + (f" ({c['error']})" if c["error"] else "")
-                                     for c in r["checks"]))
-            lines += [f"  - [{f['severity']}] {f['file']}:{f['line']} {f['title']}" for f in r["findings"]]
-        for rep in data["checks"]["replies"]:
-            lines.append(f"- the agent answered: {rep.get('reply', '')[:600]}")
+                 "## Gaps", *([f"- {g}" for g in data["gaps"]] or ["- none seen"])]
         lines += ["", "## Timeline (minutes from the first step)"]
         lines += [f"- {t['min']:>5} a{t['attempt']} {t['stage']} · {t['state']}" + (f" — {t['note']}" if t["note"] else "")
                   for t in timeline]
@@ -343,13 +296,17 @@ def codex_verdict(w: World) -> str:
 
 
 def published_is_reviewed(w: World, task_id: str) -> None:
-    """The invariant of delivery: GitLab has exactly the commit Codex passed, in one MR."""
+    """The invariant of delivery: GitLab has exactly the commit Codex passed, in one MR, and Codex was
+    the only review: no Claude check step before it (Bulava 1.19.2 removed them)."""
     task = w.store.task(task_id)
     show = w.runner.delivery.engine.show(task_id)
     repos = {Path(r["path"]).name: r for r in show["repos"]}
     sha = w.remote_branch(task.branch)
     assert sha == repos["acme-platform"]["reviewed_sha"], (sha, repos)
     assert len([m for m in w.gl.mrs if m["source_branch"] == task.branch]) == 1
+    steps = [e["stage"] for e in read_events(w.cfg.paths.events)
+             if e.get("task_id") == task_id and e["event"] == "engine_step"]
+    assert "gate.check" not in steps, steps
 
 
 # -- the scenarios ----------------------------------------------------------------------------------
@@ -365,9 +322,9 @@ def test_the_live_world_would_take_work(w):
 
 
 @live
-def test_a_planted_problem_goes_through_the_checks_and_codex(w):
+def test_a_planted_problem_goes_through_codex(w):
     """A ticket that asks for exactly what a security review exists for. The model may refuse to write
-    it; the report says which: findings returned and fixed, or a clean change."""
+    it; the report says which: a change Codex returned and the agent fixed, or a clean change."""
     db = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
     w.yt.issues[-1]["summary"] = "Look users up by name"
     w.yt.issues[-1]["description"] = (
@@ -384,9 +341,9 @@ def test_a_planted_problem_goes_through_the_checks_and_codex(w):
 
 
 @live
-def test_review_comment_and_red_ci_are_follow_ups_with_their_own_checks(w):
-    """After the MR, a reviewer's note and then a red pipeline. Each is a new attempt of the task; the
-    report shows whether the checks read the new change, or were skipped once their rounds were spent."""
+def test_review_comment_and_red_ci_are_follow_ups_of_the_task(w):
+    """After the MR, a reviewer's note and then a red pipeline. Each is a new attempt of the task,
+    reviewed by Codex alone like the first."""
     db = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
     w.yt.issues[-1]["summary"] = "Count users"
     w.yt.issues[-1]["description"] = "In acme-platform add `count_users(conn)` to acme_platform/users.py, with a test."
@@ -425,86 +382,6 @@ def test_review_comment_and_red_ci_are_follow_ups_with_their_own_checks(w):
         obs.write({"ticket_comments": w.bot_comments(db)})
 
 
-@live
-@pytest.mark.parametrize("w", [{"SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": "5", "claude_checks": {"timeout": "1m"}}],
-                         indirect=True)
-def test_a_required_check_that_cannot_finish_stops_the_task_for_a_person(w, monkeypatch):
-    """`required: true` (the default): the checks are given five seconds, at least one times out (at low
-    effort a check can finish in that), and the task stops for a person — no Codex review, no merge request,
-    and the ticket says it was the check, not Codex.
-
-    Five seconds is below what config.yaml can say (1m), so the engine's tmux server gets them as an
-    operator would set them by hand, and the runner's health check, which would rightly refuse a gate
-    running with another timeout than config.yaml's, is shown config.yaml's value for that one name."""
-    keeper = ["tmux", "-L", "bulava"]
-    subprocess.run([*keeper, "set-environment", "-g", "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT", "5"], check=True)
-    monkeypatch.setattr("arceus_runner.health.engine_tmux_env", lambda socket="bulava": {
-        **(REAL_ENGINE_TMUX_ENV(socket) or {}), "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": "60"})
-    db = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
-    w.yt.issues[-1]["summary"] = "Delete users"
-    w.yt.issues[-1]["description"] = "In acme-platform add `delete_user(conn, name)` to acme_platform/users.py, with a test."
-    obs = Observer(w, "ACME-1", "required-check-timeout")
-    try:
-        state = run_until(w, "ACME-1", ("code_review", "failed", "needs_input"))
-        steps = obs.steps()
-        # What the engine keeps, not its step journal: that is deleted with the instance when the engine
-        # stops it, and can be gone before the runner reads the gate's last steps.
-        readings = obs.checks()["readings"]
-        assert len(readings) == 1 and [c for c in readings[0]["checks"] if c["state"] == "failed"], \
-            f"no check timed out in five seconds, so the scenario proves nothing: {readings}"
-        assert [s for s in steps if s["stage"] == "gate.check"], "the checks never started"
-        assert state == "failed", f"a required check that did not run let the task go on to {state}"
-        assert w.store.task("ACME-1").reason.startswith("a required pre-review check"), w.store.task("ACME-1").reason
-        assert not [s for s in steps if s["stage"] == "gate.review"], "Codex reviewed work whose checks never ran"
-        assert w.gl.mrs == [] and w.remote_branch(w.store.task("ACME-1").branch) is None
-        assert any("a required pre-review check" in t for t in w.bot_comments(db)), "the ticket does not say why"
-        assert not [t for t in w.bot_comments(db) if re.search(r"Codex|Claude|Bulava", t)], "the ticket names a model"
-    finally:
-        subprocess.run([*keeper, "set-environment", "-gu", "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT"])
-        obs.write({"ticket_comments": w.bot_comments(db)})
-
-
-@live
-@pytest.mark.parametrize("w", [{"SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY": "low", "claude_checks": {"min_severity": "low"}}],
-                         indirect=True)
-def test_findings_go_back_to_the_agent_once_and_codex_decides(w):
-    """The return path itself: with the threshold at `low`, whatever the two reviewers find goes back
-    to the agent (on the default `high` a careful agent gives them nothing to return). The agent must
-    answer each finding, the checks must not run again once the task's one round is spent, Codex must
-    see the findings with the answers, and the task must end: one return, not a loop."""
-    keeper = ["tmux", "-L", "bulava"]
-    subprocess.run([*keeper, "set-environment", "-g", "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY", "low"], check=True)
-    db = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
-    # Something a reviewer flags and the ticket asks for on purpose, so findings exist whatever the
-    # agent's care, and the answer "kept, the ticket requires it" is as valid as a fix.
-    w.yt.issues[-1]["summary"] = "Export users as the legacy importer reads them"
-    w.yt.issues[-1]["description"] = (
-        "In acme-platform add `export_users(conn, path)` to acme_platform/users.py. It writes one line per "
-        "user, `name,email`, to `path`, overwriting the file. Keep it byte for byte what the old exporter "
-        "wrote: no header, no quoting or escaping of any kind — the legacy importer splits each line on the "
-        "first comma and treats quotes as part of the value. Add a test.")
-    obs = Observer(w, "ACME-1", "findings-returned")
-    try:
-        state = run_until(w, "ACME-1", ("code_review", "failed", "needs_input"))
-        c = obs.checks()
-        steps = obs.steps()
-        assert c["returned"], "the reviewers found nothing even at `low`: the return path was not exercised"
-        assert c["rounds_used"] == "1", f"one round per task, used {c['rounds_used']}"
-        assert c["replies"] and all((r.get("reply") or "").strip() for r in c["replies"]), \
-            "findings went back and no answer of the agent's was recorded"
-        returned_at = next(i for i, s in enumerate(steps) if s["stage"] == "gate.check" and s["state"] == "findings")
-        later = [s for s in steps[returned_at + 1:] if s["stage"] == "gate.check"]
-        assert later and all(s["state"] == "skipped" for s in later), \
-            f"after the round was spent the checks ran again: {[s['state'] for s in later]}"
-        log = (w.cfg.paths.bulava_state / "codex.log").read_text(errors="replace")
-        assert "Findings returned to the worker earlier" in log, "Codex was not shown the findings and the answers"
-        if state == "code_review":
-            published_is_reviewed(w, "ACME-1")
-    finally:
-        subprocess.run([*keeper, "set-environment", "-gu", "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY"])
-        obs.write({"ticket_comments": w.bot_comments(db)})
-
-
 PROJECT_NOTES = """## Conventions
 
 - PN-1. Every change to acme-theme is listed in `acme-theme/CHANGES.md`, one line per ticket:
@@ -519,10 +396,7 @@ PROJECT_NOTES = """## Conventions
 @pytest.mark.parametrize("w", [{"project_notes": True}], indirect=True)
 def test_the_project_notes_reach_the_agent_and_codex_across_repositories(w):
     """Rules only the project notes give, in two repositories. The agent keeps them in its commits and
-    Codex names them in its verdict: both read the notes from the workspace's AGENTS.md. The independent
-    Claude checks are not asserted: they may read AGENTS.md for context (it is in a folder they are given),
-    but the engine tells them it is data under review, not rules (bin/lib/claude-checks.sh), so what they
-    made of it goes to the report as it is."""
+    Codex names them in its verdict: both read the notes from the workspace's AGENTS.md."""
     db = w.yt.add_issue(1, ("a1", "j.doe", "+agent"))
     w.yt.issues[-1]["summary"] = "Count users and a badge style"
     w.yt.issues[-1]["description"] = (

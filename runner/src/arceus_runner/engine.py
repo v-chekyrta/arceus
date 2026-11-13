@@ -21,10 +21,8 @@ from arceus_runner.gitops import _workspace_umask
 from arceus_runner.screening import Clearance, NotScreened
 
 TIMEOUT = 900
-# Chosen in config.yaml (bulava.*_model, *_effort, claude_checks); bulava.env is for the token and
-# cannot override them.
+# Chosen in config.yaml (bulava.*_model, *_effort); bulava.env is for the token and cannot override them.
 MODEL_VARS = ("SUPERVISOR_CLAUDE_MODEL", "SUPERVISOR_CLAUDE_EFFORT", "SUPERVISOR_CODEX_MODEL", "SUPERVISOR_CODEX_EFFORT")
-CHECKS_PREFIX = "SUPERVISOR_CLAUDE_CHECKS"
 # What bulava.env may give the engine's commands: the models' credentials and the way out through a proxy. Nothing
 # that changes how a program starts or which program runs (BASH_ENV, LD_PRELOAD, PATH, NODE_OPTIONS, ...).
 TOKEN_VARS = re.compile(r"^(CLAUDE_CODE_OAUTH_TOKEN(_ISSUED_AT)?|ANTHROPIC_API_KEY|OPENAI_API_KEY|CODEX_API_KEY|"
@@ -122,10 +120,6 @@ class Engine:
         env["NIGHT_SHIFT_SETTINGS"] = "off"
         env.update(self.token_env())
         env.update(b.model_env())
-        # The engine's checks before Codex. doctor reports them from here; the review gate on a server
-        # reads them from the worker's environment, which comes from bulava-engine.service, so only the
-        # engine's defaults reach it until the engine carries these (health.claude_checks).
-        env.update(b.claude_checks.env())
         env.update(self.extra_env)
         return env
 

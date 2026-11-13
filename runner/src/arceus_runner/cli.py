@@ -17,7 +17,7 @@ from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, l
 from arceus_runner.db import ACTIVE_STATES, RUN_UNDER_WAY, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
 from arceus_runner.engine import Engine
-from arceus_runner.health import claude_checks, engine_doctor, local_checks
+from arceus_runner.health import engine_doctor, local_checks
 from arceus_runner.events import EventLog
 from arceus_runner.integrations import build_code_host, build_tracker
 from arceus_runner.loop import IntegrationChanged, LiveModeUnavailable, make_cleanup, require_mode_ready, run
@@ -62,7 +62,6 @@ def cmd_check(args) -> int:
         checks.append(Check("config.mode", "fail", str(e)))
     probe = bulava_mod.probe(cfg.paths.bulava)
     checks.append(models_check(cfg, probe))
-    checks.append(claude_checks(cfg, probe))
     checks.append(review_agent_check(cfg))
     checks.append(qa_check(cfg))
     checks.append(architect_check(cfg))
@@ -173,16 +172,6 @@ def cmd_slack_test(args) -> int:
         hook.close()
     print(f"slack: {said}")
     return EXIT_OK if said == "posted" else EXIT_CHECK_FAILED
-
-
-def cmd_engine_env(args) -> int:
-    """The engine settings the review gate must see, one NAME=value per line, for bulava-engine.service.
-    On a server a worker's gate reads the environment of the engine's tmux server, which that unit
-    starts: whatever the runner passes on a dispatch does not reach it."""
-    cfg = load_config(_config_path(args.config))
-    for name, value in sorted(cfg.bulava.claude_checks.env().items()):
-        print(f"{name}={value}")
-    return EXIT_OK
 
 
 def cmd_probe(args) -> int:
@@ -477,9 +466,6 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--act", action="store_true", help="make a full pass now (stop the runner first)")
     k.add_argument("--json", action="store_true")
     k.set_defaults(fn=cmd_cleanup)
-
-    e = sub.add_parser("engine-env", help="the check settings for bulava-engine.service (setup.sh writes them there)")
-    e.set_defaults(fn=cmd_engine_env)
 
     rb = sub.add_parser("rebind", help="bind runner.db to the tracker or code host config.yaml names now "
                                        "(the same one under a new address; stop the runner first)")

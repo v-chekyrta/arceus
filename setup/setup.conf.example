@@ -17,4 +17,4 @@ WORKSPACE_MCP_VERSION=2.3.0
 # /var/lib/arceus/bulava.git), or a branch to follow. To update: `git ls-remote <source> refs/heads/main`,
 # check engine/SERVER.md, re-run setup between tasks (it refuses while a task is running).
 BULAVA_SOURCE=https://github.com/Stepanokdev/bulava
-BULAVA_REF=bdc57917e9e0847d29a216d5fe9d5692df0d81a0   # main, 1.19.1 (2026-11-12)
+BULAVA_REF=331f7f560b1ba8fe0d38c94071f7cd6928489848   # main, 1.19.2 (2026-11-12)

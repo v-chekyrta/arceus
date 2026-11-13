@@ -58,6 +58,8 @@ _GONE = {
                     "and the agent picks the repositories the ticket needs; remove this line",
     "ci_build_jobs": "CI jobs are set per repository now: move the list to review_agent.repos.<path>.ci_build_jobs",
     "ci_test_jobs": "CI jobs are set per repository now: move the list to review_agent.repos.<path>.ci_test_jobs",
+    "claude_checks": "Bulava 1.19.2 removed the Claude checks before Codex, Codex alone reviews the work; "
+                     "remove this block",
 }
 
 
@@ -315,64 +317,6 @@ def _expand(v: object) -> object:
 ExpandedPath = Annotated[Path, BeforeValidator(_expand)]
 
 
-# What the engine's review gate uses on a server for a name nobody set (bin/lib/claude-checks.sh).
-ENGINE_CHECK_DEFAULTS = {"SUPERVISOR_CLAUDE_CHECKS": "1", "SUPERVISOR_CLAUDE_CHECKS_LIST": "code security",
-                         "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY": "high", "SUPERVISOR_CLAUDE_CHECKS_ROUNDS": "1",
-                         "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": "900", "SUPERVISOR_CLAUDE_CHECKS_REQUIRED": "0"}
-
-
-class ClaudeChecksConfig(Strict):
-    """The engine's independent checks (engine/SERVER.md, "Independent checks before Codex"): after a
-    green build and before Codex, a code review and a security review in Claude sessions of their own
-    that never saw the ticket or the worker's conversation. They advise; only Codex accepts the work.
-    A worker's review gate reads the environment of the engine's tmux server, which bulava-engine.service
-    starts; setup.sh writes these values into that unit (`arceus-runner engine-env`), and
-    health.claude_checks compares them with the running server."""
-    enabled: bool = True
-    kinds: list[Literal["code", "security"]] = Field(default=["code", "security"], min_length=1)
-    # What goes back to the worker; everything else is shown only to Codex.
-    min_severity: Literal["critical", "high", "medium", "low"] = "high"
-    # Times per task the findings go back to the worker; a follow-up does not get a new budget. Once it
-    # is spent the engine does not run the checks again for that task: Codex sees the last reading.
-    rounds: int = Field(default=1, ge=1, le=5)
-    # Per check; both run side by side inside the review gate's hour, with the build and Codex.
-    timeout: Duration = timedelta(minutes=15)
-    # true: a check that did not run (time, a Claude limit, no answer, the network) stops the task for a
-    # person instead of leaving it to Codex alone. On by default: the checks are a promise of this
-    # pipeline, the security one above all, and work that skipped them must not reach a merge request
-    # looking checked.
-    required: bool = True
-
-    @field_validator("timeout")
-    @classmethod
-    def _timeout(cls, v: timedelta) -> timedelta:
-        if not timedelta(minutes=1) <= v <= timedelta(minutes=30):
-            raise ValueError("between 1m and 30m: the checks share the review gate's hour with the build and Codex")
-        return v
-
-    def env(self) -> dict[str, str]:
-        if not self.enabled:
-            return {"SUPERVISOR_CLAUDE_CHECKS": "0"}
-        return {"SUPERVISOR_CLAUDE_CHECKS": "1",
-                "SUPERVISOR_CLAUDE_CHECKS_LIST": " ".join(dict.fromkeys(self.kinds)),
-                "SUPERVISOR_CLAUDE_CHECKS_MIN_SEVERITY": self.min_severity,
-                "SUPERVISOR_CLAUDE_CHECKS_ROUNDS": str(self.rounds),
-                "SUPERVISOR_CLAUDE_CHECKS_TIMEOUT": str(int(self.timeout.total_seconds())),
-                "SUPERVISOR_CLAUDE_CHECKS_REQUIRED": "1" if self.required else "0"}
-
-    def gate_env(self, live: dict[str, str]) -> dict[str, str]:
-        """What a review gate started with the environment `live` uses, for each name config.yaml sets:
-        the engine's server-profile default where `live` has none."""
-        return {k: live.get(k, ENGINE_CHECK_DEFAULTS[k]) for k in self.env()}
-
-    def profile(self) -> dict[str, object]:
-        """For the event log: what new tasks were dispatched with."""
-        if not self.enabled:
-            return {"claude_checks": "off"}
-        return {"claude_checks": " ".join(dict.fromkeys(self.kinds)), "claude_checks_rounds": self.rounds,
-                "claude_checks_required": self.required}
-
-
 class BulavaConfig(Strict):
     _gone = _refuse_gone("bulava")
     # The agent's fallback language for its reports, commits and MR summary. Bulava follows the
@@ -389,7 +333,6 @@ class BulavaConfig(Strict):
     claude_effort: Literal["auto", "none", "low", "medium", "high", "xhigh", "max", "ultracode"] = "auto"
     codex_model: str = Field(default="auto", pattern=MODEL_NAME)
     codex_effort: Literal["auto", "low", "medium", "high", "xhigh", "max", "ultra"] = "auto"
-    claude_checks: ClaudeChecksConfig = ClaudeChecksConfig()
     # How long the engine waits for a new session's hooks to confirm its run before it rolls the start
     # back (SUPERVISOR_HANDSHAKE_WAIT, the engine's own default 5 s). A cold Claude on a busy machine
     # takes longer, and a rolled-back start fails the ticket for a person.

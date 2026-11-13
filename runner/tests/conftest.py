@@ -76,11 +76,9 @@ def read_events(path: Path) -> list[dict]:
 
 
 @pytest.fixture(autouse=True)
-def no_engine_tmux_server(monkeypatch):
-    """The engine's tmux server of the machine running the tests (a dev Mac, the sandbox's keeper) is not
-    the engine these tests talk to. The live scenarios, which do use it, put the real reading back."""
-    monkeypatch.setattr("arceus_runner.health.engine_tmux_env", lambda socket="bulava": None)
-    # Nor are its systemd units, if it has any.
+def nothing_from_this_machine(monkeypatch):
+    """The systemd units of the machine running the tests (a dev Mac, the sandbox) are not the ones
+    these tests talk about."""
     monkeypatch.setattr("arceus_runner.health.autostart", lambda: [])
     # Nor its free disk: a full CI runner or laptop would stop new tasks in tests that are not about it.
     monkeypatch.setattr("arceus_runner.health.disk", lambda cfg: Check("disk_free", "ok", "50% free (100 GB)"))

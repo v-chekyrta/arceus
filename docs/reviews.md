@@ -1,30 +1,12 @@
 # Reviews
 
-Two kinds of review besides Codex: Claude checks that Bulava runs before every Codex review, and a code review a person asks for on the ticket.
+Besides Codex there is one more review: a code review a person asks for on the ticket.
 
-## Checks before Codex
+## Codex alone before the merge request
 
-After the build and tests pass and before Codex reviews, Bulava runs two Claude sessions side by side, a code review and a security review (engine/SERVER.md, "Independent checks before Codex"). They see only the diff of every repository with work in it, never the ticket or the agent's conversation, and change nothing. Findings at `min_severity` or above go back to the agent, which fixes each one or says why not; Codex then decides with the findings and the answers in front of it. The checks only advise: an empty list is not a pass, and the number of returns per task is fixed. A red build skips them.
+Codex is the only reviewer before a merge request is opened. Bulava 1.19.2 removed the separate Claude code and security checks that ran before it, and with them `bulava.claude_checks`. A `config.yaml` that still has that block is refused by name: delete the block. On a server Codex reviews with a team of three (contract, security, state); `doctor` shows its members in `bulava.engine.review_team`. An engine that still says it runs the Claude checks is older than the pinned one, and `doctor` warns about it in `bulava.engine.claude_checks`: run `sudo ./setup.sh`. The incoming text screen (docs/security.md) does not change.
 
-```yaml
-bulava:
-  claude_checks:
-    enabled: true
-    kinds: [code, security]
-    min_severity: high     # critical | high | medium | low
-    rounds: 1              # returns to the agent per task, 1–5; a follow-up does not reset it
-    timeout: 15m           # per check, 1m–30m
-    required: true         # a check that did not run stops the task for a person; false: Codex alone
-```
-
-The review gate reads these from the environment of the engine's tmux server, not from a dispatch. So `setup.sh` writes them into `bulava-engine.service` (`arceus-runner engine-env` prints them from `config.yaml`) and restarts the engine when they changed and no task runs; otherwise restart it between tasks. `check` and `doctor` show `FAIL` on `config.claude_checks` while the running engine differs from `config.yaml`, or has no checks at all, so no task starts on other terms. The runner drops these names from `bulava.env`. With `enabled: false` both `config.claude_checks` and the engine's own `bulava.engine.claude_checks` read `ok` ("off"), not a warning: Bulava's Codex review is then the review, on a server a team of three (contract, security, state) whose members the second row lists. The FAIL for an engine that would still run the checks stays. A `config.yaml` written from an earlier example keeps its `required: false` until you change it.
-
-- **Spent rounds** stop the checks for that task: fixes after MR comments and red CI then go to Codex alone, with the last reading.
-- **A check that did not run** (time, a Claude limit, the network) shows as `gate.check failed` in the engine steps. With `required: true` the task fails before Codex, nothing is published, and `/continue` runs it again; with `false` the work goes on to Codex alone.
-- **Cost.** Two more Claude sessions per review on the same subscription, up to `timeout` each, inside the review gate's hour. A diff over 400 000 characters is cut; the checks read the rest from the files.
-- **Model and depth** are the task's `bulava.claude_model` and `claude_effort`; there is no setting of their own.
-- **Not the slash commands.** The checks run Bulava's own prompts on a diff the engine builds across all repositories, not `/code-review` and `/security-review`.
-- **Start handshake.** The engine rolls a start back when the new session's hooks do not confirm it in time (5 s in the engine), which fails the ticket. A cold Claude on a busy machine is slower, so the runner passes `bulava.start_handshake_wait` (30 s by default, 5 s–2 m).
+**Start handshake.** The engine rolls a start back when the new session's hooks do not confirm it in time (5 s in the engine), which fails the ticket. A cold Claude on a busy machine is slower, so the runner passes `bulava.start_handshake_wait` (30 s by default, 5 s–2 m).
 
 ## Code review on request
 

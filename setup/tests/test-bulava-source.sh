@@ -50,9 +50,11 @@ if [ "${1:-}" = --live ]; then
   # As setup reads the file (it sources it): the value up to the first blank, a trailing comment left out.
   src="$(sed -n 's/^BULAVA_SOURCE=\([^[:space:]#]*\).*/\1/p' "$conf")"; ref="$(sed -n 's/^BULAVA_REF=\([^[:space:]#]*\).*/\1/p' "$conf")"
   check "BULAVA_REF in setup.conf.example is a full commit" '[[ "$ref" =~ ^[0-9a-f]{40}$ ]]'
-  check "that commit installs from $src, with the independent checks in its review gate" \
+  # 1.19.2 and later: Codex alone reviews; the Claude checks before it are gone from the engine.
+  check "that commit installs from $src, with Codex as the only reviewer in its review gate" \
     'bulava_mirror_fetch "$T/live.git" "$src" "$ref" && bulava_mirror_checkout "$T/live.git" "$ref" "$T/live" \
-     && [ -x "$T/live/engine/bin/dispatch.sh" ] && grep -q "claude_checks_enabled; then" "$T/live/engine/hooks/review-gate.sh"'
+     && [ -x "$T/live/engine/bin/dispatch.sh" ] && [ -f "$T/live/engine/hooks/review-gate.sh" ] \
+     && [ ! -e "$T/live/engine/bin/lib/claude-checks.sh" ] && ! grep -q claude_checks_enabled "$T/live/engine/hooks/review-gate.sh"'
 fi
 
 [ "$fails" = 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

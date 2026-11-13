@@ -535,21 +535,13 @@ engine_env_lines() {
     "Environment=\"SUPERVISOR_SERVER_EXTRA_SECRET_PATHS=$DATA_DIR/secrets.env $DATA_DIR/bulava.env $DATA_DIR/runner.db $DATA_DIR/runner.lock $GOOGLE_DIR\"" \
     "Environment=PATH=/usr/local/bin:$RUN_HOME/.local/bin:/usr/bin:/bin" \
     "Environment=DISABLE_AUTOUPDATER=1"
-  engine_check_lines
 }
 
-# The independent checks before Codex (bulava.claude_checks in config.yaml). A worker's review gate
-# reads the environment of this unit's tmux server, not the runner's dispatch, so this is the one
-# place the settings reach it; `arceus-runner doctor` compares them with the running server.
-ENGINE_CHECK_SETTINGS=""
-engine_check_lines() {
-  local cfg="$DATA_DIR/config.yaml" line
-  [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] && [ -f "$cfg" ] || return 0
-  if [ -z "$ENGINE_CHECK_SETTINGS" ]; then
-    ENGINE_CHECK_SETTINGS="$("$RUNNER_OPT/venv/bin/arceus-runner" --config "$cfg" engine-env)" \
-      || die "$cfg is not valid, so the engine's check settings cannot be written: run arceus-runner check --offline"
-  fi
-  while IFS= read -r line; do [ -n "$line" ] && printf 'Environment="%s"\n' "$line"; done <<< "$ENGINE_CHECK_SETTINGS"
+# config.yaml must load before the units are written: a runner that restarts on one it refuses stops
+# for good (exit 2). Nothing to read yet before the runner phase has installed it.
+require_valid_config() {
+  [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] && [ -f "$DATA_DIR/config.yaml" ] || return 0
+  load_console_settings || die "$DATA_DIR/config.yaml is not valid: run arceus-runner check --offline"
 }
 
 engine_unit_text() {
@@ -620,6 +612,7 @@ not_autostarted() {
   return 0
 }
 check_systemd() {
+  require_valid_config
   same_file "$UNIT" "$(unit_text)" 644 root:root && same_file "$ENGINE_UNIT" "$(engine_unit_text)" 644 root:root \
     && [ -z "$(not_autostarted)" ]
 }
