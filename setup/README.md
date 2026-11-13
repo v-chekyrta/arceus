@@ -18,9 +18,6 @@ Everything Arceus keeps on the machine is in one folder, `~/arceus`:
 `setup/`, `runner/`, `config/`, `docs/` and `observability/` are a copy of this repository and are replaced as a whole on update. `data/` and the workspace are never touched by an update; `data/` is the only place you edit.
 
 ```bash
-rsync -a --delete --exclude .venv --exclude __pycache__ --exclude setup.conf \
-  runner setup config docs observability <user>@<vm>:arceus/
-ssh <user>@<vm>
 cd ~/arceus/setup
 cp setup.conf.example setup.conf     # pinned versions and the Bulava commit; nothing else to fill in
 sudo ./setup.sh --check              # only checks, changes nothing
