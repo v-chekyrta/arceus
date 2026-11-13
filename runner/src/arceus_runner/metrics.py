@@ -64,6 +64,10 @@ class Metrics:
         self.cleanup_unknown = Gauge("runner_cleanup_unknown_items", "Leftovers the last pass could not put down "
                                      "to any task: reported, never removed", registry=r)
         self.cleanup_freed = Gauge("runner_cleanup_freed_bytes", "Disk space the last acting pass freed", registry=r)
+        self.cleanup_rule_freed = Gauge("runner_cleanup_rule_freed_bytes", "What each age rule of the last acting "
+                                        "pass freed, as Docker counts it: build_cache, dangling_images, "
+                                        "unused_images. Absent: the rule did not run, or Docker did not say",
+                                        ["rule"], registry=r)
         self.observed = Gauge("runner_engine_observed_seconds", "When the runner last read a running task's engine "
                               "files (epoch)", ["task_id"], registry=r)
 
@@ -125,6 +129,7 @@ class Metrics:
     def update_cleanup(self, cleanup) -> None:
         self.cleanup_ok.clear()
         self.cleanup_last.clear()
+        self.cleanup_rule_freed.clear()
         if not cleanup:
             return
         runs = cleanup.last_runs()
@@ -139,6 +144,9 @@ class Metrics:
             self.cleanup_unknown.set(len(summary.get("unknown") or []))
             if "freed_bytes" in summary:
                 self.cleanup_freed.set(summary["freed_bytes"])
+            for rule, freed in (summary.get("freed_by_rule") or {}).items():
+                if freed is not None:
+                    self.cleanup_rule_freed.labels(rule).set(freed)
 
     def update_progress(self, runner) -> None:
         if getattr(runner, "last_tick", None):

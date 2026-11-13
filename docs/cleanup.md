@@ -13,7 +13,7 @@ Agents leave things behind: stopped containers and their test databases, dev ser
 | containers | stopped ones of a finished task, after `stopped_after`, with their anonymous volumes unless something else uses or protects one; running ones and compose services only with the task's label | foreign projects, `arceus-observability`, `arceus-console`, `protect`, `arceus.keep=true`, a running container or compose service tied by time only, a container holding a protected volume |
 | volumes | with a finished task's label, when no container uses them; anonymous volumes a task's container left, unused for `orphaned_volumes_after` (below) | named volumes without a label: dependency caches and the dev stack's data |
 | networks | empty ones labelled for a finished task or belonging to its compose project | networks made by hand (compose `external:`); empty ones nobody can be tied to (reported) |
-| images | built with a finished task's label, when no container uses them | everything else; untagged images are only counted |
+| images | built with a finished task's label, when no container uses them; by age, untagged images and, if enabled, tagged ones (below) | images a container uses, stopped ones included; `arceus.keep=true`, `protect.images`, a protected compose project's images |
 | repositories | uncommitted files on a finished task's branch go to `git stash` (`arceus-cleanup …`); the task's local branch once the host has its commits or it is exactly what was published to a merged MR | ignored files (`node_modules`, builds); anything on a branch that is no finished task's |
 | processes | dev servers started in the workspace while a finished task held it, with no `tmux`, `claude` or `codex` above them | anything below a live session |
 
@@ -42,7 +42,22 @@ Agents leave things behind: stopped containers and their test databases, dev ser
 
 A volume no task's container was seen using (a person's, another project's, a container that lived less than a couple of minutes) is only counted. `prune_unowned_volumes: true` removes those too after `orphaned_volumes_after`, host-wide, as `docker volume prune` would: only on a server where nobody keeps data that way.
 
-Everything else is **reported**, never removed, for a person to clean by hand (for now, once a week): unlabelled containers and volumes, empty networks, unused images by size, untagged images and anonymous volumes nobody can be tied to or not yet unused for `orphaned_volumes_after` (counts), the build cache, and files beside the repositories in the workspace. A name that spells a task (`shop7173-mysql`) is shown as a hint, never as proof. `arceus-runner cleanup --last` shows the full report; Grafana counts it. With `llm: advise` Claude (no tools) adds a one-line opinion to each reported item.
+**Old images and build cache.** Nothing says whose an untagged image or a build cache record is, so these go by age alone, host-wide, and only in a full pass (never while a task works):
+
+| Rule | Goes | Stays |
+|---|---|---|
+| `build_cache_after` (7 days) | build cache no build has used that long: `docker builder prune --all --filter until=168h`. BuildKit counts from the last use, so cache made long ago and used yesterday stays | everything used more recently |
+| `dangling_images_after` (7 days) | untagged images made that long ago that no container uses, each removed by its ID | images a container uses, running or stopped; younger ones; one labelled for a task goes by its task's rules instead |
+| `unused_images_after` (off) | tagged images without a task label made that long ago that no container uses, each by its ID | base images, another project's, the dev stack's, as long as it is off |
+
+- `arceus.keep=true`, `protect.images` (shell patterns of repositories or tags: `postgres`, `node:*`) and the images of `protect.compose_projects` stay under every rule, a task's own images included.
+- An image's age is when it was made, not when it was last used. A base image pulled a month ago and used every day still counts as a month old, and with `unused_images_after` it goes whenever no container uses it at the moment of the pass. That is why the rule is off by default.
+- Each image is inspected again right before it goes: tagged, labelled for a task or protected since the plan, or with other tags than planned, it stays (`kept`). Docker itself refuses to remove an image a container uses.
+- The cost: what goes is downloaded and built again, so the first task after a pass takes longer. The periods are in days for that reason, and anything under a day is refused. `null` turns a rule off: the build cache is then only reported, untagged images only counted.
+- `docker builder prune` cleans the builder `docker builder` points to: the daemon's own, unless someone selected another one with `docker buildx use`. `docker system df` counts the same one.
+- The report says what each rule freed as Docker counts it (`freed_by_rule`; Grafana: `runner_cleanup_rule_freed_bytes{rule}`): for the build cache, what the prune said it reclaimed; for images, Docker's image total before the rule's first removal minus after its last, with a shared layer counted once. A rule that removed nothing says 0; a prune that failed or was cut short says nothing, since part of it may have gone. `runner_cleanup_freed_bytes` stays the change of free disk space over the whole pass.
+
+Everything else is **reported**, never removed, for a person to clean by hand (for now, once a week): unlabelled containers and volumes, empty networks, unused tagged images by size, untagged images younger than `dangling_images_after` and anonymous volumes nobody can be tied to or not yet unused for `orphaned_volumes_after` (counts), and files beside the repositories in the workspace. A name that spells a task (`shop7173-mysql`) is shown as a hint, never as proof. `arceus-runner cleanup --last` shows the full report; Grafana counts it. With `llm: advise` Claude (no tools) adds a one-line opinion to each reported item.
 
 **When.** Inside the runner's tick, so nothing switches the workspace meanwhile:
 
@@ -62,4 +77,4 @@ arceus-runner cleanup --last     # the runner's last pass
 
 Add the dev stack's compose project to `cleanup.protect.compose_projects` if it lives in the workspace, then set `mode: act` and restart the runner. `arceus-runner cleanup --act` makes a full pass by hand while the runner is stopped. Test data in the dev stack's own database is never touched: nothing tells which rows a task wrote.
 
-`ARCEUS_REAL_DOCKER=1 pytest tests/test_cleanup.py` checks the rules against the VM's Docker with objects of its own.
+`ARCEUS_REAL_DOCKER=1 pytest tests/test_cleanup.py` checks the rules against the VM's Docker with objects of its own; the age rules prune host-wide, so their check starts a throwaway Docker (`docker:29-dind`, privileged) and leaves the VM's images and build cache alone.

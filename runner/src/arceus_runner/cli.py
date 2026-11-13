@@ -13,6 +13,7 @@ from pathlib import Path
 from arceus_runner import __version__
 from arceus_runner import bulava as bulava_mod
 from arceus_runner.checks import Check, run_online_checks
+from arceus_runner.cleanup import _human
 from arceus_runner.config import DEFAULT_CONFIG, Config, ConfigError, Secrets, load_config, load_secrets
 from arceus_runner.db import ACTIVE_STATES, RUN_UNDER_WAY, AlreadyRunning, InstanceLock, ReviewStore
 from arceus_runner.delivery import PROJECT_NOTES_LIMIT, ProjectNotesError, project_notes
@@ -327,7 +328,7 @@ def cmd_cleanup(args) -> int:
                 print(f"{r['id']}: {r['status']} ({r['trigger']}, {r['scope']}, {r['mode']}), "
                       f"started {r['started_at']}, finished {r['finished_at'] or '-'}")
                 _print_cleanup(planned, unknown, summary.get("errors") or [], summary.get("images_in_use"),
-                               summary.get("unknown_bytes"))
+                               summary.get("unknown_bytes"), summary.get("freed_by_rule"))
             return EXIT_OK
         cleanup = make_cleanup(cfg, store, QuietEvents(), None)
         items, errors = cleanup.plan("full")
@@ -391,7 +392,7 @@ def _cleanup_now(cfg: Config, as_json: bool) -> int:
     else:
         print(f"{result['run']}: {result['status']}")
         _print_cleanup(result["planned"], result["unknown"], result["errors"], result.get("images_in_use"),
-                       result.get("unknown_bytes"))
+                       result.get("unknown_bytes"), result.get("freed_by_rule"))
     return EXIT_OK if result["status"] == "succeeded" else EXIT_CHECK_FAILED
 
 
@@ -419,13 +420,20 @@ class QuietEvents:
         return {}
 
 
+RULE_NAMES = {"build_cache": "build cache", "dangling_images": "untagged images", "unused_images": "unused images"}
+
+
 def _print_cleanup(planned: list[dict], unknown: list[dict], errors: list[str], images_in_use: int | None = None,
-                   unknown_bytes: int | None = None) -> None:
+                   unknown_bytes: int | None = None, freed_by_rule: dict | None = None) -> None:
     if not planned and not unknown and not errors:
         print("  nothing to clean up")
     for i in planned:
         result = f" [{i['result']}]" if i.get("result") not in (None, "planned") else ""
         print(f"  {i['action']:<7} {i['kind']:<9} {i['name']}: {i['why']}{result}")
+    if freed_by_rule:
+        print("Freed, as Docker counts it: " + "; ".join(
+            f"{RULE_NAMES.get(rule, rule)} " + (_human(n) if n is not None else "unknown (Docker did not say)")
+            for rule, n in freed_by_rule.items()))
     if unknown:
         print("Not put down to any task (reported, never removed):")
         for i in unknown:

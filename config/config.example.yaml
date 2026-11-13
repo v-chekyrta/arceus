@@ -193,11 +193,15 @@ cleanup:
   release_after: 3d                    # a waiting task idle this long loses what is marked disposable
   orphaned_volumes_after: 24h          # a task's leftover anonymous volumes
   prune_unowned_volumes: false         # true: also unused volumes of no task (docker volume prune)
+  build_cache_after: 7d                # build cache no build used this long; null: only reported
+  dangling_images_after: 7d            # untagged images no container uses; null: only counted
+  unused_images_after: null            # e.g. 30d: also old tagged images without a task label
   keep_media: 14d
   keep_notes: 90d
   llm: off                             # advise: Claude comments on what nobody owns; never removes
   protect:                             # never touched (plus arceus-observability and arceus.keep=true)
     compose_projects: []               # e.g. the dev stack's compose project
+    images: []                         # e.g. [postgres, "node:*"]: never removed by any rule
 
 # Web console (docs/console.md): status, reports, Grafana, settings behind one sign-in.
 console:

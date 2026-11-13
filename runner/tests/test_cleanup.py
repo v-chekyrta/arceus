@@ -41,7 +41,6 @@ class FakeDocker:
         self.cs: dict[str, dict] = {}
         self.vols: dict[str, dict] = {}
         self.nets: dict[str, dict] = {}
-        self.dangling = 0
         self.imgs: dict[str, dict] = {}
         self.deadline = None
         self.calls: list[tuple] = []
@@ -97,12 +96,33 @@ class FakeDocker:
     def networks(self) -> list[dict]:
         return copy.deepcopy(list(self.nets.values()))
 
-    def dangling_images(self) -> int:
-        return self.dangling
+    def dangling_images(self) -> list[str]:
+        return sorted(i for i, img in self.imgs.items() if not img["RepoTags"])
 
-    def add_image(self, iid: str, tags: tuple = (), labels: dict | None = None, size: int = 1 << 30) -> None:
+    def add_image(self, iid: str, tags: tuple = (), labels: dict | None = None, size: int = 1 << 30,
+                  created: datetime = T0 - timedelta(days=2)) -> None:
         self.imgs[iid] = {"Id": iid, "RepoTags": list(tags), "Config": {"Labels": labels or {}}, "Size": size,
-                          "Created": iso(T0 - timedelta(days=2))}
+                          "Created": iso(created)}
+
+    def add_dangling(self, n: int, created: datetime = T0 - timedelta(days=2)) -> None:
+        """`n` untagged images nothing labels: old builds a newer one took the tag from."""
+        for k in range(n):
+            self.add_image(f"sha256:{len(self.imgs) + k:064x}", created=created)
+
+    def image(self, iid: str) -> dict | None:
+        return copy.deepcopy(self.imgs.get(iid))
+
+    now = T0  # the daemon's clock
+    cache: list[tuple[datetime, int]] = []  # build cache records: (last used, bytes)
+    says_total = True  # `builder prune` ends with "Total: <size>"
+
+    def prune_build_cache(self, unused_for: timedelta) -> int | None:
+        self.calls.append(("builder prune", unused_for))
+        if "build-cache" in self.fail:
+            raise DockerError("docker builder prune: error")
+        old = [r for r in self.cache if self.now - r[0] >= unused_for]  # BuildKit: by the last use
+        self.cache = [r for r in self.cache if r not in old]
+        return sum(b for _t, b in old) if self.says_total else None
 
     def images(self) -> list[dict]:
         return copy.deepcopy(list(self.imgs.values()))
@@ -114,7 +134,19 @@ class FakeDocker:
         return copy.deepcopy(self.sizes)
 
     def disk_usage(self) -> dict:
-        return copy.deepcopy(self.df_rows)
+        """`df_rows` as set; else Docker's totals of what there is (every image here is its own layers)."""
+        rows = copy.deepcopy(self.df_rows)
+        if self.df_broken is not None:
+            return self.df_broken
+        # Docker prints every type, "0B" when there is none.
+        if "Images" not in rows:
+            rows["Images"] = {"Type": "Images", "Size": f"{sum(i['Size'] for i in self.imgs.values())}B"}
+        if "Build Cache" not in rows:
+            rows["Build Cache"] = {"Type": "Build Cache", "Size": f"{sum(b for _t, b in self.cache)}B",
+                                   "Reclaimable": f"{sum(b for _t, b in self.cache)}B"}
+        return rows
+
+    df_broken: dict | None = None  # what `docker system df` says instead, once set
 
     def remove_image(self, iid: str) -> None:
         self.calls.append(("image rm", iid))
@@ -366,7 +398,7 @@ def test_report_mode_changes_nothing(tmp_path):
     w.task("ACME-1", "done")
     w.docker.add("done-exited", created=T0 - timedelta(hours=3), finished=T0 - timedelta(hours=3),
                  labels={"arceus.task": "ACME-1"})
-    w.docker.dangling = 4
+    w.docker.add_dangling(4)
     result = w.cleanup.run("full", "manual")
     assert result["mode"] == "report" and result["status"] == "succeeded"
     assert w.items(result) == {"done-exited": ("remove", "planned")}
@@ -864,7 +896,7 @@ def test_a_busy_day_gets_an_independent_pass_that_spares_the_running_task(world)
     web = make_repo(world, "web")
     git(web, "checkout", "-q", "-b", "agent/ACME-1-work")
     (web / "left.txt").write_text("x")
-    d.dangling = 3  # the running task may be about to run one of them by id
+    d.add_dangling(3, created=T0 - timedelta(days=30))  # the running task may be about to run one by id
 
     world.cleanup.maybe_run(Situation(holder, False, False))
     assert not any(c[0] == "image rm" for c in d.calls)
@@ -1110,9 +1142,10 @@ def test_real_docker_removes_only_what_a_finished_task_labelled(tmp_path):
     import uuid
     tag = uuid.uuid4().hex[:8].upper()
     done, waiting = f"ZZ{tag}-1", f"ZZ{tag}-2"
-    w = World(tmp_path)
+    # The host's own daemon: its build cache and images are not this test's, so the age rules are off.
+    w = World(tmp_path, build_cache_after=None, dangling_images_after=None)
     w.docker = Docker()
-    w.docker.dangling_images = lambda: 0
+    w.docker.dangling_images = lambda: []
     w.cleanup = w.make()
     w.task(done, "done")
     w.task(waiting, "code_review")
@@ -1157,9 +1190,9 @@ def test_real_docker_releases_only_what_a_waiting_task_marked_disposable(tmp_pat
     import uuid
     tag = uuid.uuid4().hex[:8].lower()
     key = f"ZZ{tag.upper()}-2"
-    w = World(tmp_path, release_after="3d")
+    w = World(tmp_path, release_after="3d", build_cache_after=None, dangling_images_after=None)
     w.docker = Docker()
-    w.docker.dangling_images = lambda: 0
+    w.docker.dangling_images = lambda: []
     w.cleanup = w.make()
     real_now = datetime.now(UTC)
     w.task(key, "code_review")
@@ -1228,9 +1261,10 @@ def test_real_docker_removes_only_the_anonymous_volumes_a_finished_tasks_contain
     def run(*args: str) -> str:
         return subprocess.run(["docker", *args], check=True, capture_output=True, text=True).stdout.strip()
 
-    w = World(tmp_path, protect={"volumes": run("volume", "ls", "-q").split()}, stopped_after="30d")
+    w = World(tmp_path, protect={"volumes": run("volume", "ls", "-q").split()}, stopped_after="30d",
+              build_cache_after=None, dangling_images_after=None)
     w.docker = Docker()
-    w.docker.dangling_images = lambda: 0
+    w.docker.dangling_images = lambda: []
     w.cleanup = w.make()
     tag = uuid.uuid4().hex[:8]
     key = f"ZZ{tag.upper()}-1"
@@ -1409,15 +1443,18 @@ def test_only_images_labelled_for_a_finished_task_go(world):
     d.add_image("sha256:node", ("node:24",), size=2 << 30)
     d.add_image("sha256:untagged-a1", (), {"arceus.task": "ACME-1"})  # `docker build --label` without -t
     d.add("runs-it", status="running", created=T0, binds=("/srv/x",), image="sha256:a1used")
-    d.dangling = 5
+    d.add_dangling(5)
     d.df_rows = {"Build Cache": {"Type": "Build Cache", "Size": "11.38GB", "Reclaimable": "3.179GB"}}
     result = world.cleanup.run("full", "manual")
-    assert world.items(result) == {"acme1-e2e:latest": ("remove", "done"), "untagged-a1": ("remove", "done")}
-    assert world.unknown(result) == {"5 untagged images", "otherteam/api:1", "python:3.12", "node:24", "build cache",
-                                     "runs-it"}
+    # The build cache goes by its own rule (build_cache_after), the untagged images are under a week old.
+    assert world.items(result) == {"acme1-e2e:latest": ("remove", "done"), "untagged-a1": ("remove", "done"),
+                                   "build cache": ("prune", "done")}
+    assert world.unknown(result) == {"5 untagged images", "otherteam/api:1", "python:3.12", "node:24", "runs-it"}
     images = [i for i in result["unknown"] if i["kind"] == "image" and ":" in i["name"]]
     assert images[0]["name"] == "node:24" and "2.1 GB" in images[0]["why"]  # the biggest first
-    assert set(d.imgs) == {"sha256:a1used", "sha256:a2", "sha256:other", "sha256:py", "sha256:node"}
+    assert set(d.imgs) - set(d.dangling_images()) == {"sha256:a1used", "sha256:a2", "sha256:other", "sha256:py",
+                                                      "sha256:node"}
+    assert len(d.dangling_images()) == 5
     assert ("image rm", "sha256:other") not in d.calls
 
 
@@ -2222,3 +2259,435 @@ def test_a_week_of_test_databases_removed_without_v_is_cleared(world):
     result = world.cleanup.run("full", "manual")
     assert result["planned_total"] == 136 and set(world.docker.vols) == {persons}
     assert all(r == ("remove", "done") for r in world.items(result).values())
+
+# -- the age rules: build cache, untagged images, unused tagged images ----------------------------
+
+
+def test_build_cache_no_build_used_for_a_week_goes_and_the_rest_stays(world, capsys):
+    """BuildKit counts a record's age from its last use: a record made long ago and used yesterday stays."""
+    from arceus_runner.cli import _print_cleanup
+    d = world.docker
+    d.cache = [(T0 - timedelta(days=10), 1_800_000_000), (T0 - timedelta(days=1), 300_000_000)]
+    result = world.cleanup.run("full", "manual")
+    assert world.items(result) == {"build cache": ("prune", "done")}
+    assert d.calls == [("builder prune", timedelta(days=7))]
+    assert d.cache == [(T0 - timedelta(days=1), 300_000_000)]
+    assert result["freed_by_rule"] == {"build_cache": 1_800_000_000}
+    _print_cleanup(result["planned"], result["unknown"], result["errors"], freed_by_rule=result["freed_by_rule"])
+    assert "Freed, as Docker counts it: build cache 1.8 GB" in capsys.readouterr().out
+
+
+def test_old_untagged_images_go_and_those_a_container_or_a_protection_holds_stay(tmp_path):
+    w = World(tmp_path, protect={"compose_projects": ["acme-dev"]})
+    w.task("ACME-2", "code_review")  # waits: what is labelled for it stays, whatever its age
+    d, old = w.docker, T0 - timedelta(days=30)
+    d.add_image("sha256:old", created=old, size=700_000_000)
+    d.add_image("sha256:stopped-uses-it", created=old)
+    d.add("stopped", created=old, finished=old, binds=("/srv/x",), image="sha256:stopped-uses-it")
+    d.add_image("sha256:fresh", created=T0 - timedelta(days=6))
+    d.add_image("sha256:waiting-task", (), {"arceus.task": "ACME-2"}, created=old)
+    d.add_image("sha256:kept", (), {"arceus.keep": "true"}, created=old)
+    d.add_image("sha256:dev-stack", (), {"com.docker.compose.project": "acme-dev"}, created=old)
+    d.add_image("sha256:tagged", ("otherteam/api:1",), created=old)
+    w.cleanup = w.make()
+    result = w.cleanup.run("full", "manual")
+    assert w.items(result) == {"untagged image old": ("remove", "done")}
+    assert set(d.imgs) == {"sha256:stopped-uses-it", "sha256:fresh", "sha256:waiting-task", "sha256:kept",
+                           "sha256:dev-stack", "sha256:tagged"}
+    why = {i["name"]: i["why"] for i in result["unknown"]}
+    assert why["2 untagged images"] == "1 made less than 7 days ago, 1 used by a stopped or running container: they stay"
+    assert "otherteam/api:1" in why  # tagged, no task label: reported while unused_images_after is off
+    # Docker's own count before the rule and after it: the one image's 700 MB.
+    assert result["freed_by_rule"] == {"dangling_images": 700_000_000}
+    w.events.close()
+    w.store.close()
+
+
+def test_tagged_images_without_a_task_label_stay_while_unused_images_after_is_off(world):
+    d = world.docker
+    d.add_image("sha256:base", ("python:3.12",), created=T0 - timedelta(days=400))
+    result = world.cleanup.run("full", "manual")
+    assert world.items(result) == {} and "python:3.12" in world.unknown(result)
+    assert not [c for c in d.calls if c[0] == "image rm"] and "freed_by_rule" not in result
+
+
+def test_unused_images_after_removes_old_tagged_images_and_never_a_protected_one(tmp_path):
+    w = World(tmp_path, unused_images_after="30d",
+              protect={"images": ["postgres", "node:*"], "compose_projects": ["acme-dev"]})
+    w.task("ACME-1", "done")
+    d, old = w.docker, T0 - timedelta(days=60)
+    d.add_image("sha256:api", ("otherteam/api:1", "otherteam/api:latest"), created=old, size=400_000_000)
+    d.add_image("sha256:pg", ("postgres:16",), created=old)                   # protect.images: postgres
+    d.add_image("sha256:node", ("node:24",), created=old)                     # protect.images: node:*
+    d.add_image("sha256:py", ("python:3.12",), created=T0 - timedelta(days=3))  # younger than 30 days
+    d.add_image("sha256:keep", ("acme/tool:1",), {"arceus.keep": "true"}, created=old)
+    d.add_image("sha256:dev", ("acme-dev-web:latest",), {"com.docker.compose.project": "acme-dev"}, created=old)
+    d.add_image("sha256:used", ("mysql:8.0",), created=old)
+    d.add("stopped", created=old, finished=old, binds=("/srv/x",), image="sha256:used")
+    # A task's own image, but protected by name: protection wins over the task's rules too.
+    d.add_image("sha256:task", ("node:24-acme1",), {"arceus.task": "ACME-1"}, created=old)
+    result = w.cleanup.run("full", "manual")
+    assert w.items(result) == {"otherteam/api:1, otherteam/api:latest": ("remove", "done")}
+    assert set(d.imgs) == {"sha256:pg", "sha256:node", "sha256:py", "sha256:keep", "sha256:dev", "sha256:used",
+                           "sha256:task"}
+    assert result["freed_by_rule"] == {"unused_images": 400_000_000}
+    assert w.unknown(result) == {"python:3.12", "stopped"}  # protected images are not even listed
+    w.events.close()
+    w.store.close()
+
+
+def test_the_age_rules_change_nothing_in_report_mode_or_while_a_task_works(tmp_path):
+    old = T0 - timedelta(days=30)
+    w = World(tmp_path, mode="observe", unused_images_after="7d")  # observe: report, whatever cleanup.mode says
+    w.docker.cache = [(old, 1_000)]
+    w.docker.add_image("sha256:untagged", created=old)
+    w.docker.add_image("sha256:tagged", ("python:3.12",), created=old)
+    result = w.cleanup.run("full", "manual")
+    assert w.items(result) == {"build cache": ("prune", "planned"), "untagged image untagged": ("remove", "planned"),
+                               "python:3.12": ("remove", "planned")}
+    assert w.docker.calls == [] and "freed_by_rule" not in result
+    w.events.close()
+    w.store.close()
+
+    w = World(tmp_path / "act", unused_images_after="7d")
+    w.task("ACME-3", "dispatched")
+    w.docker.cache = [(old, 1_000)]
+    w.docker.add_image("sha256:untagged", created=old)
+    w.docker.add_image("sha256:tagged", ("python:3.12",), created=old)
+    # A task works: an independent pass touches only what cannot be its own. A host-wide rule cannot promise that.
+    result = w.cleanup.run("independent", "daily", w.store.task("ACME-3"))
+    assert w.items(result) == {} and w.docker.calls == [] and "freed_by_rule" not in result
+    w.events.close()
+    w.store.close()
+
+
+def test_a_second_look_keeps_an_image_tagged_labelled_or_protected_since_the_plan(tmp_path):
+    w = World(tmp_path, unused_images_after="7d", protect={"images": ["acme/*"]})
+    d, old = w.docker, T0 - timedelta(days=30)
+    for iid in ("tagged-since", "labelled-since", "protected-since", "gone-since", "goes"):
+        d.add_image(f"sha256:{iid}", created=old)
+    d.add_image("sha256:tags-moved", ("otherteam/api:1",), created=old)
+    w.cleanup = w.make()
+    items, _ = w.cleanup.plan("full")
+    d.imgs["sha256:tagged-since"]["RepoTags"] = ["mine:1"]
+    d.imgs["sha256:labelled-since"]["Config"]["Labels"] = {"arceus.task": "ACME-9"}
+    d.imgs["sha256:protected-since"]["RepoTags"] = ["acme/tool:1"]
+    del d.imgs["sha256:gone-since"]
+    d.imgs["sha256:tags-moved"]["RepoTags"] = ["otherteam/api:2"]
+    w.cleanup.execute("r1", items, errors := [], deadline=w.mono() + 600)
+    result = {i.ref.removeprefix("sha256:"): (i.result, i.detail.get("kept")) for i in items}
+    assert result == {
+        "tagged-since": ("kept", "it was tagged since"),
+        "labelled-since": ("kept", "it is labelled for ACME-9 now"),
+        "protected-since": ("kept", "it is protected now"),
+        "gone-since": ("gone", None),
+        "goes": ("done", None),
+        "tags-moved": ("kept", "its tags changed"),
+    }
+    assert errors == []
+    assert set(d.imgs) == {"sha256:tagged-since", "sha256:labelled-since", "sha256:protected-since",
+                           "sha256:tags-moved"}
+    w.events.close()
+    w.store.close()
+
+
+def test_what_a_rule_freed_is_only_what_docker_says(world, monkeypatch):
+    """Never an estimate: a prune that failed says nothing; one Docker did not report is measured on its own
+    count; a rule that removed nothing freed 0."""
+    d, old = world.docker, T0 - timedelta(days=30)
+    d.cache = [(old, 5_000)]
+    d.fail.add("build-cache")
+    d.add_image("sha256:untagged", created=old, size=9_000)
+    result = world.cleanup.run("full", "manual")
+    assert result["status"] == "partial" and any("builder prune" in e for e in result["errors"])
+    assert result["freed_by_rule"] == {"build_cache": None, "dangling_images": 9_000}
+
+    # Docker printed no "Total:": the build cache's own count before and after.
+    d.fail.clear()
+    d.says_total = False
+    world.now += timedelta(hours=2)
+    result = world.cleanup.run("full", "retry")
+    assert result["freed_by_rule"] == {"build_cache": 5_000}
+
+    # A rule whose every removal was refused: 0, not a guess.
+    d.add_image("sha256:refused", created=old)
+    monkeypatch.setattr(d, "remove_image", lambda iid: (_ for _ in ()).throw(
+        DockerError("docker image rm: conflict: unable to delete (must be forced) - image is being used")))
+    world.now += timedelta(hours=2)
+    result = world.cleanup.run("full", "retry")
+    assert world.items(result)["untagged image refused"] == ("remove", "kept")
+    assert result["freed_by_rule"] == {"dangling_images": 0}
+
+
+def test_last_pass_and_metrics_keep_what_each_rule_freed(tmp_path, capsys, monkeypatch):
+    import yaml
+
+    from arceus_runner import cli
+    w = World(tmp_path)
+    w.docker.cache = [(T0 - timedelta(days=10), 1_800_000_000)]
+    w.docker.add_image("sha256:untagged", created=T0 - timedelta(days=30), size=0)
+    w.cleanup.run("full", "manual")
+    metrics = Metrics()
+    metrics.update_cleanup(w.cleanup)
+    assert metrics.registry.get_sample_value("runner_cleanup_rule_freed_bytes", {"rule": "build_cache"}) == 1.8e9
+    assert metrics.registry.get_sample_value("runner_cleanup_rule_freed_bytes", {"rule": "dangling_images"}) == 0
+    assert metrics.registry.get_sample_value("runner_cleanup_rule_freed_bytes", {"rule": "unused_images"}) is None
+    w.events.close()
+    w.store.close()
+    # Read back from the database by another process, as `cleanup --last` does after a restart.
+    raw = example_raw()
+    raw.pop("slack")
+    raw["health"].pop("devstack_check", None)
+    raw["paths"] = {k: str(v) for k, v in w.cfg.paths.model_dump().items()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(raw))
+    assert cli.main(["--config", str(tmp_path / "config.yaml"), "cleanup", "--last"]) == 0
+    assert "Freed, as Docker counts it: build cache 1.8 GB; untagged images 0 B" in capsys.readouterr().out
+
+
+def test_age_rules_are_in_days_and_can_be_switched_off(tmp_path):
+    c = config(tmp_path).cleanup
+    assert (c.build_cache_after, c.dangling_images_after, c.unused_images_after) == \
+        (timedelta(days=7), timedelta(days=7), None)
+    for key in ("build_cache_after", "dangling_images_after", "unused_images_after"):
+        with pytest.raises(Exception, match="at least 1d"):
+            config(tmp_path, **{key: "12h"})
+    c = config(tmp_path, build_cache_after=None, dangling_images_after=None).cleanup
+    assert c.build_cache_after is None and c.dangling_images_after is None
+
+
+def test_the_build_cache_off_is_reported_and_untagged_images_off_are_counted(tmp_path):
+    w = World(tmp_path, build_cache_after=None, dangling_images_after=None)
+    w.docker.cache = [(T0 - timedelta(days=30), 3_179_000_000)]
+    w.docker.add_image("sha256:untagged", created=T0 - timedelta(days=30))
+    result = w.cleanup.run("full", "manual")
+    why = {i["name"]: i["why"] for i in result["unknown"]}
+    assert w.items(result) == {} and w.docker.calls == []
+    assert why["build cache"].endswith("`build_cache_after` is off: `docker builder prune` by hand")
+    assert why["1 untagged images"].endswith("`dangling_images_after` is off")
+    w.events.close()
+    w.store.close()
+
+
+def test_docker_prunes_the_build_cache_by_hours_and_reads_what_it_reclaimed(tmp_path):
+    """The real wrapper's command line: `until` in hours (Docker refuses "7d"), `--all` so cache an image shares
+    goes too, never a prune of images; and the size Docker prints, in both forms it has printed it."""
+    from arceus_runner.dockerops import Docker
+    argv = tmp_path / "argv"
+    fake = tmp_path / "docker"
+    for out, want in (("ID\\tRECLAIMABLE\\nabc\\t1.2GB\\nTotal:\\t1.8GB", 1_800_000_000),
+                      ("Total reclaimed space: 0B", 0), ("", None)):
+        fake.write_text(f'#!/bin/sh\necho "$@" > {argv}\nprintf "{out}\\n"\n')
+        fake.chmod(0o755)
+        assert Docker(binary=str(fake)).prune_build_cache(timedelta(days=7)) == want
+        assert argv.read_text().strip() == "builder prune --force --all --filter until=168h"
+
+
+def _image_tar(path: Path, created: str, payload: bytes, tag: str | None = None) -> Path:
+    """A `docker load` archive of a one-layer image made at `created`, untagged unless `tag` is given: an image
+    as old as wanted without waiting, and without pulling anything."""
+    import hashlib
+    import io
+    import json
+    import tarfile
+
+    def tar_bytes(files: dict[str, bytes]) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as t:
+            for name, data in files.items():
+                info = tarfile.TarInfo(name)
+                info.size, info.mtime = len(data), 0
+                t.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    layer = tar_bytes({"payload": payload})
+    config = json.dumps({"architecture": "amd64", "os": "linux", "created": created, "config": {},
+                         "rootfs": {"type": "layers", "diff_ids": [f"sha256:{hashlib.sha256(layer).hexdigest()}"]},
+                         "history": [{"created": created, "created_by": "test"}]}).encode()
+    manifest = json.dumps([{"Config": "config.json", "RepoTags": [tag] if tag else None,
+                            "Layers": ["layer.tar"]}]).encode()
+    path.write_bytes(tar_bytes({"config.json": config, "layer.tar": layer, "manifest.json": manifest}))
+    return path
+
+
+@pytest.mark.skipif(not os.environ.get("ARCEUS_REAL_DOCKER"), reason="set ARCEUS_REAL_DOCKER=1 on a host with Docker")
+def test_real_docker_age_rules_in_a_throwaway_daemon(tmp_path, monkeypatch):
+    """The age rules prune host-wide, so they run against a Docker of their own (docker:dind), never the host's:
+    an old untagged image goes; an old untagged image a stopped container uses, a fresh one and an old tagged one
+    stay; build cache used today stays, and `until` really prunes by the last use."""
+    import socket
+    import time
+    import uuid
+
+    from arceus_runner.dockerops import Docker
+    name = f"zz-dind-{uuid.uuid4().hex[:8]}"
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    dind = "docker:29-dind"
+    pulled = subprocess.run(["docker", "image", "inspect", dind], capture_output=True).returncode != 0
+    started = subprocess.run(["docker", "run", "-d", "--rm", "--privileged", "--name", name, "-e",
+                              "DOCKER_TLS_CERTDIR=", "-p", f"127.0.0.1:{port}:2375", dind],
+                             capture_output=True, text=True)
+    if started.returncode != 0:  # what Docker said: no daemon, no privileged containers, no registry
+        pytest.fail(f"the throwaway Docker ({dind}) did not start: {started.stderr.strip()[-500:]}")
+    monkeypatch.setenv("DOCKER_HOST", f"tcp://127.0.0.1:{port}")
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+
+    def run(*args: str) -> str:
+        return subprocess.run(["docker", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def load(tar: Path) -> str:
+        out = run("load", "-i", str(tar))
+        return run("image", "inspect", "-f", "{{.Id}}", out.rsplit(" ", 1)[-1]) if "Loaded image:" in out \
+            else out.rsplit(" ", 1)[-1]
+
+    w = None
+    try:
+        for _ in range(60):
+            if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail("the throwaway Docker did not start")
+        old = "2020-01-01T00:00:00Z"
+        goes = load(_image_tar(tmp_path / "a.tar", old, os.urandom(300_000)))
+        held = load(_image_tar(tmp_path / "b.tar", old, os.urandom(1000)))
+        run("create", "--name", "stopped", held, "/payload")
+        fresh = load(_image_tar(tmp_path / "c.tar", datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                                os.urandom(1000)))
+        tagged = load(_image_tar(tmp_path / "d.tar", old, os.urandom(1000), tag="zz-base:1"))
+        dangling = set(run("image", "ls", "-q", "--no-trunc", "--filter", "dangling=true").split())
+        assert {goes, held, fresh} <= dangling and tagged not in dangling, (goes, held, fresh, dangling)
+        ctx = tmp_path / "ctx"
+        ctx.mkdir()
+        (ctx / "Dockerfile").write_text("FROM scratch\nCOPY f /f\n")
+        (ctx / "f").write_bytes(os.urandom(200_000))
+        run("build", "-q", str(ctx))
+        cache_before = run("system", "df", "--format", "{{if eq .Type \"Build Cache\"}}{{.Size}}{{end}}")
+        assert cache_before.strip() not in ("", "0B"), cache_before
+
+        w = World(tmp_path / "w")
+        w.now = datetime.now(UTC)
+        w.docker = Docker()
+        w.cleanup = w.make()
+        result = w.cleanup.run("full", "manual")
+        assert result["status"] == "succeeded", result["errors"]
+        left = {i for i in run("image", "ls", "-aq", "--no-trunc").split()}
+        assert goes not in left and {held, fresh, tagged} <= left
+        assert w.items(result)["build cache"] == ("prune", "done")
+        assert result["freed_by_rule"]["build_cache"] == 0  # used today: kept by the 7 days
+        assert result["freed_by_rule"]["dangling_images"] > 0
+        assert "zz-base:1" in w.unknown(result)  # tagged, no task label: reported, unused_images_after is off
+
+        time.sleep(2)
+        freed = Docker().prune_build_cache(timedelta(seconds=1))
+        assert freed and freed > 0
+        assert run("system", "df", "--format", "{{if eq .Type \"Build Cache\"}}{{.Size}}{{end}}").strip() == "0B"
+    finally:
+        if w:
+            w.events.close()
+            w.store.close()
+        # `-v`: the daemon's own /var/lib/docker is an anonymous volume of the dind image. The image goes too
+        # when this test pulled it: the host is left as it was.
+        host = {k: v for k, v in os.environ.items() if k != "DOCKER_HOST"}
+        subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, env=host)
+        if pulled:
+            subprocess.run(["docker", "image", "rm", dind], capture_output=True, env=host)
+
+
+@pytest.mark.parametrize("after", [{}, {"Images": {"Type": "Images"}}, {"Images": {"Type": "Images", "Size": "unreadable"}}],
+                         ids=["no row", "no size", "not a size"])
+def test_a_measurement_docker_did_not_give_is_unknown_never_freed(tmp_path, capsys, after):
+    """Docker's count after the rule is missing or unreadable: what the rule freed is not known. It stays null in
+    the pass's result, in the stored report and `cleanup --last`, and the metric says nothing; a real 0B is 0."""
+    import json
+
+    import yaml
+
+    from arceus_runner import cli
+    w = World(tmp_path)
+    d = w.docker
+    d.add_image("sha256:old", created=T0 - timedelta(days=30), size=1_000_000)
+    remove = d.remove_image
+
+    def remove_then_break(iid: str) -> None:
+        remove(iid)
+        d.df_broken = after
+    d.remove_image = remove_then_break
+    result = w.cleanup.run("full", "manual")
+    assert w.items(result) == {"untagged image old": ("remove", "done")}
+    assert result["freed_by_rule"] == {"dangling_images": None}
+    stored = json.loads(w.store.cleanup_runs(1)[0]["summary"])
+    assert stored["freed_by_rule"] == {"dangling_images": None}
+    metrics = Metrics()
+    metrics.update_cleanup(w.cleanup)
+    assert metrics.registry.get_sample_value("runner_cleanup_rule_freed_bytes", {"rule": "dangling_images"}) is None
+    w.events.close()
+    w.store.close()
+
+    raw = example_raw()
+    raw.pop("slack")
+    raw["health"].pop("devstack_check", None)
+    raw["paths"] = {k: str(v) for k, v in w.cfg.paths.model_dump().items()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(raw))
+    args = ["--config", str(tmp_path / "config.yaml"), "cleanup", "--last"]
+    assert cli.main(args) == 0
+    assert "Freed, as Docker counts it: untagged images unknown (Docker did not say)" in capsys.readouterr().out
+    assert cli.main(args + ["--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["freed_by_rule"] == {"dangling_images": None}
+
+
+def test_docker_sizes_read_as_sizes_or_not_at_all():
+    from arceus_runner.dockerops import read_size, size_bytes
+    assert read_size("0B") == 0 and read_size("1.8GB") == 1_800_000_000 and read_size("204.8kB") == 204_800
+    for bad in (None, "", "unreadable", "1.2.3GB", "GB"):
+        assert read_size(bad) is None and size_bytes(bad) == 0
+
+
+@pytest.mark.parametrize("rule,tags", [("dangling_images", ()), ("unused_images", ("otherteam/api:1",))])
+@pytest.mark.parametrize("error", ["docker image rm: no answer in 300s, out of time", "docker image rm: daemon error"])
+def test_an_image_removal_cut_or_failed_after_it_began_freed_an_unknown_amount(tmp_path, capsys, rule, tags, error):
+    """Docker may have removed the image before the command failed or was cut: the rule says nothing (null) in the
+    result, the stored report, `cleanup --last` and the metric; never 0. One that never began frees 0."""
+    import json
+
+    import yaml
+
+    from arceus_runner import cli
+    w = World(tmp_path, unused_images_after="7d")
+    d = w.docker
+    d.add_image("sha256:old", tags, created=T0 - timedelta(days=30))
+    remove = d.remove_image
+
+    def remove_then_fail(iid: str) -> None:
+        remove(iid)  # it went, but the client never heard so
+        raise DockerError(error)
+    d.remove_image = remove_then_fail
+    result = w.cleanup.run("full", "manual")
+    assert [i["result"] for i in result["planned"]] == ["skipped" if "out of time" in error else "failed"]
+    assert result["freed_by_rule"] == {rule: None}
+    assert json.loads(w.store.cleanup_runs(1)[0]["summary"])["freed_by_rule"] == {rule: None}
+    metrics = Metrics()
+    metrics.update_cleanup(w.cleanup)
+    assert metrics.registry.get_sample_value("runner_cleanup_rule_freed_bytes", {"rule": rule}) is None
+    w.events.close()
+    w.store.close()
+    raw = example_raw()
+    raw.pop("slack")
+    raw["health"].pop("devstack_check", None)
+    raw["paths"] = {k: str(v) for k, v in w.cfg.paths.model_dump().items()}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(raw))
+    args = ["--config", str(tmp_path / "config.yaml"), "cleanup", "--last"]
+    assert cli.main(args) == 0
+    assert "unknown (Docker did not say)" in capsys.readouterr().out
+    assert cli.main(args + ["--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["freed_by_rule"] == {rule: None}
+
+
+def test_an_image_removal_that_never_began_frees_0(world):
+    """The pass's time was over before the command: nothing ran, so nothing went."""
+    world.docker.add_image("sha256:old", created=T0 - timedelta(days=30))
+    items, _ = world.cleanup.plan("full")
+    world.cleanup.execute("r1", items, errors := [], deadline=world.mono() - 1)
+    assert [i.result for i in items] == ["skipped"] and "error" not in items[0].detail
+    assert world.cleanup.freed_by_rule == {"dangling_images": 0} and errors == ["out of time"]

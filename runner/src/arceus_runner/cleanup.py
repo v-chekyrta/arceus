@@ -19,7 +19,11 @@ each thing itself, and removes only what passes three tests:
 
 A running container goes only with an explicit task label; one put down to a task by time alone may be the dev
 stack the agent restarted, so it is reported. Named Docker volumes are dependency caches and go only with a task
-label, and images only when built with one; untagged images are counted in the report, never pruned. An anonymous
+label, and images only when built with one. Three rules go by age alone, host-wide, and only in a full pass: build
+cache no build has used for `build_cache_after`, untagged images made `dangling_images_after` ago that no container
+uses (stopped ones too), and, only when `unused_images_after` is set, tagged images without a task label made that
+long ago that no container uses; `arceus.keep=true`, `protect.images` and protected compose projects win over all
+three. What each rule freed is Docker's own count (`freed_by_rule`). An anonymous
 volume left by a `docker rm` without `-v` carries nothing that says whose it is, and can still be mounted by its ID:
 it goes only when a task's labelled container was seen using it (`observe`, and every pass), by that task's rules,
 once no container has used it for `orphaned_volumes_after`. One nobody can be tied to is only counted, unless
@@ -47,6 +51,7 @@ rest `skipped` and the pass `partial`; a pass cut short by a crash is marked `in
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -62,7 +67,7 @@ from pathlib import Path
 
 from arceus_runner.config import Config
 from arceus_runner.db import ACTIVE_STATES, RUN_KINDS, Task, TaskStore
-from arceus_runner.dockerops import Docker, DockerError, size_bytes
+from arceus_runner.dockerops import Docker, DockerError, read_size, size_bytes
 from arceus_runner.engine import Engine, EngineError
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import Git, GitError
@@ -87,6 +92,8 @@ OBSERVE_EVERY = timedelta(minutes=2)  # how often labelled containers' anonymous
 HISTORY = timedelta(days=90)
 ORDER = ("process", "container", "network", "volume", "image", "repo", "branch", "folder")
 UNKNOWN_SHOWN, PLANNED_SHOWN = 200, 100  # how many of each a pass's summary lists
+# The age rules: what each frees is measured on Docker's own count, the type of `docker system df` it shrinks.
+RULES = {"build_cache": "Build Cache", "dangling_images": "Images", "unused_images": "Images"}
 
 
 def _iso(dt: datetime) -> str:
@@ -232,7 +239,7 @@ class Item:
     kind: str     # process | container | network | volume | image | repo | branch | folder
     ref: str      # what identifies it exactly: an id, a path, repo:branch, pid:ticks
     name: str     # what a person recognises
-    action: str   # stop | remove | delete | stash | kill | report
+    action: str   # stop | remove | delete | stash | kill | prune | report
     why: str
     task: str | None = None
     independent: bool = False  # cannot be the running task's: allowed while a task works
@@ -279,6 +286,7 @@ class Cleanup:
         self.seen_owners: list[tuple[str, bool, list[str]]] = []  # (task, disposable, anonymous volumes) it saw
         self._observed: datetime | None = None
         self.images_in_use = 0  # the last plan's images that containers use: never listed
+        self.freed_by_rule: dict[str, int | None] = {}  # the acting pass's age rules: bytes Docker freed, None unread
         self._deadline: float | None = None  # self.mono() by which the pass in progress must end
         self._planned: Owners | None = None  # the last plan's
         self._busy: tuple[datetime, str] | None = None  # the engine was not quiet: until when, and why
@@ -445,6 +453,7 @@ class Cleanup:
         self.docker.deadline = self.git.deadline = time.monotonic() + budget
         try:
             self.seen_projects, self.seen_orphans, self.seen_owners = {}, None, []
+            self.freed_by_rule = {}
             items, errors = self.plan(scope, holder, deadline=deadline)
             self.store.remember_projects(self.seen_projects, _iso(started))
             self.store.remember_volume_owners(self.seen_owners, _iso(started))
@@ -475,7 +484,8 @@ class Cleanup:
         self.store.cleanup_finished(run_id, status, _iso(self.now()), summary)
         self.events.emit("cleanup_finished", run=run_id, status=status, trigger=trigger, scope=scope, mode=self.mode,
                          counts=summary["counts"], unknown=summary["unknown_total"], errors=errors[:5] or None,
-                         freed_bytes=summary.get("freed_bytes"), seconds=summary["seconds"],
+                         freed_bytes=summary.get("freed_bytes"), freed_by_rule=summary.get("freed_by_rule"),
+                         seconds=summary["seconds"],
                          deferred=summary.get("deferred"))
         self.store.forget_cleanups(_iso(started - HISTORY))
         return {"run": run_id, "status": status, **summary}
@@ -549,7 +559,8 @@ class Cleanup:
                     attached[net] = attached.get(net, 0) + 1
         items += self._networks(self.docker.networks(), attached, going, known, owners, projects)
         items += self._volumes(volumes, containers, going, owners, projects, sizes.get("volumes") or {})
-        images = self.docker.images()
+        every_image = self.docker.images()
+        images = [i for i in every_image if not self._image_protected(i, projects)]
         items += self._images([i for i in images if TASK_LABEL in ((i.get("Config") or {}).get("Labels") or {})],
                               containers, going, owners)
         try:
@@ -559,14 +570,23 @@ class Cleanup:
         items += self._unlabelled_images(images, containers, sizes.get("images") or {}, owners,
                                          totals.get("Images") or {})
         used_images = {c.get("Image") for c in containers}
-        self.images_in_use = sum(1 for i in images if i.get("Id") in used_images)
+        self.images_in_use = sum(1 for i in every_image if i.get("Id") in used_images)
+        items += self._dangling(images, set(self.docker.dangling_images()), containers, sizes.get("images") or {})
         items += self._build_cache(totals.get("Build Cache"))
-        dangling = self.docker.dangling_images()
-        if dangling:
-            items.append(Item("image", "dangling", f"{dangling} untagged images", "report",
-                              "untagged, and nothing says whose they are: another project's, or a waiting task's "
-                              "build; `docker image prune` by hand when they are not needed", detail={"count": dangling}))
         return items
+
+    def _image_protected(self, img: dict, projects: set[str]) -> bool:
+        """`arceus.keep=true`, a protected compose project's image, or a tag `protect.images` names: no rule takes it."""
+        labels = (img.get("Config") or {}).get("Labels") or {}
+        if labels.get(KEEP_LABEL) == "true" or labels.get(PROJECT_LABEL) in projects:
+            return True
+        names = [n for tag in img.get("RepoTags") or [] for n in (tag, tag.rsplit(":", 1)[0])]
+        return any(fnmatch.fnmatchcase(n, p) for p in self.c.protect.images for n in names)
+
+    def _older(self, img: dict, after: timedelta | None) -> bool:
+        """Made `after` ago or longer, by Docker's `Created`; never when the rule is off or the time unreadable."""
+        made = _ts(img.get("Created"))
+        return after is not None and made is not None and self.now() - made >= after
 
     def _images(self, images: list[dict], containers: list[dict], going: set[str], owners: Owners) -> list[Item]:
         used = {c.get("Image") for c in containers if c.get("Id") not in going}
@@ -584,14 +604,14 @@ class Cleanup:
                                   independent=True))
         return items
 
-    @staticmethod
-    def _unlabelled_images(images: list[dict], containers: list[dict], sizes: dict[str, tuple[int, int]],
+    def _unlabelled_images(self, images: list[dict], containers: list[dict], sizes: dict[str, tuple[int, int]],
                            owners: Owners, total: dict) -> list[Item]:
         """Tagged images without a task label that no container uses, one by one, the biggest own part first.
         Images share layers, so one image's own part is not what removing several frees: the last line says that,
-        as Docker counts it."""
+        as Docker counts it. With `unused_images_after`, those made that long ago go, each by its ID."""
         used = {c.get("Image") for c in containers}
-        items = []
+        after = self.c.unused_images_after
+        items, going = [], []
         for img in images:
             labels = (img.get("Config") or {}).get("Labels") or {}
             iid = img.get("Id") or ""
@@ -603,10 +623,19 @@ class Cleanup:
             else:
                 what = _human(size)
             name = ", ".join(img["RepoTags"])
+            if self._older(img, after):
+                going.append(Item("image", iid, name, "remove",
+                                  f"no task label, no container uses it, made {_day(img.get('Created'))}: over "
+                                  f"`unused_images_after` ({_span(after)}); {what}",
+                                  detail={"rule": "unused_images", "tags": sorted(img["RepoTags"]),
+                                          "own": own if own is not None else size}))
+                continue
             items.append(Item("image", iid, name, "report", f"no task label, no container uses it; {what}, made "
                               f"{_day(img.get('Created'))}" + owners.named(name),
                               detail={"own": own if own is not None else size}))
         items.sort(key=lambda i: -i.detail["own"])
+        if going:  # Docker's count below is of every unused image, these included: not said then
+            return items + sorted(going, key=lambda i: -i.detail["own"])
         reclaimable = (total.get("Reclaimable") or "").split(" (")[0]
         if items and reclaimable:
             items.append(Item("image", "unused-images", f"{len(items)} images above", "report",
@@ -614,14 +643,53 @@ class Cleanup:
                               "frees, a shared layer counted once", detail={"bytes": size_bytes(reclaimable)}))
         return items
 
-    @staticmethod
-    def _build_cache(row: dict | None) -> list[Item]:
-        """Docker's build cache: what `docker build` keeps between builds. Only its size, for the person."""
+    def _dangling(self, images: list[dict], dangling: set[str], containers: list[dict],
+                  sizes: dict[str, tuple[int, int]]) -> list[Item]:
+        """Untagged images: an old build a newer one took the tag from, a `docker build` without `-t`. Made
+        `dangling_images_after` ago and used by no container, running or stopped, each goes by its ID; the rest
+        are counted. One labelled for a task goes by its task's rules (`_images`), never by age."""
+        used = {c.get("Image") for c in containers}
+        after = self.c.dangling_images_after
+        items, young, in_use = [], 0, 0
+        for img in images:
+            iid = img.get("Id") or ""
+            if iid not in dangling or TASK_LABEL in ((img.get("Config") or {}).get("Labels") or {}):
+                continue
+            if iid in used:
+                in_use += 1
+            elif not self._older(img, after):
+                young += 1
+            else:
+                own, size = sizes.get(iid) or (None, int(img.get("Size") or 0))
+                what = f"{_human(own)} of its own" if own is not None else f"{_human(size)} with shared layers"
+                items.append(Item("image", iid, f"untagged image {iid.removeprefix('sha256:')[:12]}", "remove",
+                                  f"untagged, no container uses it, made {_day(img.get('Created'))}: over "
+                                  f"`dangling_images_after` ({_span(after)}); {what}",
+                                  detail={"rule": "dangling_images"}))
+        left = young + in_use
+        if left:
+            why = (f"{young} made less than {_span(after)} ago, " if after is not None and young else "") + \
+                  (f"{in_use} used by a stopped or running container, " if in_use else "")
+            items.append(Item("image", "dangling", f"{left} untagged images", "report",
+                              (f"{why.rstrip(', ')}: they stay" if after is not None else
+                               "untagged, and nothing says whose they are; `dangling_images_after` is off"),
+                              detail={"count": left}))
+        return items
+
+    def _build_cache(self, row: dict | None) -> list[Item]:
+        """Docker's build cache: what `docker build` keeps between builds. Pruned of what no build has used for
+        `build_cache_after`; with the rule off, only its size, for the person."""
         if not row or row.get("Size") in (None, "", "0B"):
             return []
-        return [Item("image", "build-cache", "build cache", "report",
-                     f"{row.get('Size')}, of which {row.get('Reclaimable') or '?'} no image uses; "
-                     "`docker builder prune` by hand", detail={"bytes": size_bytes((row.get("Reclaimable") or "").split(" (")[0])})]
+        reclaimable = (row.get("Reclaimable") or "").split(" (")[0]
+        after = self.c.build_cache_after
+        if after is None:
+            return [Item("image", "build-cache", "build cache", "report",
+                         f"{row.get('Size')}, of which {reclaimable or '?'} no image uses; `build_cache_after` is "
+                         "off: `docker builder prune` by hand", detail={"bytes": size_bytes(reclaimable)})]
+        return [Item("image", "build-cache", "build cache", "prune",
+                     f"what no build has used for {_span(after)} (`build_cache_after`); {row.get('Size')} in all, "
+                     f"{reclaimable or '?'} of it no image uses", detail={"rule": "build_cache"})]
 
     def _container(self, c: dict, labels: dict, owners: Owners, projects: set[str]) -> Item | None:
         name = (c.get("Name") or "").lstrip("/")
@@ -1013,26 +1081,68 @@ class Cleanup:
 
     def execute(self, run_id: str, items: list[Item], errors: list[str], deadline: float) -> None:
         self._deadline = deadline
-        todo = sorted((i for i in items if i.action != "report"), key=lambda i: ORDER.index(i.kind))
-        for it in todo:
-            if self.mono() > deadline:
-                it.result = "skipped"
-                if OUT_OF_TIME not in errors:
-                    errors.append(OUT_OF_TIME)
-            else:
-                try:
-                    it.result = self._do(run_id, it)
-                except (DockerError, GitError, OSError) as e:
-                    if OUT_OF_TIME in str(e):  # the command was cut at the pass's deadline
-                        it.result = "skipped"
-                        if OUT_OF_TIME not in errors:
-                            errors.append(OUT_OF_TIME)
-                    else:
-                        it.result = "failed"
-                        errors.append(f"{it.kind} {it.name}: {e}")
-                    it.detail["error"] = str(e)[:300]
-            self.store.cleanup_item(run_id, it.kind, it.ref, it.action, it.result, it.task, self._detail(it))
-            self._emit_item(run_id, it)
+        # An age rule's items run one after another, after the task's own images: what the rule frees is Docker's
+        # count before its first item minus after its last.
+        todo = sorted((i for i in items if i.action != "report"),
+                      key=lambda i: (ORDER.index(i.kind), list(RULES).index(i.detail["rule"]) + 1
+                                     if i.detail.get("rule") in RULES else 0))
+        span: dict[str, list[int]] = {}
+        for n, it in enumerate(todo):
+            if it.detail.get("rule") in RULES:
+                span.setdefault(it.detail["rule"], [n, n])[1] = n
+        before: dict[str, int | None] = {}
+        for n, it in enumerate(todo):
+            rule = it.detail.get("rule") if it.detail.get("rule") in RULES else None
+            if rule and span[rule][0] == n:
+                before[rule] = self._docker_bytes(rule)
+            self._execute_one(run_id, it, errors, deadline)
+            if rule and span[rule][1] == n:
+                self.freed_by_rule[rule] = self._freed(rule, before.get(rule),
+                                                       [i for i in todo if i.detail.get("rule") == rule])
+
+    def _docker_bytes(self, rule: str) -> int | None:
+        """Docker's own size of what the rule removes (`docker system df`, a shared layer counted once); None
+        when it cannot be read: Docker did not answer, the pass's time is up, or the row or its size is missing
+        or not a size. `0B` is 0."""
+        try:
+            row = self.docker.disk_usage().get(RULES[rule])
+        except DockerError:
+            return None
+        return read_size(row.get("Size")) if row else None
+
+    def _freed(self, rule: str, before: int | None, its: list[Item]) -> int | None:
+        """What a rule freed: 0 when nothing of it was removed; for the build cache, what the prune said it
+        reclaimed; else Docker's count before minus after. None: Docker's count could not be read."""
+        if not any(i.result == "done" for i in its):
+            # A command that started and then failed or was cut at the deadline (it has an `error`) may have
+            # removed what it was given before the client gave up: not known, so not said. 0 only when no
+            # command ran, or Docker refused (`kept`, `gone`).
+            return None if any(i.result in ("failed", "skipped") and "error" in i.detail for i in its) else 0
+        said = [i.detail["freed"] for i in its if i.detail.get("freed") is not None]
+        if said:
+            return sum(said)
+        after = self._docker_bytes(rule)
+        return max(0, before - after) if before is not None and after is not None else None
+
+    def _execute_one(self, run_id: str, it: Item, errors: list[str], deadline: float) -> None:
+        if self.mono() > deadline:
+            it.result = "skipped"
+            if OUT_OF_TIME not in errors:
+                errors.append(OUT_OF_TIME)
+        else:
+            try:
+                it.result = self._do(run_id, it)
+            except (DockerError, GitError, OSError) as e:
+                if OUT_OF_TIME in str(e):  # the command was cut at the pass's deadline
+                    it.result = "skipped"
+                    if OUT_OF_TIME not in errors:
+                        errors.append(OUT_OF_TIME)
+                else:
+                    it.result = "failed"
+                    errors.append(f"{it.kind} {it.name}: {e}")
+                it.detail["error"] = str(e)[:300]
+        self.store.cleanup_item(run_id, it.kind, it.ref, it.action, it.result, it.task, self._detail(it))
+        self._emit_item(run_id, it)
 
     def _do(self, run_id: str, it: Item) -> str:
         """One removal, after checking again that it is still the thing that was planned."""
@@ -1113,7 +1223,23 @@ class Cleanup:
                     return "gone"
                 raise
             return "done"
+        if it.kind == "image" and it.action == "prune":
+            it.detail["freed"] = self.docker.prune_build_cache(self.c.build_cache_after)
+            return "done"
         if it.kind == "image":
+            img = self.docker.image(it.ref)
+            if img is None:
+                return "gone"
+            labels = (img.get("Config") or {}).get("Labels") or {}
+            if self._image_protected(img, self._protected_projects()):
+                return self._kept(it, "it is protected now")
+            rule = it.detail.get("rule")
+            if rule and TASK_LABEL in labels:
+                return self._kept(it, f"it is labelled for {labels[TASK_LABEL]} now")
+            if rule == "dangling_images" and img.get("RepoTags"):
+                return self._kept(it, "it was tagged since")
+            if rule == "unused_images" and sorted(img.get("RepoTags") or []) != it.detail.get("tags"):
+                return self._kept(it, "its tags changed")
             try:
                 self.docker.remove_image(it.ref)
             except DockerError as e:
@@ -1234,6 +1360,9 @@ class Cleanup:
         }
         if self.mode == "act" and disk_before is not None and after is not None:
             summary["freed_bytes"] = max(0, after - disk_before)
+        if self.mode == "act" and self.freed_by_rule:
+            # Docker's own count for each age rule that ran: build_cache, dangling_images, unused_images.
+            summary["freed_by_rule"] = dict(self.freed_by_rule)
         if scope == "independent":
             summary["deferred"] = "the workspace's repositories, compose containers and processes wait for a free workspace"
         return summary

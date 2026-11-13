@@ -594,6 +594,9 @@ class CleanupProtect(Strict):
     compose_projects: list[str] = []  # e.g. the project's dev stack: [acme-dev]
     containers: list[str] = []        # container names
     volumes: list[str] = []           # volume names
+    # Images by repository or tag, shell patterns (`postgres`, `node:*`, `registry.example.com/base/*`): never
+    # removed by any rule, a task's label included.
+    images: list[str] = []
 
 
 class CleanupConfig(Strict):
@@ -620,6 +623,16 @@ class CleanupConfig(Strict):
     # Also anonymous volumes no task's container was seen using, host-wide, as `docker volume prune` does. Such a
     # volume can still be mounted by its ID and may hold the only copy of something: only when that is accepted.
     prune_unowned_volumes: bool = False
+    # Build cache no build has used this long goes (`docker builder prune --all --filter until=`). None: only its
+    # size is reported. In days, not hours: the next build after a prune downloads and builds it all again.
+    build_cache_after: Duration | None = timedelta(days=7)
+    # Untagged (dangling) images made this long ago that no container uses, stopped ones included, and nothing
+    # labels for a task or protects: each removed by its ID. None: only counted.
+    dangling_images_after: Duration | None = timedelta(days=7)
+    # Tagged images without a task label made this long ago that no container uses: base images, another
+    # project's, the dev stack's. Age is when the image was made, not when it was last used: a base image pulled
+    # long ago goes whenever no container uses it. None (the default): only reported.
+    unused_images_after: Duration | None = None
     keep_media: Duration = timedelta(days=14)     # .arceus/media/<KEY> after the task is over
     keep_notes: Duration = timedelta(days=90)     # .arceus/notes/<KEY>: reviewers ask weeks later
     stash: bool = True       # uncommitted leftovers on a finished task's branch go to `git stash`
@@ -636,6 +649,13 @@ class CleanupConfig(Strict):
     def _release_after(cls, v: timedelta | None) -> timedelta | None:
         if v is not None and v < timedelta(hours=1):
             raise ValueError("at least 1h: a shorter wait is a pause between two answers, not a task left waiting")
+        return v
+
+    @field_validator("build_cache_after", "dangling_images_after", "unused_images_after")
+    @classmethod
+    def _image_age(cls, v: timedelta | None) -> timedelta | None:
+        if v is not None and v < timedelta(days=1):
+            raise ValueError("at least 1d: what goes is downloaded and built again by the next task")
         return v
 
     @field_validator("orphaned_volumes_after")
