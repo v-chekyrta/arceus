@@ -540,3 +540,16 @@ def test_cleanup_shows_no_help_of_the_section_after_it(w):
     assert "tests the platform" not in page.text and "qa.py" not in page.text
     qa_page = admin.get("/settings/qa/")
     assert qa_page.status_code == 200 and "past it the run stops, reported as unfinished" in qa_page.text
+
+
+def test_tags_on_a_step_are_set_in_the_form_and_read_back_by_the_runner(w):
+    admin = signed_in(w.settings, "owner@example.com")
+    r = change(admin, "tracker", **{"tracker.tags_on.merged.add": "ready for dev\nqa ready"})
+    assert r.status_code == 200 and "ready for dev" in r.text
+    assert save_preview(admin, r.text).status_code == 303
+    cfg = Config.model_validate(yaml.safe_load(w.config.read_text()))
+    assert cfg.tracker.tags_on.merged.add == ["ready for dev", "qa ready"] and cfg.tracker.tags_on.merged.remove == []
+    assert cfg.tracker.states.merged == Config.model_validate(yaml.safe_load(EXAMPLE.read_text())).tracker.states.merged
+    r = change(admin, "tracker", **{"tracker.tags_on.merged.add": "agent"})        # the queue tag: refused
+    assert "The runner would refuse this config.yaml" in r.text and "Save config.yaml" not in r.text
+    assert "tags_on.merged must not use the runner&#39;s own tags" in r.text

@@ -87,6 +87,23 @@ def test_a_merged_state_set_in_the_config_must_exist(cfg, secrets):
     assert results["youtrack.states.merged"].status == "fail"
 
 
+def test_tags_on_that_youtrack_does_not_have_warn_by_name(cfg, secrets):
+    tags_on = type(cfg.tracker.tags_on).model_validate({"merged": {"add": ["ready for dev", "qa"]},
+                                                        "answered": {"add": ["qa"]}})
+    cfg = cfg.model_copy(update={"tracker": cfg.tracker.model_copy(update={"tags_on": tags_on})})
+    fake = FakeYouTrack()
+    fake.tags.add("qa")
+    results = {c.name: c for c in check_youtrack(cfg, secrets, fake)}
+    assert results["youtrack.tags_on.merged"].status == "warn"
+    assert "'ready for dev'" in results["youtrack.tags_on.merged"].detail
+    assert "'qa'" not in results["youtrack.tags_on.merged"].detail
+    assert (results["youtrack.tags_on.answered"].status, results["youtrack.tags_on.answered"].detail) == ("ok", "qa")
+
+
+def test_no_tags_on_no_check(cfg, secrets):
+    assert not [c for c in check_youtrack(cfg, secrets, FakeYouTrack()) if c.name.startswith("youtrack.tags_on")]
+
+
 def test_youtrack_check_wrong_bot(cfg, secrets):
     results = {c.name: c for c in check_youtrack(cfg, secrets, FakeYouTrack(login="someone"))}
     assert results["youtrack.bot_user"].status == "fail"

@@ -10,7 +10,7 @@ import pytest
 
 from arceus_runner.code_review import attention_matches, parse_request
 from arceus_runner.config import Config, Secrets
-from arceus_runner.http import TransientError
+from arceus_runner.http import ServiceError, TransientError
 from arceus_runner.screening import Verdict
 
 from .conftest import GL_TOKEN, YT_TOKEN, example_raw
@@ -28,10 +28,13 @@ def no_real_tools(monkeypatch):
     monkeypatch.setattr("arceus_runner.bulava._writable_by_us", lambda root: [])
 
 
-def world(tmp_path, approver: bool = True, enabled: bool = True, paths: dict | None = None, **review_agent) -> World:
+def world(tmp_path, approver: bool = True, enabled: bool = True, paths: dict | None = None,
+          tracker: dict | None = None, **review_agent) -> World:
     settings = {"review_agent": {"enabled": enabled, **review_agent}}
     if paths:
         settings["paths"] = paths
+    if tracker:
+        settings["tracker"] = tracker
     if approver:
         settings["code_host"] = {"approver": APPROVER}
     w = World(tmp_path, Secrets(tracker=YT_TOKEN, code_host=GL_TOKEN, slack=None, approver=APPROVER_TOKEN),
@@ -1733,3 +1736,76 @@ def test_a_request_in_the_bots_mr_gets_the_bots_eyes_not_the_approvers(w):
     w.tick()
     assert [a["user"]["username"] for a in w.gl.awards[asked]] == [w.gl.username]
     assert w.gl.awards.get(review_note, []) == [] and w.gl.awards.get(command, []) == []
+
+
+def reviewed_people_ticket(tmp_path, *mrs: int) -> tuple[World, str]:
+    """A ticket people worked on, its MRs reviewed and approved, tracker.tags_on.merged set: the ticket's db id."""
+    w = world(tmp_path, tracker={"tags_on": {"merged": {"add": ["ready for dev"], "remove": ["in development"]}}})
+    w.yt.tags |= {"ready for dev", "in development"}
+    urls = [people_mr(w, iid=i, repo=repo, name=f"people{i}.txt")[0]
+            for i, repo in zip(mrs, ("acme-platform", "acme-theme"))]
+    db_id = people_ticket(w, "\n".join(urls))
+    w.yt.issue_tags[db_id] = {"in development"}
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    path = w.cfg.paths.workspace / ".arceus" / "reviews" / PEOPLE / f"{PEOPLE_RID}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"summary": "Complete.", "mrs": [
+        {"mr": f"M{n}", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed",
+         "checked": "make test", "findings": [], "attention": []} for n in range(1, len(mrs) + 1)]}))
+    finish(w, PEOPLE_RID)
+    assert w.store.task(PEOPLE).state == "code_review"
+    return w, db_id
+
+
+def test_people_merge_requests_merged_in_code_review_get_the_merge_tags(tmp_path):
+    w, db_id = reviewed_people_ticket(tmp_path, 5, 6)
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "code_review" and "ready for dev" not in w.yt.issue_tags[db_id]
+    w.gl.mr(6)["state"] = "merged"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done" and w.yt.issue_tags[db_id] == {"ready for dev"}
+    assert w.yt.issue_fields[db_id]["State"] == {"name": "Code Review"}       # people's ticket is never moved
+
+
+def test_people_merge_requests_all_closed_get_no_tags(tmp_path):
+    w, db_id = reviewed_people_ticket(tmp_path, 5)
+    w.gl.mr(5)["state"] = "closed"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done" and w.yt.issue_tags[db_id] == {"in development"}
+
+
+def test_a_people_ticket_moved_on_by_hand_gets_no_tags(tmp_path):
+    w, db_id = reviewed_people_ticket(tmp_path, 5)
+    w.yt.issue_fields[db_id]["State"] = {"name": "Done"}
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done" and "ready for dev" not in w.yt.issue_tags[db_id]
+
+
+def test_people_merge_tags_a_tracker_failure_held_back_are_put_on_later(tmp_path, monkeypatch):
+    w, db_id = reviewed_people_ticket(tmp_path, 5)
+    yt = w.runner.delivery.tracker
+    real = yt.add_tag
+
+    def refuse(issue, name):
+        raise ServiceError("youtrack", "tag write refused for now")
+
+    monkeypatch.setattr(yt, "add_tag", refuse)
+    w.gl.mr(5)["state"] = "merged"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done" and w.yt.issue_tags[db_id] == {"in development"}
+    monkeypatch.setattr(yt, "add_tag", real)
+    w.tick()
+    assert w.yt.issue_tags[db_id] == {"ready for dev"}
+    w.tick()
+    assert [e["tag"] for e in w.events_named("ticket_tagged")] == ["ready for dev", "in development"]
+
+
+def test_people_merge_requests_one_merged_one_closed_get_no_tags(tmp_path):
+    w, db_id = reviewed_people_ticket(tmp_path, 5, 6)
+    w.gl.mr(5)["state"] = "merged"
+    w.gl.mr(6)["state"] = "closed"
+    w.tick()
+    assert w.store.task(PEOPLE).state == "done" and w.yt.issue_tags[db_id] == {"in development"}

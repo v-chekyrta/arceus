@@ -100,6 +100,47 @@ class TrackerTags(Strict):
         return self
 
 
+def _tag_name(v: str) -> str:
+    if not v.strip() or v != v.strip():
+        raise ValueError(f"a tag name must not be empty or start or end with a space, got {v!r}")
+    return v
+
+
+TagName = Annotated[str, BeforeValidator(_tag_name)]
+
+
+class TagChange(Strict):
+    """Tags the runner puts on a ticket and takes off it at one of its own steps."""
+    add: list[TagName] = []
+    remove: list[TagName] = []
+
+    @model_validator(mode="after")
+    def _clear(self) -> TagChange:
+        for key in ("add", "remove"):
+            names = getattr(self, key)
+            if len(set(names)) != len(names):
+                raise ValueError(f"{key} has duplicates: {names}")
+        both = sorted(set(self.add) & set(self.remove))
+        if both:
+            raise ValueError(f"a tag cannot be both added and removed at the same step: {both}")
+        return self
+
+    @property
+    def names(self) -> list[str]:
+        return [*self.add, *self.remove]
+
+
+class TagsOn(Strict):
+    """`tracker.tags_on`: tags per step of the runner, on top of the state it moves the ticket to. Nothing by default.
+    Only the runner's own steps are here: a move people make on the board is never seen by the runner."""
+    # Every MR of the task is merged; one closed without merge sets none. Applies whether or not
+    # tracker.states.merged moves the ticket; a ticket a person moved on before the merge is not the runner's then.
+    # A ticket people worked on (a `/review` of their MRs) gets them too when all merged while still in Code Review.
+    merged: TagChange = TagChange()
+    # The answer to a research ticket is posted (each run, `/continue` included).
+    answered: TagChange = TagChange()
+
+
 class TrackerStates(Strict):
     """The tracker's names of the states a task moves through."""
     queued: str
@@ -130,6 +171,7 @@ class IssueTrackerConfig(Strict):
     bot_user: str = Field(min_length=1)  # the bot's login: its own comments are never read as people's
     allowed_users: list[str] = Field(min_length=1)  # tracker logins who may start the agent with the queue tag
     tags: TrackerTags = TrackerTags()
+    tags_on: TagsOn = TagsOn()
     states: TrackerStates
 
     _gone = _refuse_gone("tracker")
@@ -141,6 +183,16 @@ class IssueTrackerConfig(Strict):
             raise ValueError(f"allowed_users must not contain the bot itself ({self.bot_user})")
         if len(set(self.allowed_users)) != len(self.allowed_users):
             raise ValueError("allowed_users has duplicates")
+        return self
+
+    @model_validator(mode="after")
+    def _own_tags(self) -> IssueTrackerConfig:
+        # The runner's own tags drive what it does: the queue tag on a merged ticket would take it again.
+        own = {self.tags.queue, self.tags.needs_input, self.tags.failed, self.tags.research}
+        for step in TagsOn.model_fields:
+            clash = sorted(own & set(getattr(self.tags_on, step).names))
+            if clash:
+                raise ValueError(f"tags_on.{step} must not use the runner's own tags (tracker.tags): {clash}")
         return self
 
 

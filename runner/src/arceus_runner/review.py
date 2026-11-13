@@ -376,9 +376,17 @@ class ReviewLoop:
 
     def _finished(self, task: Task, mrs, closed=()) -> None:
         c = self.cfg.tracker
-        if c.states.merged and self.d.tracker.issue(task.task_id).state in (c.states.code_review,
-                                                                             c.states.in_progress):
-            # Only from where the runner put it: a ticket a person already moved on stays where they put it.
+        # Only from where the runner put it: a ticket a person already moved on (even between two polls, together
+        # with the merge) stays where they put it, untagged.
+        ours = self.d.tracker.issue(task.task_id).state in (c.states.code_review, c.states.in_progress)
+        # tracker.tags_on.merged, with or without a move: a board that keeps merged tickets in Code Review marks
+        # them by a tag. Journaled before the move, so a later poll finds them after the runner's own move too
+        # (the ticket is in states.merged then) and finishes them, as retry_pending() does.
+        keys = [key for key, _ in self.d.tags_on_plan(task, "merged")]
+        if ours and not closed:  # every MR merged: one closed without merge means the work is not all in
+            with self.store.transaction():
+                self.d.journal_tags_on(task, "merged")
+        if c.states.merged and ours:
             # A passing failure raises and the next poll tries again, since the task is not done yet; a board
             # without that state does not keep the task open.
             try:
@@ -386,6 +394,7 @@ class ReviewLoop:
                 self.events.emit("ticket_moved", task_id=task.task_id, state=c.states.merged, reason="merged")
             except (BadRequest, NotFound) as e:
                 self.events.emit("ticket_move_failed", task_id=task.task_id, state=c.states.merged, error=str(e)[:300])
+        self.d.apply_tags_on(task, keys)  # only what was journaled: nothing for a ticket a person moved on
         links = "\n".join(f"- {m.url}" for m in mrs)
         if closed:
             text = ("Every merge request of this task is merged or closed; the runner has stopped following it."

@@ -425,6 +425,18 @@ def check_youtrack(c: YouTrackConfig, yt: YouTrack) -> list[Check]:
         else:
             out.append(Check(f"youtrack.tags.{key}", "fail",
                              f"tag {want!r} does not exist or is not shared with {c.bot_user}"))
+    for step in type(c.tags_on).model_fields:
+        names = getattr(c.tags_on, step).names
+        if not names:
+            continue
+        missing = [n for n in names if n not in tags]
+        if missing:
+            # Only those tags are skipped (event ticket_tag_refused): the tasks themselves end as before.
+            out.append(Check(f"youtrack.tags_on.{step}", "warn",
+                             f"tags {missing} do not exist or are not shared with {c.bot_user}, so they are not "
+                             f"set when a ticket is {step}; create them in YouTrack"))
+        else:
+            out.append(Check(f"youtrack.tags_on.{step}", "ok", ", ".join(names)))
     return out
 
 

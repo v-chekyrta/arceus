@@ -469,6 +469,7 @@ class ReviewAgent:
         taken back, a merge the review did not let through is reported, and the runner lets go of the ticket once no review of it is under way and it has left Code
         Review or none of its merge requests is open."""
         opened = False
+        merged = []
         for m in self.store.task_mrs(task.task_id):
             st = self.host.mr_status(m.project_id, m.iid)
             if st.state != m.state:
@@ -477,16 +478,26 @@ class ReviewAgent:
                 opened = True
                 self.approval_outlived(task, m.project_id, m.iid, st)
             elif st.state == "merged":
+                merged.append(m)
                 self.merged_check(task, m.project_id, m.iid, st)
         if self.store.reviews(*REVIEW_UNDER_WAY, task_id=task.task_id):
             return
         state = self.tracker.issue(task.task_id).state
-        if opened and state == self.cfg.tracker.states.code_review:
+        in_review = state == self.cfg.tracker.states.code_review
+        if opened and in_review:
             return
-        why = "no merge request of it is open" if state == self.cfg.tracker.states.code_review \
-            else f"the ticket is in {state or 'no state'}"
-        self.store.update_task(task.task_id, state="done", reason=why)
+        why = "no merge request of it is open" if in_review else f"the ticket is in {state or 'no state'}"
+        keys = []
+        with self.store.transaction():
+            self.store.update_task(task.task_id, state="done", reason=why)
+            if in_review and merged and len(merged) == len(self.store.task_mrs(task.task_id)):
+                # Every MR merged while the ticket waited in Code Review: tracker.tags_on.merged, as for the agent's
+                # own work (the runner never moves a ticket people worked on). One closed without merge, or a ticket
+                # a person moved on, gets none. The merged MRs tell a later round of the same ticket from this one.
+                keys = self.d.journal_tags_on(task, "merged", "-".join(
+                    f"{key_part(m.project_id)}.{key_part(m.iid)}" for m in sorted(merged, key=lambda m: m.repo)))
         self.events.emit("review_ticket_released", task_id=task.task_id, reason=why)
+        self.d.apply_tags_on(task, keys)
 
     def _people_mrs(self, task: Task, issue: IssueDetails, comments: list[Comment]) -> list[dict]:
         """The merge requests a ticket people worked on links to, kept as its task's; the links that are not

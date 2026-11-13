@@ -20,6 +20,14 @@ tracker:
     needs_input: agent-needs-input
     failed: agent-failed
     research: agent-research           # with the queue tag: answer the question, no MR
+  # Tags the runner adds to / removes from the ticket at its own steps. Optional, nothing by default.
+  # The tags must already exist in YouTrack; the ones in `tags:` above are not allowed here.
+  # tags_on:
+  #   merged:                          # code ticket: every MR merged, none closed (moved to states.merged or not)
+  #     add: [ready for dev]
+  #     remove: [in development]
+  #   answered:                        # research ticket (agent-research): the answer is posted, each /continue too
+  #     add: [answered]
   states:
     queued: To Do
     in_progress: In Progress

@@ -359,6 +359,53 @@ class Delivery:
         self.tracker.add_tag(task.issue_db_id, tag)
         self.store.action_done(key)
 
+    # -- tags at the runner's own steps (tracker.tags_on) -----------------------------------------
+
+    def tags_on_plan(self, task: Task, step: str, occurrence: str = "") -> list[tuple[str, dict]]:
+        """The journal keys and payloads of the tags `tracker.tags_on.<step>` adds and removes, in the configured
+        order. `occurrence` tells apart steps that happen again on the same ticket (a research ticket's runs)."""
+        change = getattr(self.cfg.tracker.tags_on, step)
+        at = f"{step}:{occurrence}" if occurrence else step
+        return [(f"{task.task_id}:tags_on:{at}:{'add' if add else 'remove'}:{key_part(tag)}",
+                 {"tag": tag, "add": add, "step": step})
+                for add, names in ((True, change.add), (False, change.remove)) for tag in names]
+
+    def journal_tags_on(self, task: Task, step: str, occurrence: str = "") -> list[str]:
+        """Record the step's tags; call it inside the transaction of the step itself, so a crash cannot lose them.
+        Returns their keys for apply_tags_on()."""
+        plan = self.tags_on_plan(task, step, occurrence)
+        for key, data in plan:
+            self.store.action_intent(key, task.task_id, "step_tag", json.dumps(data))
+        return [key for key, _ in plan]
+
+    def apply_tags_on(self, task: Task, keys: list[str]) -> None:
+        """Put the journaled step tags on the ticket. A tracker outage leaves them, in order, to retry_pending()."""
+        for key in keys:
+            act = self.store.action(key)
+            if not act or act[0] == "done":
+                continue
+            try:
+                self._step_tag(task, key, json.loads(act[1]))
+            except ServiceError as e:
+                self.events.emit("notify_pending", task_id=task.task_id, action=key, reason=str(e))
+                return
+
+    def _step_tag(self, task: Task, key: str, data: dict) -> None:
+        """One step tag. A tag the tracker does not have or refuses ends it with an event (the health check names
+        it); it never holds the task or the tags after it."""
+        try:
+            if data["add"]:
+                self.tracker.add_tag(task.issue_db_id, data["tag"])
+            else:
+                self.tracker.remove_tag(task.issue_db_id, data["tag"])
+        except (LookupError, BadRequest, NotFound) as e:
+            self.events.emit("ticket_tag_refused", task_id=task.task_id, step=data["step"], tag=data["tag"],
+                             added=data["add"], reason=str(e)[:300])
+            self.store.action_done(key, "refused")
+            return
+        self.store.action_done(key)
+        self.events.emit("ticket_tagged", task_id=task.task_id, step=data["step"], tag=data["tag"], added=data["add"])
+
     def retry_pending(self) -> None:
         """Finish ticket and merge request updates that a failure or a crash left half done. A service that fails
         keeps the rest of its own updates waiting, in their order, for the next tick; the others go on."""
@@ -378,6 +425,8 @@ class Delivery:
                 elif kind == "untag":
                     self.tracker.remove_tag(task.issue_db_id, data["tag"])
                     self.store.action_done(key)
+                elif kind == "step_tag":
+                    self._step_tag(task, key, data)
                 elif kind == "state":
                     if task.state in data.get("while", [task.state]):  # never move a ticket back past a later step
                         self.tracker.set_state(task.issue_db_id, data["state"])
@@ -1216,6 +1265,7 @@ class Delivery:
             if answered:
                 self.store.action_intent(f"{task.task_id}:state:answered:{run}", task.task_id, "state",
                                          json.dumps({"state": answered, "while": ["done"]}))
+            self.journal_tags_on(task, "answered", str(run))
         self.events.emit("task_done", task_id=task.task_id, kind=task.kind, reviewed=reviewed, run=run,
                          comments=len(pieces), answer_chars=len(text), unpublished_commits=unpublished or None)
         self.retry_pending()
