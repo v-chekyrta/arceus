@@ -94,8 +94,9 @@ def run_online_checks(cfg: Config, secrets: Secrets) -> list[Check]:
     finally:
         tracker.client.close()
         host.client.close()
-        if getattr(host, "approver_client", None):
-            host.approver_client.close()
+        for extra in ("approver_client", "reactions_client"):
+            if getattr(host, extra, None):
+                getattr(host, extra).close()
     return results
 
 

@@ -1542,3 +1542,185 @@ def test_a_long_explanation_without_code_changes_reaches_the_thread_and_the_tick
     assert "The last reason matters most." in reply
     [note] = [c["text"] for c in w.yt.comments["2-1"] if "did not change the code" in c["text"]]
     assert "The last reason matters most." in note and "…" not in note
+
+
+# -- the bot's 👀 on a request in its merge request ------------------------------------------------
+
+def eyes(w: World, note: int) -> list[str]:
+    """Who put 👀 on this MR note."""
+    return [a["user"]["username"] for a in w.gl.awards.get(note, []) if a["name"] == "eyes"]
+
+
+def award_posts(w: World) -> list:
+    return [r for r in w.gl.requests if r.method == "POST" and r.url.path.endswith("/award_emoji")]
+
+
+def test_a_request_in_the_mr_gets_the_bots_eyes_once_before_the_fix(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    top = w.gl._note
+    w.gl.note(1, "reviewer", "@acme-agent-bot This should be a constant", path="app/login.py", line=12)
+    inline = w.gl._note
+    old = w.gl.note(1, "reviewer", "Not sure about this name")
+    w.gl.note(1, "anna", "Looks fine to me")                               # no mention: people talking
+    chat = w.gl._note
+    w.gl.note(1, w.gl.username, "@acme-agent-bot noted")                   # the bot's own
+    own = w.gl._note
+    w.gl.note(1, "reviewer", "mentioned in @acme-agent-bot", system=True)  # GitLab's own
+    system = w.gl._note
+    w.tick()
+    assert sends(w) == []                                                  # still inside review_debounce
+    assert eyes(w, top) == eyes(w, inline) == [w.gl.username]
+    assert eyes(w, chat) == eyes(w, own) == eyes(w, system) == []
+    w.gl.note(1, "reviewer", "@acme-agent-bot and rename the old one too", discussion=old)  # a late reply
+    late = w.gl._note
+    later(w)
+    later(w)
+    assert eyes(w, late) == [w.gl.username] and eyes(w, w.gl._note - 3) == []  # the thread's first note: none
+    assert len(award_posts(w)) == 3                                        # one each, however many polls
+    assert w.yt.reactions == {}                                            # the ticket's comments are not touched
+    assert len(sends(w)) == 1 and not [a for a in w.store.pending_actions() if a[2] == "mr_react"]
+
+
+def test_someone_elses_eyes_do_not_stand_in_for_the_bots(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    w.gl.awards[w.gl._note] = [{"id": 1, "name": "eyes", "user": {"username": "anna"}}]
+    w.tick()
+    assert eyes(w, w.gl._note) == ["anna", w.gl.username]
+
+
+def test_a_crash_after_the_reaction_does_not_put_it_there_twice(w, monkeypatch):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    real_done = w.store.action_done
+
+    def die_on_react(key, result=None):
+        if ":mr_react:" in key:
+            raise RuntimeError("killed right after the reaction was posted")
+        return real_done(key, result)
+
+    monkeypatch.setattr(w.store, "action_done", die_on_react)
+    with pytest.raises(RuntimeError, match="killed"):
+        w.tick()
+    monkeypatch.setattr(w.store, "action_done", real_done)
+    w.restart()
+    w.clock.advance(3600)
+    w.tick()
+    assert eyes(w, w.gl._note) == [w.gl.username] and len(award_posts(w)) == 1
+    assert not [a for a in w.store.pending_actions() if a[2] == "mr_react"]
+    later(w)
+    assert len(sends(w)) == 1                                              # the request itself went on
+
+
+def test_a_request_and_its_reaction_are_recorded_together(w, monkeypatch):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    real_intent = w.store.action_intent
+
+    def die_on_react(key, *args):
+        if ":mr_react:" in key:
+            raise RuntimeError("killed between the request and its reaction")
+        return real_intent(key, *args)
+
+    monkeypatch.setattr(w.store, "action_intent", die_on_react)
+    with pytest.raises(RuntimeError, match="killed"):
+        w.tick()
+    assert w.store.signals("ACME-1", unbatched=True) == []                 # neither of them, not half
+    monkeypatch.setattr(w.store, "action_intent", real_intent)
+    w.restart()
+    w.clock.advance(3600)
+    w.tick()
+    assert eyes(w, w.gl._note) == [w.gl.username] and len(w.store.signals("ACME-1", unbatched=True)) == 1
+
+
+def test_a_reaction_lost_to_a_gitlab_outage_keeps_the_ticket_updates_moving(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    note = w.gl._note
+    w.gl.refuse_awards = 503
+    w.tick()
+    assert eyes(w, note) == [] and w.events_named("notify_pending")
+    # A ticket update journaled after it: GitLab being unwell does not hold YouTrack's updates back.
+    w.store.action_intent("ACME-1:tag:later", "ACME-1", "tag", json.dumps({"tag": "agent-needs-input"}))
+    w.runner.delivery.retry_pending()
+    assert "agent-needs-input" in w.yt.issue_tags["2-1"]
+    assert [a[2] for a in w.store.pending_actions() if a[1] == "ACME-1"] == ["mr_react"]
+    assert w.runner.code_host.client.available()                           # the rest of GitLab is not paused
+    w.gl.refuse_awards = None
+    later(w)
+    later(w)                                                               # past the reactions' backoff
+    assert eyes(w, note) == [w.gl.username] and len(award_posts(w)) == 1 and len(sends(w)) == 1
+
+
+def test_a_reaction_gitlab_refuses_ends_with_an_event_and_the_request_goes_on(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    w.gl.refuse_awards = 404                                               # the note was deleted meanwhile
+    w.tick()
+    [refused] = w.events_named("reaction_refused")
+    assert refused["note"] == w.gl._note and refused["repo"] == "acme-platform"
+    assert not [a for a in w.store.pending_actions() if a[2] == "mr_react"]
+    w.gl.refuse_awards = None
+    later(w)
+    later(w)
+    assert len(sends(w)) == 1 and len(award_posts(w)) == 0
+
+
+def test_requests_seen_before_reactions_existed_get_none(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    mr = w.store.task_mrs("ACME-1")[0]
+    w.store.add_signal(f"note-{mr.project_id}-{w.gl._note}", "ACME-1", "review", "reviewer", "earlier", NOW.isoformat(),
+                       repo=mr.repo, discussion_id=w.gl.discussions[1][-1]["id"])
+    later(w)
+    assert eyes(w, w.gl._note) == [] and award_posts(w) == []
+
+
+def test_a_code_host_without_reactions_reviews_as_before(w, monkeypatch):
+    from arceus_runner.gitlab import GitLabHost
+    monkeypatch.delattr(GitLabHost, "react_note")
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    w.tick()
+    later(w)
+    assert len(sends(w)) == 1 and award_posts(w) == []
+    assert not [a for a in w.store.pending_actions() if a[2] == "mr_react"]
+
+
+@pytest.mark.parametrize("status", [403, 503])
+def test_reactions_gitlab_keeps_refusing_hold_back_neither_the_request_nor_other_mrs(w, status):
+    platform, _ = two_mrs(w)
+    w.gl.refuse_awards = status                                            # for good: a locked thread, an outage
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    w.tick()
+    assert w.runner.code_host.client.available()                           # only reactions are paused
+    assert "award_emoji" in w.runner.code_host.reactions_client.state.last_error
+    assert w.runner.code_host.client.state.last_error is None
+    w.gl.note(2, "reviewer", "@acme-agent-bot And the theme's colour too")  # the other MR is still read
+    w.tick()
+    assert [e["repo"] for e in w.events_named("review_signal")] == ["acme-platform", "acme-theme"]
+    later(w)
+    [send] = sends(w)                                                      # after debounce, without the reaction
+    assert "Please rename this function" in send["argv"][-1] and "theme's colour" in send["argv"][-1]
+    assert w.gl.awards == {} and len([a for a in w.store.pending_actions() if a[2] == "mr_react"]) == 2
+
+
+def test_a_reaction_journaled_before_a_restart_is_put_there_after_it_and_the_request_goes_once(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot This should be a constant", path="app/login.py", line=12)
+    note = w.gl._note
+    w.gl.refuse_awards = 503                               # GitLab cannot take it at the moment the request is seen
+    w.tick()
+    assert eyes(w, note) == [] and [a[2] for a in w.store.pending_actions()] == ["mr_react"]
+    w.restart()                                            # the runner stops with the reaction still journaled
+    w.gl.refuse_awards = None
+    w.clock.advance(3600)
+    w.tick()
+    assert eyes(w, note) == [w.gl.username] and len(award_posts(w)) == 1
+    assert sends(w) == []                                  # the request still waits for review_debounce
+    later(w)
+    later(w)
+    [send] = sends(w)                                      # once, with where the person wrote it
+    assert "This should be a constant" in send["argv"][-1] and "app/login.py:12" in send["argv"][-1]
+    assert len(award_posts(w)) == 1 and not w.store.pending_actions()

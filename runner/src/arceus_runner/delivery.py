@@ -63,6 +63,9 @@ STALLED_NUDGE = ("Your previous session stopped at its prompt without finishing 
 RESUME = "The session was interrupted (a reboot or a crash). Continue the task from where you stopped."
 PREPARED_MARK = "arceus-prepared"
 CONTINUE = "/continue"  # a comment that starts with this, from someone allowed, resumes a failed task (_continuable)
+# Which client a journaled action goes through: one that fails holds back only its own actions (retry_pending).
+# Reactions have their own client on the code host (GitLabHost.reactions_client); the rest go to the tracker.
+ACTION_CLIENTS = {"reply": "code_host", "mr_react": "reactions"}
 TAKEN = "eyes"  # the reaction on a command the runner took: the person sees it was seen and will be done
 HOME_IGNORE = """\
 # Every folder here is a repository of the project's group on its code host, cloned by the Arceus runner.
@@ -307,6 +310,28 @@ class Delivery:
         self.store.action_intent(f"{task.task_id}:react:{key_part(comment_id, keep_dash=True)}", task.task_id,
                                  "react", json.dumps({"comment": comment_id, "reaction": TAKEN}))
 
+    def mr_taken(self, task: Task, mr, note_id) -> tuple[str, dict] | None:
+        """The same for a request in a thread of one of the task's merge requests: a reaction on that note, by the
+        bot. Journaled with the signal (call it inside that transaction); react_mr() puts it there. Returns the
+        journal key and what it holds, or None when the code host has no reactions."""
+        if not getattr(self.host, "react_note", None):
+            return None
+        key = f"{task.task_id}:mr_react:{key_part(mr.project_id)}-{key_part(note_id)}"
+        data = {"repo": mr.repo, "project": mr.project_id, "iid": mr.iid, "note": note_id, "reaction": TAKEN}
+        self.store.action_intent(key, task.task_id, "mr_react", json.dumps(data))
+        return key, data
+
+    def react_mr(self, task_id: str, key: str, data: dict) -> None:
+        """Put a journaled reaction on its merge request note. A note that is gone or a reaction the host refuses
+        ends it with an event; an outage raises and leaves it for retry_pending()."""
+        if react := getattr(self.host, "react_note", None):
+            try:
+                react(data["project"], data["iid"], data["note"], data["reaction"])
+            except (NotFound, BadRequest) as e:
+                self.events.emit("reaction_refused", task_id=task_id, repo=data.get("repo"), note=data["note"],
+                                 reason=str(e))
+        self.store.action_done(key)
+
     # -- comments: once per (task, kind), even across a crash -----------------------------------
 
     def comment_once(self, task: Task, kind: str, text: str) -> tuple[str, int] | None:
@@ -335,10 +360,13 @@ class Delivery:
         self.store.action_done(key)
 
     def retry_pending(self) -> None:
-        """Finish ticket updates that a failure or a crash left half done."""
+        """Finish ticket and merge request updates that a failure or a crash left half done. A service that fails
+        keeps the rest of its own updates waiting, in their order, for the next tick; the others go on."""
+        unwell: set[str] = set()
         for key, task_id, kind, payload in self.store.pending_actions():
+            side = ACTION_CLIENTS.get(kind, "tracker")
             task = self.store.task(task_id)
-            if not task or not payload:
+            if not task or not payload or side in unwell:
                 continue
             data = json.loads(payload)
             try:
@@ -364,9 +392,11 @@ class Delivery:
                             self.events.emit("reaction_refused", task_id=task_id, comment=data["comment"],
                                              reason=str(e))
                     self.store.action_done(key)
+                elif kind == "mr_react":
+                    self.react_mr(task_id, key, data)
             except ServiceError as e:
                 self.events.emit("notify_pending", task_id=task_id, action=key, reason=str(e))
-                return  # the tracker is still unwell; the next tick tries again
+                unwell.add(side)  # still unwell; the next tick tries again
 
     # -- taking a task --------------------------------------------------------------------------
 

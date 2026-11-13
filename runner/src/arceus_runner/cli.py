@@ -218,6 +218,8 @@ def cmd_rebind(args) -> int:
         try:
             adapter = build_tracker(cfg, secrets) if args.role == "tracker" else build_code_host(cfg, secrets)
             adapter.client.close()
+            if getattr(adapter, "reactions_client", None):
+                adapter.reactions_client.close()
             was = store.rebind_integration(args.role, adapter.identity())
         finally:
             store.close()

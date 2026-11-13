@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from urllib.parse import quote, urlsplit
 
@@ -17,7 +18,7 @@ from pydantic import Field, field_validator
 from arceus_runner.checks import Check, Status
 from arceus_runner.config import CodeHostConfig, HttpConfig, _url
 from arceus_runner.gitops import GitAuth
-from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError
+from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError, ServiceState
 from arceus_runner.integrations import (
     Approval,
     CIJob,
@@ -197,6 +198,15 @@ class GitLabReview(GitLabWriter):
                                       f"{discussion_id}/notes", json={"body": body})
         return resp.json()["id"]
 
+    def award_note(self, project_id: int, iid: int, note_id: int, name: str, user: str) -> None:
+        """Put the emoji `name` on one note of the MR as this client's account, unless `user` already put it there:
+        after a crash between the POST and the journal's `done`, the retry finds it and posts nothing (GitLab would
+        answer a second one with 404). Someone else's same emoji does not count."""
+        path = f"/api/v4/projects/{project_id}/merge_requests/{iid}/notes/{note_id}/award_emoji"
+        if any(a.get("name") == name and (a.get("user") or {}).get("username") == user for a in self.paged(path)):
+            return
+        self.c.request("POST", path, json={"name": name})
+
     def description(self, project_id: int, iid: int) -> str:
         return self.c.get_json(f"/api/v4/projects/{project_id}/merge_requests/{iid}").get("description") or ""
 
@@ -269,6 +279,11 @@ class GitLabHost:
         self.cfg = cfg
         self.client = client
         self.api = GitLabReview(client)
+        # Reactions go through a client of their own: the bot's token and address, but its own failures and backoff.
+        # A reaction GitLab refuses (403 on a locked thread) or cannot take right now pauses reactions only, never
+        # the reading of merge requests and the replies that the request itself depends on.
+        self.reactions_client = replace(client, name=f"{client.name}-reactions", state=ServiceState())
+        self.reactions_api = GitLabReview(self.reactions_client)
         self.scope = cfg.group
         self._token = token
         self._mention = mentions(cfg.bot_user)
@@ -335,6 +350,10 @@ class GitLabHost:
 
     def reply(self, repo_id: Id, iid: Id, discussion_id: str, body: str) -> None:
         self.api.reply(repo_id, iid, discussion_id, body)
+
+    def react_note(self, repo_id: Id, iid: Id, note_id: Id, reaction: str) -> None:
+        # Always the bot's own client: the reaction says the author of the MR took the request, not the approver.
+        self.reactions_api.award_note(repo_id, iid, note_id, reaction, self.cfg.bot_user)
 
     def description(self, repo_id: Id, iid: Id) -> str:
         return self.api.description(repo_id, iid)

@@ -1720,3 +1720,16 @@ def test_a_judged_merge_request_closed_after_the_ticket_was_let_go_is_no_longer_
     later(w)
     assert _merged_notes(w, db_id) == []
     assert not [r for r in w.gl.requests[calls:] if r.url.path.endswith("/merge_requests/5")]
+
+
+def test_a_request_in_the_bots_mr_gets_the_bots_eyes_not_the_approvers(w):
+    publish(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function")
+    asked = w.gl._note
+    w.gl.note(1, APPROVER["user"], "Found nothing to fix, @acme-agent-bot\n\n<!-- arceus:review -->")  # its own
+    review_note = w.gl._note
+    w.gl.note(1, "reviewer", f"@acme-agent-bot {w.cfg.review_agent.command}")  # the review command
+    command = w.gl._note
+    w.tick()
+    assert [a["user"]["username"] for a in w.gl.awards[asked]] == [w.gl.username]
+    assert w.gl.awards.get(review_note, []) == [] and w.gl.awards.get(command, []) == []

@@ -227,10 +227,18 @@ class ReviewLoop:
                 continue  # the code review command: started from the ticket, and never a change request
             where = f" ({n.path}:{n.line})" if n.path else ""
             text = f"{n.author} in {mr.repo}{where}: {n.body.strip()}\n{n.url}"
-            if self.store.add_signal(_note_signal(mr, n.id), task.task_id, "review", n.author, text, now,
-                                     repo=mr.repo, discussion_id=n.discussion_id):
-                self.events.emit("review_signal", task_id=task.task_id, kind="review", author=n.author,
-                                 repo=mr.repo, url=n.url)
+            with self.store.transaction():  # the request and its reaction are recorded together or not at all
+                if not self.store.add_signal(_note_signal(mr, n.id), task.task_id, "review", n.author, text, now,
+                                             repo=mr.repo, discussion_id=n.discussion_id):
+                    continue
+                react = self.d.mr_taken(task, mr, n.id)
+            self.events.emit("review_signal", task_id=task.task_id, kind="review", author=n.author,
+                             repo=mr.repo, url=n.url)
+            if react:  # now, so the person sees it was taken while the follow-up still waits for quiet
+                try:
+                    self.d.react_mr(task.task_id, *react)
+                except ServiceError as e:
+                    self.events.emit("notify_pending", task_id=task.task_id, action=react[0], reason=str(e))
 
     def _pipeline(self, task: Task, mr, st: MRStatus, now: str) -> None:
         if st.ci_sha != mr.published_sha or st.ci_id is None:

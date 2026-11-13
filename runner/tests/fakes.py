@@ -202,6 +202,8 @@ class FakeGitLab:
         self._note = 1000
         self.tokens: dict[str, str] = {}  # token → username, for a second account (the approver); else the bot
         self.refuse_approval: int | None = None  # the status an approval gets, as for an account without rights
+        self.awards: dict[int, list[dict]] = {}  # note id -> emoji reactions as GitLab lists them
+        self.refuse_awards: int | None = None     # the status every emoji reaction call gets, as in an outage
 
     def mr(self, iid: int) -> dict:
         return next(m for m in self.mrs if m["iid"] == iid)
@@ -284,6 +286,22 @@ class FakeGitLab:
             if tail == ["discussions"]:
                 page = int(request.url.params.get("page", 1))
                 return json_response(self.discussions.get(iid, []) if page == 1 else [], headers={"x-next-page": ""})
+            if len(tail) == 3 and tail[0] == "notes" and tail[2] == "award_emoji":
+                if self.refuse_awards:
+                    return json_response({"message": f"{self.refuse_awards}"}, self.refuse_awards)
+                note = int(tail[1])
+                if not any(n["id"] == note for d in self.discussions.get(iid, []) for n in d["notes"]):
+                    return json_response({"message": "404 Note Not Found"}, 404)
+                awards = self.awards.setdefault(note, [])
+                if request.method == "GET":
+                    page = int(request.url.params.get("page", 1))
+                    return json_response(awards if page == 1 else [], headers={"x-next-page": ""})
+                who = self.tokens.get(request.headers.get("private-token"), self.username)
+                name = json.loads(request.content)["name"]
+                if any(a["name"] == name and a["user"]["username"] == who for a in awards):
+                    return json_response({"message": "404 Award Emoji Name has already been taken"}, 404)
+                awards.append({"id": len(awards) + 1, "name": name, "user": {"username": who}})
+                return json_response(awards[-1], 201)
             if len(tail) == 3 and tail[0] == "discussions" and tail[2] == "notes":
                 body = json.loads(request.content)["body"]
                 self.note(iid, self.username, body, discussion=tail[1])

@@ -50,6 +50,8 @@ def providers(cfg: Config, secrets: Secrets, fake_tracker, fake_host, clock=None
     host = build_code_host(cfg, secrets, transport=httpx.MockTransport(fake_host))
     if clock is not None:
         tracker.client.clock = host.client.clock = clock
+        if getattr(host, "reactions_client", None):
+            host.reactions_client.clock = clock
     return tracker, host
 
 

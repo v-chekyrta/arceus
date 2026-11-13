@@ -305,6 +305,8 @@ class CodeHost(Protocol):
       agent then says what it found in a note and approves nothing.
     - Merge requests people opened: mr_link and mr_head_ref; without them the review agent reviews only the
       merge requests the runner opened itself.
+    - Reactions: react_note; without it a request in a merge request thread gets no reaction, only the reply that
+      follows it.
     - Comparing diffs: same_change; without it a merge at another commit than the reviewed one is reported as
       a merge of commits nobody reviewed, also when it was only rebased.
     """
@@ -348,6 +350,10 @@ class CodeHost(Protocol):
 
     def reply(self, repo_id: Id, iid: Id, discussion_id: str, body: str) -> None:
         """Answer in the thread as the bot."""
+
+    def react_note(self, repo_id: Id, iid: Id, note_id: Id, reaction: str) -> None:
+        """Put the bot's reaction on one note of the merge request, once: a second call for the same one changes
+        nothing, and another person's same reaction does not count as the bot's. Optional (see above)."""
 
     def description(self, repo_id: Id, iid: Id) -> str: ...
 

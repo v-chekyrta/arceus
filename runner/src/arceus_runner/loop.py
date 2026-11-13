@@ -454,8 +454,9 @@ def run(cfg: Config, secrets: Secrets, once: bool = False, config_sha: str | Non
         stack.callback(tracker.client.close)
         host = build_code_host(cfg, secrets)
         stack.callback(host.client.close)
-        if getattr(host, "approver_client", None):
-            stack.callback(host.approver_client.close)
+        for extra in ("approver_client", "reactions_client"):
+            if getattr(host, extra, None):
+                stack.callback(getattr(host, extra).close)
         bind_integrations(store, tracker, host)
         engine = git = classify = None
         if cfg.mode == "live":
