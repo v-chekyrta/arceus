@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from arceus_runner import media, qa_report
@@ -32,13 +33,9 @@ FINDINGS = "findings.json"
 RESUME = "The session was interrupted (a reboot or a crash). Continue testing from where you stopped."
 OUTCOMES = ("passed", "partial", "found", "blocked", "unfinished", "stopped")
 
-MAX_FILE_BYTES = 2 * 1024 * 1024  # findings.json
-MAX_FINDINGS = 100
-MAX_TESTED = 200
 MAX_STEPS = 30
 MAX_EVIDENCE = 10                 # files per finding
-MAX_FILES = 200                   # files per run
-MAX_MEDIA_BYTES = 300 * 1024 * 1024
+NAMED = 10                        # what was left out, named one by one before "and N more"
 SEVERITIES = ("critical", "major", "minor")
 RESULTS = ("ok", "problem", "blocked", "skipped")
 
@@ -62,7 +59,28 @@ SCHEMA_EXAMPLE = """\
                "code": [{"repo": "web", "file": "web/views/checkout.py", "line": 88}]}]}"""
 
 
-def load_findings(folder: Path, dest: Path) -> tuple[dict, list[str]]:
+@dataclass(frozen=True)
+class Limits:
+    """How much of the agent's report a run keeps (`qa.max_*`). The defaults are the config's."""
+    checks: int = 1000
+    findings: int = 300
+    files: int = 1000
+    report_bytes: int = 8 * 1024 * 1024
+    media_bytes: int = 1024 * 1024 * 1024
+
+    @classmethod
+    def of(cls, c) -> Limits:
+        return cls(checks=c.max_checks, findings=c.max_findings, files=c.max_files,
+                   report_bytes=c.max_report_mb * 1024 * 1024, media_bytes=c.max_media_mb * 1024 * 1024)
+
+
+def _left_out(names: list[str]) -> str:
+    """The names of what was left out, the first few of them, quoted."""
+    shown = ", ".join(f"\u201c{n}\u201d" for n in names[:NAMED])
+    return shown + (f" and {len(names) - NAMED} more" if len(names) > NAMED else "")
+
+
+def load_findings(folder: Path, dest: Path, limits: Limits = Limits()) -> tuple[dict, list[str]]:
     """What the agent reported, as the runner may show it, and one line per thing left out. The evidence it names
     is checked (a plain file of the folder, a real image or video, within the limits) and copied into `dest`; only
     copied files are named in what comes back.
@@ -70,17 +88,19 @@ def load_findings(folder: Path, dest: Path) -> tuple[dict, list[str]]:
     The folder is the agent's, so everything is read defensively: a file shaped in a way nobody foresaw is no
     report, never an error that would keep the workspace held."""
     try:
-        return _load_findings(folder, dest)
+        return _load_findings(folder, dest, limits)
     except (TypeError, AttributeError, ValueError, OSError) as e:
         return {}, [f"the findings file could not be read ({type(e).__name__})"]
 
 
-def _load_findings(folder: Path, dest: Path) -> tuple[dict, list[str]]:
+def _load_findings(folder: Path, dest: Path, limits: Limits) -> tuple[dict, list[str]]:
     path = folder / FINDINGS
     if folder.is_symlink() or not path.is_file() or path.is_symlink():
         return {}, ["the agent wrote no findings file"]
-    if path.stat().st_size > MAX_FILE_BYTES:
-        return {}, [f"the findings file is larger than {MAX_FILE_BYTES // 1024} KB"]
+    size = path.stat().st_size
+    if size > limits.report_bytes:
+        return {}, [f"the findings file is {size // 1024} KB, more than the {limits.report_bytes // 1024} KB a run "
+                    "keeps (qa.max_report_mb), so none of it is shown"]
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
@@ -96,15 +116,17 @@ def _load_findings(folder: Path, dest: Path) -> tuple[dict, list[str]]:
             continue
         result = t.get("result") if t.get("result") in RESULTS else "skipped"
         tested.append({"what": what, "result": result, "note": clean_text(t.get("note"), 600)})
-    if len(tested) > MAX_TESTED:
-        problems.append(f"`tested` lists more than {MAX_TESTED} checks; the rest are left out")
-        tested = tested[:MAX_TESTED]
-    evidence = _Evidence(folder, dest)
+    if len(tested) > limits.checks:
+        dropped = [t["what"] for t in tested[limits.checks:]]
+        problems.append(f"`tested` lists {len(tested)} checks; a run keeps {limits.checks} (qa.max_checks), so "
+                        f"{len(dropped)} are left out: {_left_out(dropped)}")
+        tested = tested[:limits.checks]
+    evidence = _Evidence(folder, dest, limits)
     findings = []
     raw = data.get("findings") if isinstance(data.get("findings"), list) else []
     if data.get("findings") is not None and not isinstance(data.get("findings"), list):
         problems.append("`findings` is not a list, so what the agent found there is not known")
-    for i, f in enumerate(raw[:MAX_FINDINGS], 1):
+    for i, f in enumerate(raw[:limits.findings], 1):
         title = clean_text(f.get("title"), 200) if isinstance(f, dict) else ""
         if not title:
             problems.append(f"finding {i} has no readable title")
@@ -142,8 +164,10 @@ def _load_findings(folder: Path, dest: Path) -> tuple[dict, list[str]]:
             "cause": clean_text(f.get("cause"), 2000),
             "code": code,
         })
-    if len(raw) > MAX_FINDINGS:
-        problems.append(f"more than {MAX_FINDINGS} findings; the rest are left out")
+    if len(raw) > limits.findings:
+        dropped = [clean_text(f.get("title"), 200) if isinstance(f, dict) else "" for f in raw[limits.findings:]]
+        problems.append(f"the report has {len(raw)} findings; a run keeps {limits.findings} (qa.max_findings), so "
+                        f"{len(dropped)} are left out: {_left_out([t or '(no title)' for t in dropped])}")
     return {"summary": clean_text(data.get("summary"), 1500), "blocked": clean_text(data.get("blocked"), 1500),
             "tested": tested, "findings": findings}, list(dict.fromkeys(problems))
 
@@ -152,8 +176,8 @@ class _Evidence:
     """The run's screenshots and recordings: each checked as media.py checks a task's, then copied out of the
     agent's folder. A file named twice is copied once."""
 
-    def __init__(self, folder: Path, dest: Path):
-        self.folder, self.root, self.dest = folder, folder.resolve(), dest
+    def __init__(self, folder: Path, dest: Path, limits: Limits):
+        self.folder, self.root, self.dest, self.limits = folder, folder.resolve(), dest, limits
         self.taken: dict[str, str] = {}
         self.total = 0
 
@@ -168,16 +192,16 @@ class _Evidence:
         if ext not in media.TYPES:
             problems.append(f"{name}: only {', '.join(sorted(media.TYPES))} are shown")
             return None
-        if len(self.taken) >= MAX_FILES:
-            problems.append(f"{name}: more than {MAX_FILES} files in the run")
+        if len(self.taken) >= self.limits.files:
+            problems.append(f"{name}: left out, a run keeps {self.limits.files} files (qa.max_files)")
             return None
         if path.is_symlink() or not path.is_file() or path.resolve().parent != self.root:
             problems.append(f"{name}: no such regular file")
             return None
         size = path.stat().st_size
-        if size > media.MAX_FILE_BYTES or self.total + size > MAX_MEDIA_BYTES:
+        if size > media.MAX_FILE_BYTES or self.total + size > self.limits.media_bytes:
             problems.append(f"{name}: too large ({size // (1024 * 1024)} MB; {media.MAX_FILE_BYTES // (1024 * 1024)} "
-                            f"MB a file, {MAX_MEDIA_BYTES // (1024 * 1024)} MB in all)")
+                            f"MB a file, {self.limits.media_bytes // (1024 * 1024)} MB in all, qa.max_media_mb)")
             return None
         try:
             data = media._read_plain(path, media.MAX_FILE_BYTES)
@@ -205,9 +229,9 @@ def outcome_of(found: dict, problems: list[str], fatal: list[str], stopped: bool
     """The run as a whole, and why it is not a clean result when that is not obvious from the rest.
 
     "passed" only for a run that finished, found nothing, read whole, and checked at least one thing that worked
-    with nothing it could not check; a run that checked some and could not check others is "partial". What could
-    not be checked, a check marked as a problem with no finding to say what, or a report the runner could not read
-    whole is never "No problems found"."""
+    with nothing it could not check or skipped; a run that checked some and could not check or skipped others is
+    "partial". What could not be checked, what was skipped, a check marked as a problem with no finding to say what,
+    or a report the runner could not read whole is never "No problems found"."""
     if stopped:
         return "stopped", []
     if fatal:
@@ -227,7 +251,7 @@ def outcome_of(found: dict, problems: list[str], fatal: list[str], stopped: bool
         if "blocked" in results:
             return "blocked", ["none of the checks could be done"]
         return "unfinished", ["every check was skipped: nothing was tested"]
-    if "blocked" in results:
+    if "blocked" in results or "skipped" in results:
         return "partial", []
     return "passed", []
 
@@ -245,7 +269,7 @@ class QaAgent(WorkspaceRun):
         return {"summary": "", "blocked": "", "tested": [], "findings": []}
 
     def _read(self, run: AgentRun) -> tuple[dict, list[str]]:
-        return load_findings(self.out_dir(run), self.run_dir(run) / "media")
+        return load_findings(self.out_dir(run), self.run_dir(run) / "media", Limits.of(self.c))
 
     def _outcome(self, run: AgentRun, found: dict, problems: list[str], fatal: list[str],
                  stopped: bool) -> tuple[str, list[str]]:
@@ -330,6 +354,10 @@ class QaAgent(WorkspaceRun):
                   "- `blocked`: empty, or why you could not test at all.",
                   "- `tested`: each thing you checked, with `result` \"ok\", \"problem\", \"blocked\" or \"skipped\" "
                   "and a `note` where it helps.",
+                  f"- The report keeps at most {self.c.max_checks} entries of `tested`, {self.c.max_findings} "
+                  f"findings and {self.c.max_files} screenshots and recordings; whatever goes past is left out. "
+                  "When the instructions need more checks than that, still test them all, and make one entry of "
+                  "closely related checks with the same result, its `note` naming each check it holds.",
                   "- `findings`: one per problem. `severity` is \"critical\" (a main path is broken or data is at "
                   "risk), \"major\" (a feature does not work) or \"minor\" (cosmetic, a workaround exists). `steps` "
                   "start from a state anyone can reach (a URL, an account); `failed_step` is the step where it goes "

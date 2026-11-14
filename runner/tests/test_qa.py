@@ -12,10 +12,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from arceus_runner import qa_report
-from arceus_runner.config import Secrets
+from arceus_runner.config import QaConfig, Secrets
 from arceus_runner.metrics import Metrics
 from arceus_runner.cli import qa_check
-from arceus_runner.qa import load_findings, outcome_of
+from arceus_runner.qa import Limits, load_findings, outcome_of
 
 from .conftest import GL_TOKEN, YT_TOKEN
 from .test_delivery import World, git, take
@@ -327,9 +327,53 @@ def test_findings_are_read_defensively(tmp_path):
     assert any("../secret.png" in p for p in problems) and any("finding 2" in p for p in problems)
 
 
+def test_what_goes_past_the_limits_is_left_out_by_count_and_by_name(tmp_path):
+    folder, dest = tmp_path / "out", tmp_path / "dest"
+    folder.mkdir()
+    for i in range(3):
+        (folder / f"s{i}.png").write_bytes(PNG + bytes([i]))
+    (folder / "findings.json").write_text(json.dumps({
+        "tested": [{"what": f"Check {i}", "result": "ok"} for i in range(15)],
+        "findings": [{"title": f"Bug {i}", "evidence": [{"file": f"s{i}.png"}]} for i in range(3)]}))
+    data, problems = load_findings(folder, dest, Limits(checks=3, findings=2, files=1))
+    assert [t["what"] for t in data["tested"]] == ["Check 0", "Check 1", "Check 2"]
+    assert [f["title"] for f in data["findings"]] == ["Bug 0", "Bug 1"]
+    assert [len(f["evidence"]) for f in data["findings"]] == [1, 0]
+    [checks] = [p for p in problems if "qa.max_checks" in p]
+    assert "lists 15 checks" in checks and "12 are left out" in checks
+    assert "\u201cCheck 3\u201d" in checks and "Check 12" in checks and "Check 13" not in checks and "2 more" in checks
+    [findings] = [p for p in problems if "qa.max_findings" in p]
+    assert "has 3 findings" in findings and "\u201cBug 2\u201d" in findings
+    assert any("s1.png" in p and "qa.max_files" in p for p in problems)
+    # The truncated report is not read as whole: never "No problems found".
+    assert outcome_of({**data, "findings": []}, problems, [], False)[0] == "unfinished"
+
+
+def test_a_findings_file_past_its_size_is_not_read(tmp_path):
+    folder = tmp_path / "out"
+    folder.mkdir()
+    (folder / "findings.json").write_text(json.dumps({"summary": "x" * 3000}))
+    data, [problem] = load_findings(folder, tmp_path / "dest", Limits(report_bytes=1024))
+    assert data == {} and "qa.max_report_mb" in problem
+
+
+def test_the_limits_come_from_the_config_and_the_agent_is_told_them(tmp_path):
+    assert Limits.of(QaConfig()) == Limits()
+    w = world(tmp_path, max_checks=1500, max_findings=400, max_files=50, max_report_mb=16, max_media_mb=2048)
+    try:
+        assert Limits.of(w.cfg.qa) == Limits(checks=1500, findings=400, files=50, report_bytes=16 * 1024 * 1024,
+                                             media_bytes=2048 * 1024 * 1024)
+        queue(w)
+        [call] = dispatches(w)
+        assert "at most 1500 entries of `tested`, 400 findings and 50 screenshots" in call["argv"][-1]
+    finally:
+        w.events.close()
+        w.store.close()
+
+
 @pytest.mark.parametrize("tested, problems, outcome, doubt", [
     (["ok"], [], "passed", None),
-    (["ok", "skipped"], [], "passed", None),
+    (["ok", "skipped"], [], "partial", None),
     (["ok", "blocked"], [], "partial", None),
     ([], [], "unfinished", "did not say what it tested"),
     (["skipped"], [], "unfinished", "every check was skipped"),

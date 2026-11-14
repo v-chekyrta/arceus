@@ -547,6 +547,14 @@ class QaConfig(Strict):
     reports: ExpandedPath = Path("~/arceus/data/qa/runs").expanduser()
     schedule: RunSchedule | None = None    # none: runs start only by the command
     timeout: Duration = timedelta(hours=8)  # the run's own; past it the run is stopped and reported as unfinished
+    # How much of the agent's report one run keeps. They guard the report page and the disk against an agent that
+    # runs away, not the testing: raise them for long instructions. The agent is told them; whatever goes past one is
+    # left out and the report names it, so the run is never "No problems found".
+    max_checks: int = Field(default=1000, ge=1, le=10_000)    # entries of `tested`
+    max_findings: int = Field(default=300, ge=1, le=2_000)
+    max_files: int = Field(default=1000, ge=1, le=10_000)     # screenshots and recordings
+    max_report_mb: int = Field(default=8, ge=1, le=64)        # findings.json itself
+    max_media_mb: int = Field(default=1024, ge=1, le=20_480)  # all screenshots and recordings together
     address: str = "127.0.0.1"            # the reports page; never open it outside
     port: int = Field(default=3300, ge=0, le=65535)  # 0: any free port (tests). Loki has 3100, Grafana 3000
 

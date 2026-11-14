@@ -10,10 +10,12 @@ Off by default (`qa.enabled: false`). With it on, the agent tests the whole plat
 
 **The report.** The agent writes `findings.json` and its screenshots; the runner validates them and writes `report.html` under `qa.reports`: what was checked, and each problem with its steps, the screenshot where it went wrong, expected against actual, how often, and the suspected cause linked to the code at the commit read. The outcome is one of:
 
-- no problems found: the run finished, the report was read whole, and at least one thing was checked with nothing left unchecked;
-- no problems in what was checked, with what could not be checked listed;
+- no problems found: the run finished, the report was read whole, and at least one thing was checked with nothing left unchecked or skipped;
+- no problems in what was checked, with what could not be checked or was skipped listed;
 - could not test (the site down, the login refused);
 - did not finish: nothing checked, everything skipped, a problem without a description, or a report the runner could not read; the report and Slack say why.
+
+**How much a report keeps.** One run keeps at most `qa.max_checks` (1000) entries of what was checked, `qa.max_findings` (300) findings, `qa.max_files` (1000) screenshots and recordings, `qa.max_media_mb` (1024) MB of them together, and a `findings.json` of `qa.max_report_mb` (8) MB. The limits guard the report page and the disk against an agent that runs away; they say nothing about how much the agent can test well, so raise them when the instructions are long. The agent is told them. Whatever goes past one is left out, and the report lists it by count and by name, so such a run is never "no problems found". The instructions themselves are capped at 64 KiB (the brief goes to the agent as one command-line argument): split a larger test plan into several runs, one after another, since a run reads the instructions when it starts, not when it is queued.
 
 With the web console on, the reports are its **Test runs** ([console.md](console.md)): people with the QA role (or admins) start and stop runs there and edit the instructions, and everyone signed in reads the reports. Without it, reports are served on `127.0.0.1:3300` (`qa.port`): `ssh -L 3300:127.0.0.1:3300 <user>@<vm>`, then `http://localhost:3300/`. Either way the list is read from the database on every visit, so queued and running runs show at once, and only reports and their screenshots are served, never the instructions.
 

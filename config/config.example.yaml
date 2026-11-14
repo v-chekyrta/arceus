@@ -161,6 +161,12 @@ qa:
   reports: ~/arceus/data/qa/runs                   # report.html, result.json, media/ per run
   # schedule: { days: [mon, tue, wed, thu, fri], at: "02:00" }   # in schedule.timezone
   timeout: 8h                                      # past it the run stops, reported as unfinished
+  # What one report keeps; past a limit the rest is left out and the report names it. Raise for long instructions.
+  # max_checks: 1000                               # entries of what was checked
+  # max_findings: 300
+  # max_files: 1000                                # screenshots and recordings
+  # max_report_mb: 8                               # the agent's findings.json
+  # max_media_mb: 1024                             # screenshots and recordings together
   port: 3300                                       # 127.0.0.1 only
 
 # Optional. The agent reviews the architecture and reports what needs a decision (docs/architect.md).
