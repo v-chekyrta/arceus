@@ -274,6 +274,7 @@ def test_env_for_setup_names_the_address_the_folders_to_read_and_the_secrets_to_
     lines = [line.split("=", 1) for line in capsys.readouterr().out.splitlines()]
     env = dict(lines)
     assert env["CONSOLE_PUBLIC_URL"] == "https://console.example.com" and env["CONSOLE_PORT"] == "8080"
+    assert env["CONSOLE_LISTEN"] == ""  # every address, as before
     assert ["CONSOLE_READ_DIR", "/srv/qa-runs"] in lines
     assert ["CONSOLE_SECRET_FILE", str(setup.config_path.parent / "secrets.env")] in lines
 
@@ -361,3 +362,17 @@ def test_behind_https_browsers_are_told_to_stay_on_https(setup):
     r = TestClient(create_app(s), base_url="https://console.example.com").get("/login")
     assert r.headers["strict-transport-security"] == "max-age=31536000"
     assert "strict-transport-security" not in client(setup).get("/login").headers
+
+
+def test_console_listen_takes_an_address_and_is_handed_to_setup(setup, capsys):
+    from arceus_runner.config import ConfigError, load_config
+    raw = yaml.safe_load(setup.config_path.read_text())
+    raw["console"] = {"enabled": True, "public_url": "https://console.example.com", "port": 8190, "listen": "172.18.0.1"}
+    setup.config_path.write_text(yaml.safe_dump(raw))
+    assert console_cli.main(["--config", str(setup.config_path), "console", "env"]) == 0
+    env = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert env["CONSOLE_LISTEN"] == "172.18.0.1" and env["CONSOLE_PORT"] == "8190"
+    raw["console"]["listen"] = "traefik"
+    setup.config_path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="not an IP address"):
+        load_config(setup.config_path)

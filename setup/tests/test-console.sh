@@ -13,6 +13,7 @@ check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$
 # console_nginx_conf is a here-document whose own lines start with }: it ends at CONF and the line after.
 eval "$(sed -n '/^yaml_str() {/p; /^console_secret_paths() {/,/^}/p; /^console_mounts() {/,/^}/p; /^console_forbidden_dir() {/,/^}/p;
                 /^console_env() {/,/^}/p' "$HERE/../setup.sh")"
+eval "$(sed -n '/^console_listen() {/,/^}/p' "$HERE/../setup.sh")"
 eval "$(sed -n '/^console_nginx_conf() {/,/^CONF$/{p;/^CONF$/{n;p;};}' "$HERE/../setup.sh")"
 type yaml_str console_secret_paths console_mounts console_nginx_conf >/dev/null \
   || { echo "FAIL the functions are not in setup.sh"; exit 1; }
@@ -32,6 +33,7 @@ console_get() {
     CONSOLE_SECRET_FILE) printf '%s\n' "$DATA_DIR/secrets.env" "$DATA_DIR/bulava.env" ;;
     CONSOLE_TRUSTED_PROXIES) echo "10.0.0.0/8 192.168.0.0/16" ;;
     CONSOLE_PORT) echo 8081 ;;
+    CONSOLE_LISTEN) echo "${LISTEN:-}" ;;
     CONSOLE_TLS) echo "${TLS:-0}" ;;
     CONSOLE_PUBLIC_URL) echo https://console.example.com ;;
     CONSOLE_SESSION_IDLE) echo 86400s ;;
@@ -59,6 +61,11 @@ check "a reports folder in /srv is mounted" "! console_forbidden_dir /srv/qa-run
 
 conf="$(console_nginx_conf)"
 check "nginx listens on console.port" "grep -q 'listen 8081 default_server;' <<< \"\$conf\" && ! grep -q ssl_certificate <<< \"\$conf\""
+LISTEN=172.18.0.1
+check "with console.listen, nginx listens on that address only" "grep -q 'listen 172.18.0.1:8081 default_server;' <<< \"\$(console_nginx_conf)\""
+LISTEN=::1
+check "an IPv6 console.listen is put in brackets" "grep -q 'listen \[::1\]:8081 default_server;' <<< \"\$(console_nginx_conf)\""
+LISTEN=
 TLS=1
 conf_tls="$(console_nginx_conf)"; mounts_tls="$(console_mounts)"
 check "with console.tls, nginx speaks TLS on the port with setup's own certificate" \

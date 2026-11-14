@@ -91,6 +91,7 @@ def env_lines(cfg: Config) -> list[str]:
     return [f"CONSOLE_ENABLED={'1' if c.enabled else '0'}",
             f"CONSOLE_PUBLIC_URL={c.public_url or ''}",
             f"CONSOLE_PORT={c.port}",
+            f"CONSOLE_LISTEN={c.listen or ''}",
             f"CONSOLE_TLS={'1' if c.tls else '0'}",
             f"CONSOLE_TRUSTED_PROXIES={' '.join(c.trusted_proxies)}",
             f"CONSOLE_SESSION_IDLE={int(c.session_idle.total_seconds())}s",

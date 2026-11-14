@@ -68,6 +68,7 @@ console:
   enabled: true
   public_url: https://console.example.com   # the address people open
   port: 80                                  # what nginx listens on; the load balancer forwards public_url here
+  # listen: 172.18.0.1                      # the address it listens on; unset: every address of the machine
   tls: false                                # true: the load balancer talks HTTPS to nginx (see below)
   trusted_proxies: [10.0.0.0/8]             # who may say who the visitor is (X-Forwarded-For)
 ```
@@ -77,6 +78,13 @@ Some load balancers talk HTTPS to their backends even on port 80. A Kubernetes i
 visitor gets a 502. `tls: true` makes nginx speak TLS on `port` with a certificate setup makes for it once
 (`/opt/arceus-console/tls`, ten years). Such load balancers do not check the backend's certificate. The other way
 out is to have the load balancer talk plain HTTP to the backend.
+
+nginx runs in the host's network and listens on `port` on every address of the machine. That suits a load
+balancer elsewhere, with the machine's firewall closed to everyone else. When the reverse proxy runs on the
+same machine in Docker (Traefik, Caddy) and nothing filters the machine's ports, set `listen` to the gateway of
+the proxy's Docker network (`docker network inspect <net> -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'`): the
+proxy reaches nginx there, and the port is not open on the public address. The proxy is then in
+`trusted_proxies` (its network, for example `172.18.0.0/16`).
 
 Then `sudo ./setup.sh` (or `--phase console`). The first admin comes from the server:
 

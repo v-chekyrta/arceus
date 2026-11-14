@@ -806,6 +806,15 @@ apply_console_tls() {
   chmod 600 "$CONSOLE_DIR/tls/key.pem"; chmod 644 "$CONSOLE_DIR/tls/cert.pem"
   say "  nginx: made a certificate of its own for the load balancer's HTTPS ($CONSOLE_DIR/tls)"
 }
+# What nginx's listen names: the port alone (every address) or console.listen with it; an IPv6 one in brackets.
+console_listen() {
+  local addr port; addr="$(console_get CONSOLE_LISTEN)"; port="$(console_get CONSOLE_PORT)"
+  case "$addr" in
+    "") printf '%s' "$port" ;;
+    *:*) printf '[%s]:%s' "$addr" "$port" ;;
+    *) printf '%s:%s' "$addr" "$port" ;;
+  esac
+}
 console_nginx_conf() {
   local net
   cat <<CONF
@@ -836,12 +845,12 @@ $(for net in $(console_get CONSOLE_TRUSTED_PROXIES); do printf '  set_real_ip_fr
   map \$request_uri \$grafana_path { ~^(?<path>/grafana/[^?]*) \$path; default /grafana/; }
   server {
 $(if [ "$(console_get CONSOLE_TLS)" = 1 ]; then
-    printf '    listen %s ssl default_server;\n' "$(console_get CONSOLE_PORT)"
+    printf '    listen %s ssl default_server;\n' "$(console_listen)"
     printf '    # The load balancer in front talks HTTPS to this backend; the certificate is setup'"'"'s own.\n'
     printf '    ssl_certificate /etc/nginx/tls/cert.pem;\n    ssl_certificate_key /etc/nginx/tls/key.pem;\n'
     printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
   else
-    printf '    listen %s default_server;\n' "$(console_get CONSOLE_PORT)"
+    printf '    listen %s default_server;\n' "$(console_listen)"
   fi)
     # Grafana, once the console has said who asks. Its answer's headers replace any X-WEBAUTH-* the browser
     # sent; no session: to the sign-in.

@@ -39,6 +39,7 @@ fails=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); fi; }
 
 # The nginx.conf setup.sh writes, from its own function.
+eval "$(sed -n '/^console_listen() {/,/^}/p' "$ROOT/setup/setup.sh")"
 eval "$(sed -n '/^console_nginx_conf() {/,/^CONF$/{p;/^CONF$/{n;p;};}' "$ROOT/setup/setup.sh")"
 CONSOLE_APP=127.0.0.1:8180
 console_get() {

@@ -685,6 +685,10 @@ class ConsoleConfig(Strict):
     enabled: bool = False
     public_url: str | None = Field(default=None, pattern=r"^https?://[^/\s?#]+$")  # https://console.example.com
     port: int = Field(default=80, ge=1, le=65535)
+    # The address nginx listens on. None: every address of the machine, for a load balancer elsewhere. A reverse
+    # proxy on the same machine (Traefik in Docker) reaches it on the Docker bridge's gateway, e.g. 172.18.0.1, and
+    # then nothing outside reaches the port past it.
+    listen: str | None = None
     # nginx speaks TLS on `port`, with a certificate setup.sh makes for it: for a load balancer that talks HTTPS to
     # its backends (and, as they usually do, does not check the backend's certificate). Off: plain HTTP.
     tls: bool = False
@@ -692,6 +696,17 @@ class ConsoleConfig(Strict):
     trusted_proxies: list[str] = PRIVATE_NETWORKS
     session_idle: Duration = timedelta(hours=24)   # signed out after this long without a page opened
     session_max: Duration = timedelta(days=14)     # and after this long in any case
+
+    @field_validator("listen")
+    @classmethod
+    def _listen(cls, v: str | None) -> str | None:
+        import ipaddress
+        if v is None:
+            return v
+        try:
+            return str(ipaddress.ip_address(v))
+        except ValueError:
+            raise ValueError(f"{v!r} is not an IP address of this machine, like 127.0.0.1 or 172.18.0.1") from None
 
     @field_validator("trusted_proxies")
     @classmethod

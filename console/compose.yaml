@@ -1,9 +1,9 @@
 # The web console: the console itself and nginx in front of it. setup.sh installs this folder to
 # /opt/arceus-console, writes .env, nginx.conf and mounts.yaml beside it, and builds the image.
 #
-# - nginx listens on CONSOLE_PORT on every address of the machine: what is in front of it (a load balancer that
-#   ends TLS) sends the console's address there. It passes everything to the console, and /grafana/ to Grafana
-#   once the console has said who is asking.
+# - nginx listens on CONSOLE_PORT, on every address of the machine or on console.listen: what is in front of it
+#   (a load balancer that ends TLS, or a reverse proxy on the same machine) sends the console's address there.
+#   It passes everything to the console, and /grafana/ to Grafana once the console has said who is asking.
 # - The console runs as the run user, without sudo, capabilities or a writable root; it sees the data folder
 #   (runner.db, config.yaml, console.db) at the same path as on the machine, the secrets in it replaced by empty
 #   files (mounts.yaml). What needs root, it asks the host for (arceus-ops.service).

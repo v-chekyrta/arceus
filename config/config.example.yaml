@@ -214,6 +214,8 @@ console:
   enabled: false
   # public_url: https://console.example.com   # required when enabled
   port: 80                                  # nginx here; the load balancer forwards public_url to it
+  # listen: 172.18.0.1                      # the address nginx listens on; unset: every address. For a reverse
+  #                                         # proxy in Docker on this machine: its network's gateway, nothing else
   tls: false                                # true if the load balancer talks HTTPS to backends
 
 paths:
