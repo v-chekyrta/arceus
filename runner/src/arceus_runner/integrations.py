@@ -190,8 +190,12 @@ class IssueTracker(Protocol):
     def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
         """Attach a file to the bot's comment. Only called when supports_attachments."""
 
-    def attachment_markdown(self, name: str, caption: str) -> str:
-        """Markdown that shows an attachment of the comment in place."""
+    def attachment_markdown(self, name: str, caption: str, width: int | None = None) -> str:
+        """Markdown that shows an attachment of the comment in place; `width`, when given, is the width in
+        pixels to show an image at (its height scaled with it)."""
+
+    def attachment_link(self, name: str, caption: str) -> str:
+        """Markdown that links to an attachment of the comment without showing it in place."""
 
     def issue_url(self, key: str) -> str: ...
 

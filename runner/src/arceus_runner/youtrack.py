@@ -340,9 +340,17 @@ class YouTrackTracker:
     def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
         self.api.attach_to_comment(db_id, comment_id, name, data, mime)
 
-    def attachment_markdown(self, name: str, caption: str) -> str:
+    def attachment_markdown(self, name: str, caption: str, width: int | None = None) -> str:
         # YouTrack shows a comment's own attachment in place when the text names it: images and a video player.
-        return f"![{caption}]({name})"
+        # A sized image is a preview: `{width=}` scales its height with it, and the link around it (YouTrack turns
+        # the name into the file's signed address) opens the original in one click.
+        if not width:
+            return f"![{caption}]({name})"
+        return f"[![{caption}]({name}){{width={width}}}]({name})"
+
+    def attachment_link(self, name: str, caption: str) -> str:
+        # The name is resolved the same way in a link: to the file's signed address, opened in a new tab.
+        return f"[Open the screenshot: {caption}]({name})"
 
     def issue_url(self, key: str) -> str:
         return f"{self.cfg.url}/issue/{key}"

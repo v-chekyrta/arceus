@@ -242,10 +242,23 @@ def with_media_section(description: str, shots: list[str]) -> str:
 
 
 def ticket_media_text(tracker: IssueTracker, items: list[media.MediaItem]) -> str:
-    """The comment's own attachments, shown in place the way the tracker does it."""
+    """The comment's own attachments, shown in place the way the tracker does it: a screenshot as a preview, one of
+    unknown size as a link to the file."""
+    def shown(m: media.MediaItem) -> str:
+        if m.shown_as == "link":
+            return tracker.attachment_link(m.upload_name, m.caption)
+        return tracker.attachment_markdown(m.upload_name, m.caption, m.preview_width)
     return "\n\n".join(["Screenshots and recordings of the change:",
-                         *(f"**{m.caption}**\n\n{tracker.attachment_markdown(m.upload_name, m.caption)}"
-                           for m in items)])
+                         *(f"**{m.caption}**\n\n{shown(m)}" for m in items)])
+
+
+def mr_media_markdown(m: media.MediaItem, url: str) -> str:
+    """An uploaded file in the MR description: a screenshot as a preview that GitLab opens full size on a click,
+    a recording as its player, a screenshot of unknown size as a link to the file."""
+    if m.shown_as == "link":
+        return f"**{m.caption}**\n\n[Open the screenshot: {m.caption}]({url})"
+    width = m.preview_width
+    return f"**{m.caption}**\n\n![{m.caption}]({url})" + (f"{{width={width}}}" if width else "")
 
 
 _CAUSE = re.compile(r"not found|no such file|not on path|\berror\b|\bfailed\b|denied|timed out", re.I)
@@ -2016,7 +2029,7 @@ class Delivery:
                     self.events.emit("media_skipped", task_id=task.task_id, repo=repo, detail=f"{m.path.name}: {e}")
                     continue
                 self.store.action_done(key, url)
-            out.append(f"**{m.caption}**\n\n![{m.caption}]({url})")
+            out.append(mr_media_markdown(m, url))
         return out
 
     def comment_with_media(self, task: Task, kind: str, text: str,

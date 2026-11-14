@@ -6,9 +6,11 @@ import json
 import atexit
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1161,7 +1163,13 @@ def test_auto_passes_no_model_and_says_auto(w):
     assert e["claude_model"] == e["claude_effort"] == e["codex_model"] == e["codex_effort"] == "auto"
 
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+def png_header(width: int, height: int) -> bytes:
+    """The start of a PNG: signature and IHDR, which is all the runner reads of it."""
+    ihdr = struct.pack(">II", width, height) + b"\x08\x06\x00\x00\x00"
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr))
+
+
+PNG = png_header(2880, 1800)  # a retina screenshot of a 1440×900 window
 WEBM = b"\x1a\x45\xdf\xa3" + b"\x00" * 32
 
 
@@ -1185,21 +1193,31 @@ def test_visual_proof_goes_to_its_mr_and_to_the_ticket(w):
         {"file": "fake.png", "caption": "not an image"},
         {"file": "../secret.txt", "caption": "outside"},
         {"file": "dup.png", "caption": "same bytes as 404.png"},
-    ], {"404.png": PNG, "retry.webm": WEBM, "theme.png": PNG + b"t", "fake.png": b"hello", "dup.png": PNG})
+        {"file": "odd.png", "caption": "No size in its header", "repo": "acme-platform"},
+    ], {"404.png": PNG, "retry.webm": WEBM, "theme.png": PNG + b"t", "fake.png": b"hello", "dup.png": PNG,
+        "odd.png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 32})
     w.settle("ACME-1", "waiting_review")
     w.tick()
     assert w.store.task("ACME-1").state == "code_review"
     [mr] = w.gl.mrs
     names = [n.split("-", 1)[1] for _, n, _ in w.gl.uploads]
-    assert names == ["404.png", "retry.webm"] and {p for p, _, _ in w.gl.uploads} == {mr["project_id"]}
+    assert names == ["404.png", "retry.webm", "odd.png"] and {p for p, _, _ in w.gl.uploads} == {mr["project_id"]}
     assert w.gl.uploads[0][2] == PNG
     desc = mr["description"]
     assert "## Screenshots and recordings" in desc and "![404 page, desktop](/uploads/" in desc
+    # A screenshot is a preview within 480×320 (2880×1800 → 480 wide, 300 high); the recording keeps its player.
+    assert re.search(r"!\[404 page, desktop\]\(/uploads/[^)]+-404\.png\)\{width=480\}", desc)
+    assert re.search(r"-retry\.webm\)\n", desc)
+    # A screenshot whose size its header does not give is a link to it: nothing unbounded in the page.
+    assert re.search(r"\[Open the screenshot: No size in its header\]\(/uploads/[^)]+-odd\.png\)", desc)
+    assert "![No size in its header]" not in desc
     assert "503, then Retry recovers" in desc and "Theme only" not in desc and "secret" not in desc
     [note] = [c for c in w.yt.comments["2-1"] if "Merge request" in c["text"]]
     attached = [n.split("-", 1)[1] for n, _ in w.yt.attachments[note["id"]]]
-    assert attached == ["404.png", "retry.webm", "theme.png"]
-    assert "![404 page, desktop](" in note["text"] and "-404.png)" in note["text"] and "![Theme only](" in note["text"]
+    assert attached == ["404.png", "retry.webm", "theme.png", "odd.png"]
+    assert re.search(r"\[!\[404 page, desktop\]\((\w+-404\.png)\)\{width=480\}\]\(\1\)", note["text"])
+    assert "![Theme only](" in note["text"] and "-retry.webm)\n" in note["text"]
+    assert re.search(r"\[Open the screenshot: No size in its header\]\(\w+-odd\.png\)", note["text"])
     skipped = " ".join(e["detail"] for e in w.events_named("media_skipped"))
     assert "fake.png" in skipped and "../secret.txt" in skipped
     assert git(w.cfg.paths.workspace, "status", "--porcelain") == ""  # the media folder is never committed

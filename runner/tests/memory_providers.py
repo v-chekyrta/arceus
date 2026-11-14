@@ -165,7 +165,10 @@ class MemoryTracker:
     def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
         raise AssertionError("supports_attachments is False: the runner must not attach")
 
-    def attachment_markdown(self, name: str, caption: str) -> str:
+    def attachment_markdown(self, name: str, caption: str, width: int | None = None) -> str:
+        raise AssertionError("supports_attachments is False")
+
+    def attachment_link(self, name: str, caption: str) -> str:
         raise AssertionError("supports_attachments is False")
 
     def issue_url(self, key: str) -> str:
