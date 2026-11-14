@@ -355,9 +355,10 @@ class QaAgent(WorkspaceRun):
                   "- `tested`: each thing you checked, with `result` \"ok\", \"problem\", \"blocked\" or \"skipped\" "
                   "and a `note` where it helps.",
                   f"- The report keeps at most {self.c.max_checks} entries of `tested`, {self.c.max_findings} "
-                  f"findings and {self.c.max_files} screenshots and recordings; whatever goes past is left out. "
-                  "When the instructions need more checks than that, still test them all, and make one entry of "
-                  "closely related checks with the same result, its `note` naming each check it holds.",
+                  f"findings and {self.c.max_files} screenshots and recordings; whatever goes past is left out, "
+                  "and the report names it. Keep one entry per check all the same, never several checks in one "
+                  "entry or its `note`: a `note` is cut short. When the instructions need more checks than that, "
+                  "test the most important first and say in `summary` that the rest did not fit.",
                   "- `findings`: one per problem. `severity` is \"critical\" (a main path is broken or data is at "
                   "risk), \"major\" (a feature does not work) or \"minor\" (cosmetic, a workaround exists). `steps` "
                   "start from a state anyone can reach (a URL, an account); `failed_step` is the step where it goes "

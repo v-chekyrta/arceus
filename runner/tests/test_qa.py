@@ -345,8 +345,19 @@ def test_what_goes_past_the_limits_is_left_out_by_count_and_by_name(tmp_path):
     [findings] = [p for p in problems if "qa.max_findings" in p]
     assert "has 3 findings" in findings and "\u201cBug 2\u201d" in findings
     assert any("s1.png" in p and "qa.max_files" in p for p in problems)
-    # The truncated report is not read as whole: never "No problems found".
+    # The truncated report is not read as whole: never "No problems found", even when every kept check is ok.
     assert outcome_of({**data, "findings": []}, problems, [], False)[0] == "unfinished"
+
+
+def test_checks_past_the_limit_are_never_a_silent_pass(tmp_path):
+    folder = tmp_path / "out"
+    folder.mkdir()
+    (folder / "findings.json").write_text(json.dumps({
+        "tested": [{"what": f"Check {i}", "result": "ok"} for i in range(30)], "findings": []}))
+    data, problems = load_findings(folder, tmp_path / "dest", Limits(checks=20))
+    assert len(data["tested"]) == 20 and any("10 are left out" in p for p in problems)
+    outcome, doubts = outcome_of(data, problems, [], False)
+    assert outcome != "passed" and doubts
 
 
 def test_a_findings_file_past_its_size_is_not_read(tmp_path):
@@ -365,7 +376,10 @@ def test_the_limits_come_from_the_config_and_the_agent_is_told_them(tmp_path):
                                              media_bytes=2048 * 1024 * 1024)
         queue(w)
         [call] = dispatches(w)
-        assert "at most 1500 entries of `tested`, 400 findings and 50 screenshots" in call["argv"][-1]
+        brief = call["argv"][-1]
+        assert "at most 1500 entries of `tested`, 400 findings and 50 screenshots" in brief
+        # One entry per check: a list of checks folded into a `note` would be cut short with no word of it.
+        assert "one entry per check" in brief and "never several checks in one entry" in brief
     finally:
         w.events.close()
         w.store.close()
