@@ -10,6 +10,12 @@ __pycache__/
 # The Docker sandbox of the server is a local tool, never committed (its README is inside)
 /sandbox/
 
+# The test platform on the shared VM: its server address, tokens and the ticket bank stay local (lab/README.md)
+/lab/
+
+# Local Claude Code notes and settings for this checkout (.claude/CLAUDE.md)
+/.claude/
+
 # Internal notes, not part of the public repository
 Agentic development workflow.md
 bulava-agreement.md
