@@ -349,6 +349,19 @@ def test_what_goes_past_the_limits_is_left_out_by_count_and_by_name(tmp_path):
     assert outcome_of({**data, "findings": []}, problems, [], False)[0] == "unfinished"
 
 
+@pytest.mark.parametrize("limit, outcome", [(20, "unfinished"), (100, "partial")])
+def test_checks_the_agent_did_not_get_to_are_never_a_pass(tmp_path, limit, outcome):
+    """As the brief asks: every check an entry, the ones not done "skipped", whether or not they fit the limit."""
+    folder = tmp_path / "out"
+    folder.mkdir()
+    (folder / "findings.json").write_text(json.dumps({
+        "summary": "Checked 20 of 30; checks 20 to 29 did not fit.",
+        "tested": [{"what": f"Check {i}", "result": "ok" if i < 20 else "skipped"} for i in range(30)],
+        "findings": []}))
+    data, problems = load_findings(folder, tmp_path / "dest", Limits(checks=limit))
+    assert outcome_of(data, problems, [], False)[0] == outcome
+
+
 def test_checks_past_the_limit_are_never_a_silent_pass(tmp_path):
     folder = tmp_path / "out"
     folder.mkdir()
@@ -380,6 +393,9 @@ def test_the_limits_come_from_the_config_and_the_agent_is_told_them(tmp_path):
         assert "at most 1500 entries of `tested`, 400 findings and 50 screenshots" in brief
         # One entry per check: a list of checks folded into a `note` would be cut short with no word of it.
         assert "one entry per check" in brief and "never several checks in one entry" in brief
+        # Every check is an entry, the ones not done "skipped": coverage never lives in `summary` alone.
+        assert "also one you did not get to: that one is \"skipped\"" in brief
+        assert "nor tell of it only in `summary`" in brief
     finally:
         w.events.close()
         w.store.close()

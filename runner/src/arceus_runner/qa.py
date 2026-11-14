@@ -357,8 +357,9 @@ class QaAgent(WorkspaceRun):
                   f"- The report keeps at most {self.c.max_checks} entries of `tested`, {self.c.max_findings} "
                   f"findings and {self.c.max_files} screenshots and recordings; whatever goes past is left out, "
                   "and the report names it. Keep one entry per check all the same, never several checks in one "
-                  "entry or its `note`: a `note` is cut short. When the instructions need more checks than that, "
-                  "test the most important first and say in `summary` that the rest did not fit.",
+                  "entry or its `note`: a `note` is cut short. Every check the instructions ask for is an entry, "
+                  "also past that limit and also one you did not get to: that one is \"skipped\". The runner "
+                  "counts what does not fit; never leave a check out of `tested`, nor tell of it only in `summary`.",
                   "- `findings`: one per problem. `severity` is \"critical\" (a main path is broken or data is at "
                   "risk), \"major\" (a feature does not work) or \"minor\" (cosmetic, a workaround exists). `steps` "
                   "start from a state anyone can reach (a URL, an account); `failed_step` is the step where it goes "
