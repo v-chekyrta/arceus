@@ -1107,6 +1107,86 @@ def test_a_run_banked_as_debt_after_its_review_passed_counts_as_finished(w):
     assert w.store.review(RID).outcome == "approved"
 
 
+# What the engine's report review leaves when Codex still disputes the reviewer's closing report at its limit
+# (the arceus-lab run of AL-4: state failed, needs-user, the objections in review_why).
+DISPUTED = {"state": "failed", "state_reason": "needs-user",
+            "outcome": {"result": "succeeded_research", "summary": "Ready to merge."},
+            "receipt": {"result": "succeeded_research", "review": "failed", "repos": [],
+                        "review_why": "STATE: COMPLETE\nVERDICT: FAIL\n\n1. The probe's database changes are not "
+                                      "described, nor how they were undone."}}
+
+
+def report_returns(w) -> list[dict]:
+    return [c for c in sends(w) if c["argv"][c["argv"].index("--message-id") + 1].startswith(f"report-{RID}")]
+
+
+def test_a_disputed_report_goes_back_to_the_reviewer_once_and_a_passed_one_is_approved(w):
+    publish(w)
+    ask(w)
+    write_verdict(w)
+    finish(w, **DISPUTED)
+    [ret] = report_returns(w)
+    assert "did not accept it" in ret["argv"][-1] and "database changes are not described" in ret["argv"][-1]
+    assert w.store.review(RID).state == "running" and approve_calls(w) == [] and review_notes(w) == []
+    assert [e["attempt"] for e in w.events_named("review_report_returned")] == [1]
+    finish(w)   # the fixed report passed: the run is done
+    assert w.store.review(RID).outcome == "approved" and len(approve_calls(w)) == 1
+    assert len(report_returns(w)) == 1
+
+
+def test_a_report_still_disputed_after_its_return_is_neither_approved_nor_sent_to_the_author(w):
+    publish(w)
+    ask(w)
+    write_verdict(w)
+    finish(w, **DISPUTED)
+    author_sends = len(sends(w)) - len(report_returns(w))
+    finish(w, **DISPUTED)
+    review = w.store.review(RID)
+    assert review.outcome == "unverified" and approve_calls(w) == []
+    assert len(report_returns(w)) == 1                              # one return, no loop until a lucky pass
+    assert len(sends(w)) - len(report_returns(w)) == author_sends   # nothing to the author: the code was not faulted
+    [note] = review_notes(w)
+    assert "could not be confirmed" in note
+
+
+def test_a_run_that_failed_for_another_reason_is_not_returned(w):
+    publish(w)
+    ask(w)
+    write_verdict(w)
+    finish(w, state="failed", state_reason="needs-user", outcome={"result": "succeeded_research", "summary": "x"},
+           receipt={"result": "succeeded_research", "review": "failed", "repos": [],
+                    "review_why": "Codex stopped with an error (code 1)"})
+    assert report_returns(w) == [] and w.store.review(RID).outcome == "unverified"
+
+
+def test_a_report_return_the_engine_is_busy_for_is_sent_again_as_the_same_message(w):
+    publish(w)
+    ask(w)
+    write_verdict(w)
+    # The engine took the run up again before the runner's send arrived: busy, so the same message next tick.
+    w.set_engine(lambda s: s["tasks"][RID].update(state="failed", attempt_live=False, **{
+        k: v for k, v in DISPUTED.items() if k != "state"}))
+    from arceus_runner.engine import Reply
+    real = w.runner.reviewer.d.engine.send
+    calls = []
+
+    def busy_once(**kw):
+        calls.append(kw["message_id"])
+        return Reply(6, "busy", {}, "busy") if len(calls) == 1 else real(**kw)
+    w.runner.reviewer.d.engine.send = busy_once
+    w.tick()
+    w.tick()
+    assert calls == [f"report-{RID}-1", f"report-{RID}-1"]
+    assert json.loads(w.store.review(RID).snapshot)["report_repairs"] == 1
+
+
+def test_the_brief_says_the_closing_report_is_checked_claim_by_claim(w):
+    publish(w)
+    ask(w)
+    prompt = reviews(w)[0]["argv"][-1]
+    assert "checked by Codex claim by claim" in prompt and "how you removed it" in prompt
+
+
 # What the real engine's review gate writes for a research run that changed nothing (staging, STG-24).
 EMPTY_DIFF_WHY = ("Declared 'succeeded_research' with an empty diff — no machine verification of a "
                   "no-change/research claim is possible; needs human review.")

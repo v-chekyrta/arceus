@@ -82,6 +82,20 @@ FINAL = ("approved", "attention", "changes")
 # "attention" is an approval that also asks a person to look at named changes; "ready" is one that was refused.
 ORDER = ("changes", "unverified", "ready", "attention", "approved")  # the overall outcome is the first one found
 RESUME = "The session was interrupted (a reboot or a crash). Continue the review from where you stopped."
+# On a server Codex checks the reviewer's closing report claim by claim (the engine's report review, two rounds). When
+# it still disputes the report at that limit, the run ends `failed`/`needs-user` and nothing in it can be approved. The
+# reviewer gets the objections back this many times before the review is settled as it stands: a report fixed, or a
+# verdict changed, that Codex then passes counts like any other; one it still disputes is never approved.
+REPORT_REPAIRS = 1
+MAX_OBJECTIONS = 6000
+REPORT_RETURNED = (
+    "Codex checked your closing report against the code and your logs and did not accept it. Its objections are "
+    "below. Answer each one: correct the report where it is wrong or unsupported; when an objection shows that your "
+    "verdict itself is wrong (a requirement not met, a test that does not pass, a defect), change the verdict file "
+    "too. State only what you verified, each claim with its evidence, and for anything you ran that changed data or "
+    "state, where it ran and how it was undone. Then finish with the outcome succeeded_research again.\n\n"
+    "## Codex's objections\n\n")
+_REPORT_FAIL = re.compile(r"^\s*VERDICT:\s*FAIL\b", re.MULTILINE)
 MAX_FILE_BYTES = 512 * 1024
 MAX_TEXT = 3000
 MAX_ITEMS = 30
@@ -809,7 +823,53 @@ class ReviewAgent:
             if not reply.accepted and reply.rc != 6:
                 self._settled(row, show, f"the execution engine did not take the review up again ({reply.why()})")
             return
+        if self._report_disputed(show) and self._return_report(row, show):
+            return
         self._settled(row, show)
+
+    @staticmethod
+    def _report_disputed(show: dict) -> bool:
+        """The run ended because Codex did not accept the reviewer's closing report at its round limit. A review
+        commits nothing, so the engine's report review is the only gate that can end it this way."""
+        receipt = show.get("receipt") or {}
+        return (show.get("state") == "failed" and show.get("state_reason") == "needs-user"
+                and receipt.get("result") == "succeeded_research"
+                and bool(_REPORT_FAIL.search(receipt.get("review_why") or "")))
+
+    def _return_report(self, row: ReviewRequest, show: dict) -> bool:
+        """Codex's objections back to the reviewer for one more attempt, at most REPORT_REPAIRS times. True while
+        that is under way (sent, or waiting for the screen or the engine); False when the review is to be settled.
+
+        The attempt is counted before it is sent and marked sent after: a runner that restarts in between sends the
+        same message again (the engine takes a message id once), never a second attempt."""
+        snap = json.loads(row.snapshot)
+        n = int(snap.get("report_repairs", 0))
+        if snap.get("report_repair_sent", True):
+            if n >= REPORT_REPAIRS or self._overdue(row):
+                return False
+            n += 1
+            snap = {**snap, "report_repairs": n, "report_repair_sent": False}
+            row = self.store.update_review(row.id, snapshot=json.dumps(snap))
+        elif self._overdue(row):
+            return False
+        why = ((show.get("receipt") or {}).get("review_why") or "").strip()[:MAX_OBJECTIONS]
+        text = REPORT_RETURNED + why
+        task = self.store.task(row.task_id)
+        # Codex's words quote the repository and the reviewer's logs: screened like any text from outside.
+        clearance = self.d.gate.clear(task, "review_request", text, authors=[], resume_state=task.state,
+                                      ref=row.id)
+        if clearance is None:
+            return True  # held for a security reviewer or the screen is down: tried again next tick, until overdue
+        reply = self.d.engine.send(task_id=row.id, message_id=f"report-{row.id}-{n}", source="other",
+                                   author=self.cfg.tracker.bot_user, repo=Path(self.cfg.paths.workspace), text=text,
+                                   clearance=clearance, extra_dirs=self._extra_dirs(row))
+        if reply.rc == 6:
+            return True   # busy: the same message again next tick
+        if not reply.accepted:
+            return False
+        self.store.update_review(row.id, snapshot=json.dumps({**snap, "report_repair_sent": True}))
+        self.events.emit("review_report_returned", task_id=row.task_id, review=row.id, attempt=n)
+        return True
 
     def _settled(self, row: ReviewRequest, show: dict | None, problem: str | None = None) -> None:
         """The run is over (or never took place): keep what it found, then put the workspace back."""
@@ -1621,6 +1681,13 @@ class ReviewAgent:
                   "- `deploy`: what whoever deploys it should know or do, by point 3; an empty list when there is "
                   "nothing.",
                   "- `summary`: a few sentences for the ticket.",
+                  "",
+                  "Your closing report (the outcome's summary) is checked by Codex claim by claim against the "
+                  "code and your logs, and a report it does not accept is never approved. Say only what you "
+                  "verified, each claim with its evidence: the command and what it showed, or the file and line. "
+                  "Leave out what does not bear on the verdict. Anything you ran that changed data or state (a "
+                  "database you seeded, a container you started, a file you wrote) ran somewhere throwaway: say "
+                  "where, and how you removed it.",
                   "",
                   f"Write in English. The runner reads the file and posts the result; you cannot post on "
                   f"{self.tracker.label} or {self.host.label} yourself. Then finish with the outcome "
