@@ -20,7 +20,8 @@ while [ $# -gt 0 ]; do
 done
 HOST="$(printf '%s' "$URL" | sed -E 's#^https?://([^/:]+).*#\1#')"
 VM="${TARGET#*@}"
-on_vm() { ssh -o BatchMode=yes -o ConnectTimeout=15 "${SSH_OPTS[@]}" "$TARGET" "$@"; }
+# ${a[@]+...}: an empty array is "unbound" under set -u in the bash 3.2 macOS ships.
+on_vm() { ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$TARGET" "$@"; }
 fails=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); fi; }
 
@@ -62,11 +63,13 @@ import hashlib, json, os, sqlite3
 from pathlib import Path
 from arceus_runner.config import load_config
 from arceus_runner.console import status
+from arceus_runner.db import MIGRATIONS
 cfg = load_config(Path(os.environ["ARCEUS_RUNNER_CONFIG"]))
 snap = status.snapshot(cfg)
 db = sqlite3.connect(f"file:{cfg.paths.db}?mode=ro", uri=True)
 direct = {
     "schema": db.execute("pragma user_version").fetchone()[0],
+    "known": len(MIGRATIONS),  # the schema the console's own code (the runner's, the same setup) expects
     "active": db.execute("select count(*) from tasks where state in ('claimed','dispatched','publishing')").fetchone()[0],
     "waiting": db.execute("select count(*) from tasks where state in ('needs_input','security_hold')").fetchone()[0],
     "review": db.execute("select count(*) from tasks where state = 'code_review'").fetchone()[0],
@@ -79,7 +82,7 @@ print(json.dumps({"console": {"error": snap["db"].get("error"), "active": len(sn
 PY
 probe="$(on_vm "docker exec -i arceus-console-console-1 /opt/console/bin/python -" <<< "$PROBE" 2>&1)"
 pj() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print($1)" "$probe" 2>/dev/null; }
-check "the console reads the VM's runner.db (schema 22, no error)" "[ \"\$(pj 'd[\"direct\"][\"schema\"]')\" = 22 ] && [ \"\$(pj 'd[\"console\"][\"error\"]')\" = None ]"
+check "the console reads the VM's runner.db (the schema its code knows, no error)" "[ \"\$(pj 'd[\"direct\"][\"schema\"] == d[\"direct\"][\"known\"]')\" = True ] && [ \"\$(pj 'd[\"console\"][\"error\"]')\" = None ]"
 check "its counts are runner.db's own (in work, waiting on people, in code review)" \
   "[ \"\$(pj '[d[\"console\"][k] for k in (\"active\",\"waiting\",\"review\")] == [d[\"direct\"][k] for k in (\"active\",\"waiting\",\"review\")]')\" = True ]"
 check "it sees the runner answering in its configured mode" \
