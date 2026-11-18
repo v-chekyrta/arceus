@@ -14,7 +14,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from urllib.parse import quote, urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import field_validator, model_validator
 
 from arceus_runner.checks import Check, Status
 from arceus_runner.config import CodeHostConfig, HttpConfig, _url
@@ -60,6 +60,17 @@ class GitLab:
 
     def group(self, full_path: str) -> dict:
         return self.c.get_json(f"/api/v4/groups/{quote(full_path, safe='')}", {"with_projects": "false"})
+
+    def project_repos(self, full_paths: list[str]) -> list[Repo]:
+        """The repositories named one by one (code_host.projects); each folder in the workspace is its own name."""
+        out = []
+        for full_path in full_paths:
+            p = self.c.get_json(f"/api/v4/projects/{quote(full_path, safe='')}")
+            out.append(Repo(id=p["id"], path=p["path"], relative_path=p["path"],
+                            default_branch=p.get("default_branch"), archived=bool(p.get("archived")),
+                            http_url=p.get("http_url_to_repo") or "",
+                            description=(p.get("description") or "").strip()))
+        return out
 
     def group_repos(self, group_path: str, include_subgroups: bool) -> list[Repo]:
         group = self.group(group_path)
@@ -261,7 +272,10 @@ class GitLabApprover(GitLab):
 
 class GitLabConfig(CodeHostConfig):
     url: str
-    group: str = Field(min_length=1)  # the group that holds all the project's repositories
+    group: str = ""  # the group that holds all the project's repositories
+    # Or, when a project's repositories live in different groups, the repositories themselves by full path
+    # ("mobile/app", "backend/api"): a task gets all of them. Set one of `group` and `projects`, not both.
+    projects: list[str] = []
     token_env: str = "GITLAB_TOKEN"
     include_subgroups: bool = True
 
@@ -271,6 +285,24 @@ class GitLabConfig(CodeHostConfig):
     @classmethod
     def _group(cls, v: str) -> str:
         return v.strip("/")
+
+    @field_validator("projects")
+    @classmethod
+    def _projects(cls, v: list[str]) -> list[str]:
+        paths = [p.strip().strip("/") for p in v]
+        if any(not p or "/" not in p for p in paths):
+            raise ValueError("each entry is a repository's full path, e.g. 'group/repo'")
+        names = [p.rsplit("/", 1)[1].lower() for p in paths]
+        twice = sorted({n for n in names if names.count(n) > 1})
+        if twice:  # the name is the repository's folder in the workspace, so it has to be unique
+            raise ValueError(f"two repositories share the name {', '.join(twice)}: the workspace needs distinct names")
+        return paths
+
+    @model_validator(mode="after")
+    def _one_scope(self) -> GitLabConfig:
+        if bool(self.group) == bool(self.projects):
+            raise ValueError("set exactly one of code_host.group and code_host.projects")
+        return self
 
 
 def mentions(bot: str) -> re.Pattern:
@@ -295,7 +327,11 @@ class GitLabHost:
         # the reading of merge requests and the replies that the request itself depends on.
         self.reactions_client = replace(client, name=f"{client.name}-reactions", state=ServiceState())
         self.reactions_api = GitLabReview(self.reactions_client)
-        self.scope = cfg.group
+        if cfg.projects:
+            self.scope_kind = "projects"
+            self.scope = ", ".join(cfg.projects)
+        else:
+            self.scope = cfg.group
         self._token = token
         self._mention = mentions(cfg.bot_user)
         self.approver_client = approver
@@ -322,12 +358,16 @@ class GitLabHost:
         self.api.note_mr(repo_id, iid, body)
 
     def identity(self) -> str:
-        return f"gitlab {self.cfg.url} group {self.cfg.group}"
+        return f"gitlab {self.cfg.url} {self.scope_kind} {self.scope}"
 
     def describe(self) -> str:
+        if self.cfg.projects:
+            return f"GitLab at {self.cfg.url}, the repositories {self.scope}"
         return f"GitLab at {self.cfg.url}, the repositories of group {self.cfg.group}"
 
     def repos(self) -> list[Repo]:
+        if self.cfg.projects:  # like the group listing, which leaves archived repositories out
+            return [r for r in self.api.project_repos(self.cfg.projects) if not r.archived]
         return self.api.group_repos(self.cfg.group, self.cfg.include_subgroups)
 
     def branch_mr(self, repo_id: Id, branch: str) -> MergeRequest | None:
@@ -422,8 +462,12 @@ class GitLabHost:
         m = _MR_PATH.match(link.path[len(base.path.rstrip("/")):] if link.path.startswith(base.path) else "")
         if m is None:
             return None
-        group = self.cfg.group.strip("/").lower()
         project = m["project"].lower()
+        if self.cfg.projects:  # the listed repositories only, by their full path
+            name = next((p.rsplit("/", 1)[1].lower() for p in self.cfg.projects if p.lower() == project), None)
+            hit = next((r for r in repos if name and r.relative_path.lower() == name), None)
+            return (hit, int(m["iid"])) if hit else None
+        group = self.cfg.group.strip("/").lower()
         for r in repos:  # the group's own projects only: a same-named project elsewhere is not one of them
             if project == f"{group}/{r.relative_path.lower()}":
                 return r, int(m["iid"])
@@ -487,6 +531,20 @@ def check_gitlab(g: GitLabConfig, gl: GitLab, warn_days: int, today: date | None
     except ServiceError as e:
         out.append(Check("gitlab.token_expiry", "warn", f"cannot read token info: {e}"))
 
+    if g.projects:
+        repos = []
+        for path in g.projects:
+            try:
+                repos += gl.project_repos([path])
+            except ServiceError as e:
+                out.append(Check(f"gitlab.projects.{path}", "fail", f"repository {path!r}: {e}"))
+        if len(repos) < len(g.projects):
+            return out
+        out.append(Check("gitlab.projects", "ok", f"{len(repos)} repositories: {', '.join(g.projects)}"))
+        archived = [r.path for r in repos if r.archived]
+        if archived:
+            out.append(Check("gitlab.projects.archived", "warn", f"archived: {', '.join(archived)}"))
+        return out
     try:
         repos = gl.group_repos(g.group, g.include_subgroups)
     except ServiceError as e:

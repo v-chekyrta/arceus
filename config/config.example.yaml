@@ -53,6 +53,9 @@ code_host:
   url: https://gitlab.example.com
   group: clients/acme                  # every task gets all its repositories; MRs only where something changed
   include_subgroups: true
+  # Repositories in different groups: list them by full path instead of `group` (one of the two). Each one's
+  # folder in the workspace is its name, so names must differ; exclude_repos and include_subgroups do not apply.
+  # projects: [mobile/other/acme-app, backend/acme/acme-api]
   # For review_agent approvals: a second account (an author cannot approve its own MR), Developer or higher,
   # token in secrets.env. Without it the review only comments.
   # approver: { user: acme-review-bot, token_env: GITLAB_REVIEW_TOKEN }

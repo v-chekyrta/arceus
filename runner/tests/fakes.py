@@ -190,6 +190,7 @@ class FakeGitLab:
         self.retry_after: str | None = None
         self.requests: list[httpx.Request] = []
         self.repos = ["acme-platform", "acme-theme", "acme-infra"]
+        self.projects: dict[str, dict] = {}   # code_host.projects: full path -> {id, archived, description}
         self.token = {"scopes": ["api"], "expires_at": "2027-06-01", "active": True}
         self.branch_late = 0  # MR creations refused with "source_branch does not exist" before one goes through
         self.urls: dict[str, str] = {}
@@ -234,6 +235,14 @@ class FakeGitLab:
             return json_response(self.token)
         if path == "/api/v4/groups/clients%2Facme" or request.url.raw_path.startswith(b"/api/v4/groups/clients%2Facme"):
             return json_response({"id": 42, "full_path": "clients/acme"})
+        if request.url.raw_path.startswith(b"/api/v4/projects/") and b"%2F" in request.url.raw_path.split(b"?")[0]:
+            full = request.url.raw_path.split(b"?")[0][len(b"/api/v4/projects/"):].decode().replace("%2F", "/")
+            p = self.projects.get(full)
+            if p is None:
+                return json_response({"message": "404 Project Not Found"}, 404)
+            return json_response({"id": p.get("id", 100), "path": full.rsplit("/", 1)[1], "path_with_namespace": full,
+                                  "default_branch": "main", "archived": p.get("archived", False),
+                                  "http_url_to_repo": f"https://gl/{full}.git", "description": p.get("description")})
         if path == "/api/v4/groups/42/projects":
             page = int(request.url.params.get("page", 1))
             items = [{"id": i, "path": r, "path_with_namespace": f"clients/acme/{r}", "default_branch": "main",

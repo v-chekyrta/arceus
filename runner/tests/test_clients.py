@@ -144,3 +144,63 @@ def test_error_bodies_are_scrubbed_of_our_tokens(cfg, secrets):
     assert (result.name, result.status) == ("youtrack.request", "fail")
     text = result.detail
     assert "HTTP 422" in text and secrets.tracker not in text
+
+
+# code_host.projects: the repositories of one project can live in different groups (say, the mobile app in one,
+# the backend in another). They are named one by one instead of by a group.
+
+def _projects_cfg(cfg, projects):
+    from arceus_runner.gitlab import GitLabConfig
+    raw = cfg.code_host.model_dump()
+    raw.update(group="", projects=projects, exclude_repos=[])
+    return GitLabConfig.model_validate(raw)
+
+
+def test_gitlab_projects_config_takes_one_scope_and_distinct_names(cfg):
+    import pytest
+    from pydantic import ValidationError
+    ok = _projects_cfg(cfg, ["mobile/other/app ", "/backend/api/"])
+    assert ok.projects == ["mobile/other/app", "backend/api"] and ok.group == ""
+    raw = ok.model_dump()
+    for bad in ({"group": "clients/acme"},                    # both a group and projects
+                {"projects": []},                             # neither
+                {"projects": ["mobile/app", "web/app"]},      # two folders named app in the workspace
+                {"projects": ["app"]}):                       # not a full path
+        with pytest.raises(ValidationError):
+            from arceus_runner.gitlab import GitLabConfig
+            GitLabConfig.model_validate({**raw, **bad})
+
+
+def test_gitlab_projects_check_reads_each_repository(cfg, secrets):
+    fake = FakeGitLab()
+    fake.token = {"scopes": ["api"], "expires_at": "2027-10-30"}
+    fake.projects = {"mobile/other/app": {"id": 5}, "backend/team/api": {"id": 6, "archived": True}}
+    g = _projects_cfg(cfg, ["mobile/other/app", "backend/team/api"])
+    results = {c.name: c for c in check_gitlab(g, gl(cfg, secrets, fake), 14, today=date(2026, 10, 23))}
+    assert results["gitlab.projects"].status == "ok"
+    assert results["gitlab.projects"].detail == "2 repositories: mobile/other/app, backend/team/api"
+    assert results["gitlab.projects.archived"].status == "warn"
+    assert "gitlab.group" not in results
+
+    fake.projects.pop("backend/team/api")
+    results = {c.name: c for c in check_gitlab(g, gl(cfg, secrets, fake), 14, today=date(2026, 10, 23))}
+    assert results["gitlab.projects.backend/team/api"].status == "fail"
+    assert "gitlab.projects" not in results
+
+
+def test_gitlab_projects_host_lists_them_and_reads_their_merge_request_links(cfg, secrets):
+    from arceus_runner.gitlab import GitLabHost
+    fake = FakeGitLab()
+    fake.projects = {"mobile/other/app": {"id": 5}, "backend/team/api": {"id": 6},
+                     "backend/team/old": {"id": 7, "archived": True}}
+    g = _projects_cfg(cfg, ["mobile/other/app", "backend/team/api", "backend/team/old"])
+    host = GitLabHost(g, gitlab_client(g, secrets.code_host, cfg.http, transport=httpx.MockTransport(fake)),
+                      secrets.code_host)
+    repos = host.repos()
+    assert [(r.id, r.relative_path) for r in repos] == [(5, "app"), (6, "api")]   # the archived one is left out
+    assert (host.scope_kind, host.scope) == ("projects", "mobile/other/app, backend/team/api, backend/team/old")
+    assert host.mr_link("https://gitlab.example.com/backend/team/api/-/merge_requests/9", repos) == (repos[1], 9)
+    assert host.mr_link("https://gitlab.example.com/Mobile/Other/App/merge_requests/3", repos) == (repos[0], 3)
+    for other in ("https://gitlab.example.com/elsewhere/api/-/merge_requests/9",   # same name, not listed
+                  "https://gitlab.example.com/backend/team/old/-/merge_requests/1"):   # listed but archived
+        assert host.mr_link(other, repos) is None, other
