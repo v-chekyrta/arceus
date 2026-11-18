@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -32,6 +32,7 @@ from arceus_runner.db import ReviewStore
 from arceus_runner.events import EventLog
 
 NOTE_LIMIT = 300
+RECENT = 6  # the agent's latest actions a ticket's progress comment shows
 # Steps where the agent is expected to be silent: the gate, the verifier and Codex are working, or the
 # engine waits for a usage window. A quiet transcript then is not a stuck agent.
 NOT_AGENT_STAGES = ("gate", "run", "outcome")
@@ -46,6 +47,16 @@ def task_key(task_id: str) -> str:
 def _clip(text: str, limit: int = NOTE_LIMIT) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _when(stamp: object) -> float | None:
+    """A transcript entry's ISO time as epoch seconds, None when it has none."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _jsonl(data: bytes) -> list[dict]:
@@ -90,6 +101,8 @@ class TaskProgress:
     quiet_reported: bool = False
     journal_sig: tuple = ()   # size and mtime of the journal files at the last read
     problem: str = ""         # the last read error, said once
+    calls: int = 0            # tool calls seen in this attempt, for the ticket's progress comment
+    recent: deque = field(default_factory=lambda: deque(maxlen=RECENT))  # (epoch, tool, target), newest last
 
 
 def tool_target(name: str, args: dict, workspace: Path) -> str:
@@ -128,6 +141,9 @@ class ProgressWatcher:
         self.quiet_after = quiet_after.total_seconds()
         self.projects_dir = projects_dir or Path.home() / ".claude" / "projects"
         self.tasks: dict[str, TaskProgress] = {}
+        # Told of every new engine step (task id, attempt, stage, state, epoch ms, note): ticket_progress.py keeps
+        # the attempt's steps for the ticket's progress comment.
+        self.on_step: Callable[[str, int, str, str, int, str], None] | None = None
 
     # -- one look ---------------------------------------------------------------------------------
 
@@ -235,6 +251,9 @@ class ProgressWatcher:
                          state=str(x.get("state") or "?"), note=_clip(str(x.get("note") or "")) or None,
                          at=x.get("at"), **extra)
         self._set_step(p, x)
+        if self.on_step:
+            self.on_step(p.task_id, p.attempt, str(x.get("stage") or "?"), str(x.get("state") or "?"),
+                         int(x.get("ms") or 0), _clip(str(x.get("note") or "")))
 
     def _set_step(self, p: TaskProgress, x: dict) -> None:
         stage, state = str(x.get("stage") or "?"), str(x.get("state") or "?")
@@ -294,7 +313,11 @@ class ProgressWatcher:
                 if isinstance(part, dict) and part.get("type") == "tool_use":
                     name = str(part.get("name") or "?")
                     p.tools[name] += 1
+                    p.calls += 1
                     p.last_tool, p.last_target = name, tool_target(name, part.get("input") or {}, self.workspace)
+                    if p.last_target and not (p.recent and p.recent[-1][2] == p.last_target):
+                        p.recent.append((_when(entry.get("timestamp")) or self.now().timestamp(), name,
+                                         p.last_target))
 
     def _agent_turn(self, p: TaskProgress) -> bool:
         """Whether the agent should be the one producing output now."""

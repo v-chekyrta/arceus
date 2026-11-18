@@ -50,6 +50,7 @@ from arceus_runner.metrics import Metrics
 from arceus_runner import notify
 from arceus_runner.notify import Notifier
 from arceus_runner.progress import ProgressWatcher
+from arceus_runner.ticket_progress import TicketProgress
 from arceus_runner.screening import ClaudeClassifier, Classify, classifier_env
 from arceus_runner.http import AuthError, BadRequest, NotFound, ServiceClient, ServiceError, TransientError
 from arceus_runner.integrations import (
@@ -153,6 +154,8 @@ class Runner:
             self.delivery.workspace.holders = [self.reviewer, *self.background]
         self.progress = ProgressWatcher(cfg.paths.bulava_state, cfg.paths.workspace, store, events, now,
                                         quiet_after=cfg.limits.agent_quiet_after) if self.delivery else None
+        # The comment that says the agent took a ticket, kept up to date with what it does (ticket_progress.py).
+        self.ticket_progress = TicketProgress(self.delivery, self.progress, now) if self.progress else None
         self.last_tick: float | None = None  # wall clock of the last finished tick, for the metrics
         self.cleanup = cleanup
         self.engine = engine
@@ -358,6 +361,11 @@ class Runner:
                 self.progress.poll()
             finally:
                 self.next_due["progress"] = self.mono() + self.cfg.schedule.poll_progress.total_seconds()
+            if self.ticket_progress:
+                try:
+                    self.ticket_progress.tick()
+                except Exception as e:  # telling must never stop the loop it tells about
+                    self.events.emit("progress_comment_failed", error=f"{type(e).__name__}: {e}")
         if self.notifier:
             try:
                 self.notifier.tick(self.situation(),

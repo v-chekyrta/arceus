@@ -35,6 +35,9 @@ tracker:
     code_review: Code Review
     # merged: Testing                  # after every MR is merged (default Testing); null: stay in Code Review
     # answered: Code Review            # after a research answer (default code_review); null: stay In Progress
+  # The comment that says the agent took a ticket keeps, while it works, a Progress section: what happens now,
+  # the agent's latest actions, the steps, the MRs. false: that comment stays as it was posted.
+  # progress_comment: true
   # YouTrack
   url: https://youtrack.example.com
   project: ACME                        # YouTrack project ID
@@ -82,6 +85,7 @@ schedule:
   poll_off_hours: 10m
   poll_local: 2m                       # local health
   poll_progress: 30s                   # a running task's steps and activity
+  progress_comment_every: 5m          # the ticket's Progress section, at most this often unless a step changed
   review_debounce: 5m
 
 http:

@@ -18,7 +18,7 @@ import httpx
 from arceus_runner.checks import Check
 from arceus_runner.config import AdvisoryRegisterConfig, CodeHostConfig, HttpConfig, IssueTrackerConfig
 from arceus_runner.gitops import GitAuth
-from arceus_runner.http import BadRequest, ServiceClient, ServiceError, TransientError
+from arceus_runner.http import BadRequest, NotFound, ServiceClient, ServiceError, TransientError
 from arceus_runner.integrations import (
     Advisory,
     CIJob,
@@ -79,6 +79,7 @@ class MemoryTracker:
         self.users = {"j.doe", "a.smith", "mallory", cfg.bot_user}
         self.clock = 1_792_479_600_000
         self.lose_response: set[str] = set()
+        self.edits = 0
 
     # what a test does on the tracker's side
     def file(self, n: int, summary: str, queued_by: str | None, state: str | None = None) -> Ticket:
@@ -166,6 +167,15 @@ class MemoryTracker:
         self._ticket(db_id).comments.append(c)
         self._lost("add_comment")
         return c.id, c.created
+
+    def edit_comment(self, db_id: str, comment_id: str, text: str) -> None:
+        comments = self._ticket(db_id).comments
+        for i, c in enumerate(comments):
+            if c.id == comment_id:
+                comments[i] = Comment(c.id, text, c.author, c.created)
+                self.edits += 1
+                return
+        raise NotFound(self.name, f"comment {comment_id}: not found", 404)
 
     def attach(self, db_id: str, comment_id: str, name: str, data: bytes, mime: str) -> None:
         raise AssertionError("supports_attachments is False: the runner must not attach")

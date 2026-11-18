@@ -23,6 +23,7 @@ class FakeYouTrack:
         self.issue_tags: dict[str, set[str]] = {}
         self.issue_fields: dict[str, dict[str, object]] = {}
         self.comments: dict[str, list[dict]] = {}
+        self.comment_edits = 0
         self.clock = 1_792_479_600_000  # 2026-10-20 07:00 UTC in ms, the test runner's 'now'
         self.fail_once: dict[tuple[str, str], int] = {}  # (method, path) -> status, once
         self.attachments: dict[str, list[tuple[str, bytes]]] = {}  # comment id -> (file name, content)
@@ -75,6 +76,13 @@ class FakeYouTrack:
                 self.comment(db_id, self.login, json.loads(request.content)["text"])
                 c = self.comments[db_id][-1]
                 return json_response({"id": c["id"], "created": c["created"]})
+            if len(rest) == 2 and rest[0] == "comments" and method == "POST":
+                c = next((c for c in self.comments.get(db_id, []) if c["id"] == rest[1]), None)
+                if c is None:
+                    return json_response({"error": "Not Found"}, 404)
+                c["text"] = json.loads(request.content)["text"]
+                self.comment_edits += 1
+                return json_response({"id": c["id"]})
             if len(rest) == 3 and rest[0] == "comments" and rest[2] == "reactions":
                 if not any(c["id"] == rest[1] for c in self.comments.get(db_id, [])):
                     return json_response({"error": "Not Found"}, 404)

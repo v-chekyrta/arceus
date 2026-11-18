@@ -196,6 +196,9 @@ class IssueTrackerConfig(Strict):
     tags: TrackerTags = TrackerTags()
     tags_on: TagsOn = TagsOn()
     states: TrackerStates
+    # The comment that says the agent took a ticket also says, while it works, what it is doing: the step, its
+    # latest actions, the merge requests (ticket_progress.py). Off: that comment stays as it was posted.
+    progress_comment: bool = True
 
     _gone = _refuse_gone("tracker")
     _check_env = field_validator("token_env")(_env_name)
@@ -350,6 +353,8 @@ class Schedule(Strict):
     poll_off_hours: Duration = timedelta(minutes=10)
     poll_local: Duration = timedelta(minutes=2)
     poll_progress: Duration = timedelta(seconds=30)  # engine steps and agent activity: local files only
+    progress_comment_every: Duration = timedelta(minutes=5)  # the ticket's progress comment, at most this often
+                                                            # unless the task's state or step changed
     review_debounce: Duration = timedelta(minutes=5)
 
     _accept_old = _accept_retired("schedule", ("repo_sync",))

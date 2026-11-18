@@ -128,6 +128,7 @@ class IssueTracker(Protocol):
     (reads_attachments False or missing: the agent works from the ticket's text and comments only);
     in_state (missing: the code review answers only on tickets whose merge requests the runner opened);
     react (missing: a command the runner took gets no reaction, only what follows from it).
+    edit_comment (missing: the comment that says the agent took a ticket is not kept up to date).
     """
 
     name: str            # the service in health checks, metrics and events: "youtrack"
@@ -183,6 +184,10 @@ class IssueTracker(Protocol):
 
     def add_comment(self, db_id: str, text: str) -> tuple[str, int]:
         """Post a Markdown comment as the bot; returns its (id, created ms)."""
+
+    def edit_comment(self, db_id: str, comment_id: str, text: str) -> None:
+        """Replace the text of one of the bot's own comments, keeping its id. Optional: ticket_progress.py keeps
+        the comment that says the agent took the ticket up to date with it."""
 
     def attachments(self, db_id: str) -> list[Attachment]:
         """Every file on the issue and on its comments, oldest first, removed ones left out. Only called
