@@ -1762,3 +1762,143 @@ def test_a_review_stop_in_a_later_round_asks_names_the_open_mr_and_the_answer_go
     sha = fix_and_settle(w, "agreed.txt", "Renamed as agreed")
     task = w.store.task("ACME-1")
     assert task.state == "code_review" and w.remote_branch(task.branch) == sha and len(w.gl.mrs) == 1
+
+
+# -- open MR discussions come with a comment on the ticket ------------------------------------
+
+def review_without_mention(w: World) -> str:
+    """A reviewer's notes on the MR that address nobody, and the noise around them."""
+    d = w.gl.note(1, "reviewer", "`user` should be typed `User`, not `User_`", path="app/login.py", line=12)
+    gone = w.gl.note(1, "reviewer", "Typo in the docstring", path="app/login.py", line=3)
+    next(x for x in w.gl.discussions[1] if x["id"] == gone)["notes"][0]["resolved"] = True
+    w.gl.note(1, w.gl.username, "Arceus pushed the branch")                 # the runner's own note
+    w.gl.note(1, "ci-bot", "added 1 commit", system=True)
+    return d
+
+
+def test_mr_notes_without_a_mention_still_wake_nothing(w):
+    published(w)
+    review_without_mention(w)
+    w.tick()
+    later(w)
+    later(w)
+    assert sends(w) == []
+
+
+def test_a_ticket_comment_brings_the_open_mr_discussions_along(w):
+    published(w)
+    review_without_mention(w)
+    w.yt.comment("2-1", "j.doe", "Discussions have been added to the MR created.")
+    w.tick()
+    later(w)
+    [send] = sends(w)
+    text = send["argv"][-1]
+    assert "Discussions have been added" in text
+    assert "## Open discussions on the merge requests" in text
+    assert "should be typed `User`" in text and "app/login.py:12" in text
+    assert "Typo in the docstring" not in text                                 # resolved
+    assert "Arceus pushed the branch" not in text and "added 1 commit" not in text
+    assert text.index("## Open discussions") < text.index("## What to do")
+
+
+def test_a_thread_addressed_to_the_agent_is_not_shown_twice(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Please rename this function", path="app/login.py", line=12)
+    w.yt.comment("2-1", "j.doe", "And see the MR")
+    w.tick()
+    later(w)
+    [send] = sends(w)
+    assert send["argv"][-1].count("Please rename this function") == 1
+    assert "## Open discussions on the merge requests" not in send["argv"][-1]
+
+
+def test_an_answer_to_the_agents_question_brings_the_open_mr_discussions(w):
+    # The agent asked for the MR's notes, since it cannot read the MR; "see the MR" is enough now.
+    published(w)
+    review_without_mention(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Rename it")
+    w.tick()
+    later(w)
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
+        state="needs_input", attempt_live=False, question={"id": "q-9", "text": "Which notes?", "options": []}))
+    w.tick()
+    w.yt.comment("2-1", "j.doe", "See the discussions on the MR")
+    w.tick()
+    answer = sends(w)[1]
+    assert "--answers" in answer["argv"]
+    assert "See the discussions on the MR" in answer["argv"][-1]
+    assert "should be typed `User`" in answer["argv"][-1] and "Typo in the docstring" not in answer["argv"][-1]
+    assert "Rename it" not in answer["argv"][-1]      # addressed to the agent: its review round brought it
+
+
+def test_a_continue_brings_the_open_mr_discussions(w):
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Rename it")
+    w.tick()
+    later(w)
+    w.settle("ACME-1", "failed", review="needs-user", state_reason="needs-user")
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed"
+    w.yt.clock = task.failed_at_ms + 1000
+    review_without_mention(w)
+    w.yt.comment("2-1", "j.doe", "/continue Discussions have been added to the MR created.")
+    w.tick()
+    w.tick()
+    text = sends(w)[-1]["argv"][-1]
+    assert "asked you to continue this task" in text and "should be typed `User`" in text
+
+
+def asked_a_question(w: World) -> None:
+    published(w)
+    w.gl.note(1, "reviewer", "@acme-agent-bot Rename it")
+    w.tick()
+    later(w)
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
+        state="needs_input", attempt_live=False, question={"id": "q-9", "text": "Which notes?", "options": []}))
+    w.tick()
+
+
+def test_an_answer_waits_while_the_code_host_cannot_give_the_discussions(w, monkeypatch):
+    asked_a_question(w)
+    review_without_mention(w)
+    real = w.runner.review.host.notes
+
+    def down(*a, **k):
+        raise ServiceError("gitlab", "unavailable", 503)
+    monkeypatch.setattr(w.runner.review.host, "notes", down)
+    w.yt.comment("2-1", "j.doe", "See the MR")
+    w.tick()
+    w.tick()
+    assert len(sends(w)) == 1 and w.store.task("ACME-1").state == "needs_input"   # not sent without them
+    monkeypatch.setattr(w.runner.review.host, "notes", real)
+    w.tick()
+    assert len(sends(w)) == 2 and "should be typed `User`" in sends(w)[1]["argv"][-1]
+
+
+def test_the_discussions_sent_with_an_answer_stay_as_they_were_read(w):
+    # The engine dedups by message id: a retry of the same answer must carry the same text.
+    asked_a_question(w)
+    review_without_mention(w)
+    w.yt.comment("2-1", "j.doe", "See the MR")
+    task = w.store.task("ACME-1")
+    first = w.runner.delivery.open_threads(task, "answer:x")
+    w.gl.note(1, "reviewer", "A new thought written later")
+    assert w.runner.delivery.open_threads(task, "answer:x") == first
+    assert "A new thought" not in first[0] and "A new thought" in w.runner.delivery.open_threads(task, "answer:y")[0]
+
+
+def test_a_merged_mr_brings_no_discussions(w):
+    asked_a_question(w)
+    review_without_mention(w)
+    w.gl.mr(1)["state"] = "merged"
+    task = w.store.task("ACME-1")
+    assert w.runner.delivery.open_threads(task, "answer:z") == ("", [])
+
+
+def test_many_open_threads_all_come_along(w):
+    published(w)
+    for i in range(30):
+        w.gl.note(1, "reviewer", f"Note {i:02d} " + "x" * 1990, path="app/login.py", line=i + 1)
+    text, writers = w.runner.review.open_threads(w.store.task("ACME-1"))
+    assert all(f"Note {i:02d}" in text for i in range(30)) and writers == ["reviewer"]

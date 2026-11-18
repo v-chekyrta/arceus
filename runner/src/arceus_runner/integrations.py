@@ -272,6 +272,7 @@ class Note:
     line: int | None
     url: str
     commit: str | None = None  # the version of the merge request a diff comment was written on
+    resolved: bool = False     # people marked its thread resolved (a host without that: never)
 
 
 @dataclass(frozen=True)

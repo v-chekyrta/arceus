@@ -28,6 +28,7 @@ The task is reconciled with `night-shift task show` every `poll_local`:
 On each poll of the code host the runner watches every MR of the task for:
 
 - review notes by people that mention the bot (`@` and `code_host.bot_user`), in every discussion, late replies in old threads included. Anyone with access to the repository may ask the agent this way; the text goes through the security screen. Notes without the mention, the bot's own and the host's system notes wake nothing;
+  a comment on the ticket brings them along, though: every one that goes to the agent (review, an answer to its question, a `/continue`) carries the threads people left unresolved on the task's open MRs, under "Open discussions on the merge requests", so "see the discussions on the MR" can be followed (the agent cannot read the code host itself). They are context there, not requests, and the runner posts no answers in them; threads already addressed to the agent in the round, resolved ones, and the runner's and the code review's own notes are left out;
 - the head pipeline: a failure of the commit the runner published is sent with the failed jobs and the end of their logs; a running, cancelled or older pipeline is not, and one that turns green or is replaced before it is sent is dropped;
 - a conflict the code host has confirmed (GitLab `detailed_merge_status: conflict`; `checking` does not count);
 - ticket comments by people in `allowed_users`, except `/review` and `/security-allow` / `/security-reject`, which are the runner's.

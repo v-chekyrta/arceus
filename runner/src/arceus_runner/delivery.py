@@ -1078,6 +1078,25 @@ class Delivery:
         self.events.emit("task_needs_input", task_id=task.task_id, question_id=q.get("id"),
                          blocked=words["blocked"], **({"review": True} if review_asked else {}))
 
+    def open_threads(self, task: Task, ref: str) -> tuple[str, list[str]]:
+        """The open MR discussions not addressed to the agent, for the comment on the ticket `ref`
+        (ReviewLoop.open_threads). Read once and kept: a retry under the same message id, or the same text waiting
+        for a security reviewer, must not change because someone wrote on the MR meanwhile."""
+        review = getattr(self, "review", None)
+        if not review:
+            return "", []
+        key = f"{task.task_id}:mr-context:{ref}"
+        kept = self.store.action(key)
+        if kept:
+            data = json.loads(kept[1] or "{}")
+            return data.get("text", ""), data.get("writers", [])
+        text, writers = review.open_threads(task)  # ServiceError: the comment waits for a later tick
+        payload = json.dumps({"text": text, "writers": writers})
+        with self.store.transaction():
+            self.store.action_intent(key, task.task_id, "mr_context", payload)
+            self.store.action_done(key, payload)
+        return text, writers
+
     def check_answers(self) -> None:
         """A comment from an allowed person after the question is the answer."""
         c = self.cfg.tracker
@@ -1101,11 +1120,14 @@ class Delivery:
                     continue  # the answer is read again on a later tick; the task stays in needs_input
                 files = self.ticket_files(task, {str(answer.id)}, [answer])
                 text = answer.text if answer.text.strip() else f"{answer.author} answered with files only."
+                threads, writers = self.open_threads(task, f"answer:{answer.id}")  # it may say "see the MR"
+                if threads:
+                    text += f"\n{threads}"
                 if files:
                     text, files = materials.with_section(
                         text, files, self._files_folder(task),
                         [(f"the answer by {answer.author}", str(answer.id), answer.text)])
-                clearance = self.gate.clear(task, "answer", text, authors=[answer.author,
+                clearance = self.gate.clear(task, "answer", text, authors=[answer.author, *writers,
                                                                            *(m.attachment.author for m in files)],
                                             resume_state="needs_input", files=materials.screen_files(files))
                 if clearance is None or not self.workspace.followup_ready(task):
@@ -1224,12 +1246,15 @@ class Delivery:
         files = self.ticket_files(task, {asked.id}, [asked])
         if data.get("text"):
             text += f"\n\n{data['text']}"
+        threads, writers = self.open_threads(task, key)  # the request may say "see the MR"
+        if threads:
+            text += f"\n{threads}"
         if files:
             text, files = materials.with_section(
                 text, files, self._files_folder(task),
                 [(f"the request by {data['author']}", asked.id, data.get("text") or "")])
-        if data.get("text") or files:
-            clearance = self.gate.clear(task, "continue", text, authors=[data["author"],
+        if data.get("text") or files or threads:
+            clearance = self.gate.clear(task, "continue", text, authors=[data["author"], *writers,
                                                                          *(m.attachment.author for m in files)],
                                         resume_state=task.state, ref=key, files=materials.screen_files(files))
             if clearance is None:

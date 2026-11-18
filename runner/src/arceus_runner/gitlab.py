@@ -187,7 +187,7 @@ class GitLabReview(GitLabWriter):
                     id=n["id"], discussion_id=disc["id"], author=(n.get("author") or {}).get("username") or "",
                     body=n.get("body") or "", system=bool(n.get("system")), created_at=n.get("created_at") or "",
                     path=pos.get("new_path") or pos.get("old_path"), line=pos.get("new_line") or pos.get("old_line"),
-                    url=f"{mr_url}#note_{n['id']}", commit=pos.get("head_sha")))
+                    url=f"{mr_url}#note_{n['id']}", commit=pos.get("head_sha"), resolved=bool(n.get("resolved"))))
         return out
 
     def failed_jobs(self, project_id: int, pipeline_id: int) -> list[FailedJob]:

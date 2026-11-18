@@ -53,6 +53,9 @@ TRACE_JOBS = 3
 TRACE_CHARS = 2500
 NOTE_CHARS = 2000    # one note of a thread, as the agent sees it
 THREAD_CHARS = 8000  # one thread: its first note and the latest ones, the middle left out
+OPEN_THREADS_CHARS = 60000  # all the open threads a comment on the ticket brings along
+MIN_OPEN_THREAD_CHARS = 1500  # the least room one of them gets
+OPEN_THREADS_TITLE = "Open discussions on the merge requests"
 _OUR_MARKER = re.compile(r"\s*<!-- arceus:[^>]*-->")
 
 
@@ -144,6 +147,12 @@ def _fit(lines: list[str], limit: int = THREAD_CHARS) -> list[str]:
         room -= len(line) + 1
     left_out = len(lines) - 1 - len(tail)
     return [lines[0], f"- … {left_out} earlier {'note' if left_out == 1 else 'notes'} left out …", *tail]
+
+
+def _with_section(text: str, section: str) -> str:
+    """`section` before the round's "What to do", so the instructions stay last."""
+    head, sep, tail = text.partition("\n## What to do\n")
+    return f"{head.rstrip()}\n{section}{sep}{tail}" if sep else f"{text.rstrip()}\n{section}"
 
 
 class ReviewLoop:
@@ -460,6 +469,13 @@ class ReviewLoop:
                                            else "mr")
             threads, writers = self._threads(task, pending)
             text = self._compose(task, pending, batch_id, threads)
+            if any(s.kind == "ticket" for s in pending):
+                # A comment on the ticket may be about the MR's discussions: they come along (open_threads).
+                addressed = {(s.repo, s.discussion_id) for s in pending if s.kind == "review" and s.discussion_id}
+                section, others = self.open_threads(task, addressed)
+                if section:
+                    text = _with_section(text, section)
+                    writers += others
             batch = self.store.make_batch(batch_id, task.task_id, source, humans[0] if humans else
                                           self.cfg.tracker.bot_user, text, ci_only, self.d.now().isoformat(), ids,
                                           authors=list(dict.fromkeys([*humans, *writers])))
@@ -547,7 +563,8 @@ class ReviewLoop:
                 out.append(f"### {label} · {key[0]}\n" + "\n".join(f"- NEW: {b}" for b in asked))
         return out, writers
 
-    def _render_thread(self, label: str, repo: str, thread: list[Note], new: set[str]) -> str:
+    def _render_thread(self, label: str, repo: str, thread: list[Note], new: set[str],
+                       limit: int = THREAD_CHARS) -> str:
         """`new`: the ids of the notes that ask something of the agent in this round."""
         bot = self.cfg.code_host.bot_user
         first = thread[0]
@@ -557,11 +574,71 @@ class ReviewLoop:
         for n in thread:
             who = "you (the runner posted this for you)" if n.author == bot else n.author
             body = _OUR_MARKER.sub("", n.body).strip()
-            if len(body) > NOTE_CHARS:
-                body = body[:NOTE_CHARS].rstrip() + " …"
+            most = min(NOTE_CHARS, max(500, limit - 300))  # the thread's room holds at least its first note
+            if len(body) > most:
+                body = body[:most].rstrip() + " …"
             mark = "NEW, to you: " if str(n.id) in new else ""
             lines.append(f"- {mark}{who}: " + body.replace("\n", "\n  "))
-        return "\n".join([f"### {label} · {repo}{where}{version}", first.url, *_fit(lines)])
+        return "\n".join([f"### {label} · {repo}{where}{version}", first.url, *_fit(lines, limit)])
+
+    def open_threads(self, task: Task, skip: set[tuple[str, str]] = frozenset()) -> tuple[str, list[str]]:
+        """The threads people left open on the task's MRs that are not addressed to the agent, as a section of a
+        follow-up, and whose words are in it.
+
+        They wake nothing on their own: people talk to each other there. But a comment on the ticket that sends the
+        agent to them ("discussions have been added to the MR") can only be followed when they come along,
+        since the agent cannot read the code host itself. So every comment on the ticket that goes to the agent, as
+        review, as an answer or as a `/continue`, brings them. `skip`: (repo, discussion) already in the round.
+
+        The MRs' state is read afresh: outside Code Review nothing else keeps it current. A code host that does not
+        answer raises ServiceError, so the comment waits for a later tick rather than going without what it is
+        about; an MR the host no longer has is left out.
+        """
+        bot = self.cfg.code_host.bot_user
+        approver = getattr(self.host, "approver", "")
+        blocks: list[tuple[str, list[Note]]] = []
+        urls = []
+        for mr in self.store.task_mrs(task.task_id):
+            try:
+                if self.host.mr_status(mr.project_id, mr.iid).state != "opened":
+                    continue
+                notes = self.host.notes(mr.project_id, mr.iid, mr.url)
+            except NotFound:
+                continue
+            urls.append(mr.url)
+            threads: dict[str, list[Note]] = {}
+            for n in notes:
+                if not n.system:
+                    threads.setdefault(n.discussion_id, []).append(n)
+            for did, thread in threads.items():
+                if (mr.repo, did) in skip or all(n.resolved for n in thread):
+                    continue
+                if any(n.author != bot and self.host.mentions_bot(n.body) for n in thread):
+                    continue  # addressed to the agent: a review round brings it, as a request
+                if any(n.author != bot and not (n.author == approver and "<!-- arceus:" in n.body) for n in thread):
+                    blocks.append((mr.repo, thread))  # not only the runner's own notes, or the code review's
+        if not blocks:
+            return "", []
+        lines = ["", f"## {OPEN_THREADS_TITLE}", "",
+                 "People left these threads open on the merge requests of this task. They were not addressed to "
+                 "you, so on their own they ask nothing of you. A comment on the ticket may send you to them (for "
+                 "example \"see the discussions on the MR\"): then they are what you are asked to do, as if each "
+                 "had been written to you. You cannot read the merge requests yourself; this is their text now. "
+                 "Say in your result, for each thread you acted on, its file and line and what you did, or why you "
+                 "left it as it is.", ""]
+        # Many threads get less room each, so all of them come along: first note and latest replies stay (_fit).
+        room = max(MIN_OPEN_THREAD_CHARS, min(THREAD_CHARS, OPEN_THREADS_CHARS // len(blocks)))
+        used, writers = 0, []
+        for i, (repo, thread) in enumerate(blocks, 1):
+            block = self._render_thread(f"D{i}", repo, thread, set(), limit=room)
+            if used + len(block) > OPEN_THREADS_CHARS:
+                lines.append(f"- … {len(blocks) - i + 1} more open threads left out for length, on "
+                             + ", ".join(urls) + ". Ask on the ticket for the ones you need.")
+                break
+            lines += [block, ""]
+            used += len(block)
+            writers += [n.author for n in thread if n.author != bot]  # only words that are in the text
+        return "\n".join(lines).rstrip() + "\n", list(dict.fromkeys(writers))
 
     def _compose(self, task: Task, signals: list[Signal], batch_id: str | None = None,
                  threads: list[str] | None = None) -> str:
