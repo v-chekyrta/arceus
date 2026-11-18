@@ -29,6 +29,11 @@ tracker:
   #     remove: [in development]
   #   answered:                        # research ticket (agent-research): the answer is posted, each /continue too
   #     add: [answered]
+  # Tags that name a platform, and the repositories (workspace paths) its work goes to. Every tag reaches the
+  # agent and the reviewers anyway; a tag listed here also holds back the MRs until one of its repositories changed.
+  # platforms:
+  #   android: [mobile/app-android]
+  #   ios: [mobile/app-ios]
   states:
     queued: To Do
     in_progress: In Progress

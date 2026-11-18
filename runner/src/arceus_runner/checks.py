@@ -12,7 +12,8 @@ from typing import Literal
 
 from arceus_runner.config import Config, Secrets
 from arceus_runner.http import ServiceClient, ServiceError
-from arceus_runner.integrations import IssueTracker, build_code_host, build_register, build_tracker
+from arceus_runner.integrations import (CodeHost, IssueTracker, build_code_host, build_register, build_tracker,
+                                        usable_repos)
 from arceus_runner.slack import Slack, SlackApiError
 
 Status = Literal["ok", "warn", "fail"]
@@ -90,6 +91,8 @@ def run_online_checks(cfg: Config, secrets: Secrets, register: bool = False) -> 
                 results += check_register(cfg, advisories, host.scope)
             finally:
                 advisories.close()
+        if cfg.tracker.platforms:
+            results += _guard(host.name, lambda: check_platforms(cfg, host))
         if cfg.slack and cfg.slack.alerts_channel:
             sc = slack_client(cfg, secrets)
             try:
@@ -107,6 +110,18 @@ def run_online_checks(cfg: Config, secrets: Secrets, register: bool = False) -> 
             if getattr(host, extra, None):
                 getattr(host, extra).close()
     return results
+
+
+def check_platforms(cfg: Config, host: CodeHost) -> list[Check]:
+    """Every repository `tracker.platforms` names is one the agent gets: a wrong path would hold back every
+    ticket tagged for that platform."""
+    have = {r.relative_path for r in usable_repos(cfg, host.repos())}
+    out = []
+    for name, repos in cfg.tracker.platforms.items():
+        lost = [r for r in repos if r not in have]
+        out.append(Check(f"tracker.platforms.{name}", "fail" if lost else "ok",
+                         f"not repositories the agent gets: {', '.join(lost)}" if lost else ", ".join(repos)))
+    return out
 
 
 def _guard(service: str, fn) -> list[Check]:

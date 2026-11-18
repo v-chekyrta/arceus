@@ -33,7 +33,8 @@ from arceus_runner.workspace import Workspace
 class Publisher:
     def __init__(self, cfg: Config, store: TaskStore, events: EventLog, git: Git, host: CodeHost,
                  tracker: IssueTracker, workspace: Workspace, *, fail: Callable[..., Any],
-                 comment_with_media: Callable[..., tuple[str, int] | None]):
+                 comment_with_media: Callable[..., tuple[str, int] | None],
+                 hold_back: Callable[[Task, set[str], int], bool] | None = None):
         self.cfg = cfg
         self.store = store
         self.events = events
@@ -43,6 +44,9 @@ class Publisher:
         self.workspace = workspace
         self.fail = fail  # Delivery.fail: the task fails with a reason, told on the ticket
         self.comment_with_media = comment_with_media  # Delivery.comment_with_media: a journaled ticket comment
+        # Delivery.platforms_missing: True when the ticket's tags hold the work back before any push (it went back
+        # to the agent, waits to, or the task failed). Asked with the repositories this round and the task's MRs touch.
+        self.hold_back = hold_back
         # review.ReviewLoop, set by the loop: counts the round, follows the MRs, sends a person's push back to the
         # agent (count_round, after_publish, note_moved).
         self.review = None
@@ -67,6 +71,10 @@ class Publisher:
         if not plan:
             self.fail(task, "no changes", attempt=attempt)
             return False
+        if self.hold_back is not None:
+            changed = {self._repo_name(p) for p, _ in plan} | {m.repo for m in self.store.task_mrs(task.task_id)}
+            if self.hold_back(task, changed, attempt):
+                return False
 
         group = {(workspace / r.relative_path).resolve(): r for r in self.host.repos()}
         missing = [str(path) for path, _ in plan if path not in group]

@@ -20,7 +20,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from arceus_runner import materials, media
+from arceus_runner import materials, media, platforms
 from arceus_runner.replies import unattributed
 from arceus_runner.config import Config
 from arceus_runner.db import REVIEW_UNDER_WAY, TaskStore, Task, TriggerDecision
@@ -101,7 +101,7 @@ class Delivery:
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
         self.workspace = Workspace(cfg, store, events, git, engine, host, now)
         self.publisher = Publisher(cfg, store, events, git, host, tracker, self.workspace, fail=self.fail,
-                                   comment_with_media=self.comment_with_media)
+                                   comment_with_media=self.comment_with_media, hold_back=self.platforms_missing)
         self.reviewer = None  # code_review.ReviewAgent, set by the loop: told of MRs and merges (review.py)
 
     @property
@@ -343,6 +343,9 @@ class Delivery:
         parent = self._parent(details)
         files = self.ticket_files(task, None, comments)
         text = f"{task.task_id}: {details.summary}\n\n{details.description}".strip()
+        tags = self._ticket_tags(task)
+        if tags:
+            text += "\n\n" + self._tags_section(tags)
         if parent:
             text += "\n\n" + parent_section(parent)
         if comments:
@@ -366,8 +369,92 @@ class Delivery:
             self.fail(task, why)
             return
         self.publish_files(task, files, fresh=True)
+        self._remember_tags(task, tags)
         self.claim_on_ticket(task)
         self.dispatch(task, text, clearance)
+
+    # -- the ticket's tags ------------------------------------------------------------------------
+
+    def _ticket_tags(self, task: Task) -> list[str]:
+        """The ticket's tags as they are now, the runner's own left out."""
+        return platforms.ticket_tags(self.tracker.tags(task.issue_db_id), self.cfg.tracker.tags)
+
+    def _tags_section(self, tags: list[str], reviewer: bool = False) -> str:
+        present = [r.relative_path for r in self.workspace.group()] if self.cfg.tracker.platforms and not reviewer else []
+        return platforms.section(tags, self.cfg.tracker.platforms, present, reviewer=reviewer)
+
+    def _remember_tags(self, task: Task, tags: list[str]) -> None:
+        """The tags the agent was last told of, so a follow-up says so when people changed them."""
+        key = f"{task.task_id}:tags"
+        with self.store.transaction():
+            self.store.action_intent(key, task.task_id, "tags")
+            self.store.action_done(key, json.dumps(tags))
+
+    def _changed_tags(self, task: Task) -> tuple[str, list[str] | None]:
+        """For a follow-up: the tags section when the ticket's tags are not the ones the agent was told of, and
+        the tags to remember once the follow-up is sent ("", None when they are the same)."""
+        tags = self._ticket_tags(task)
+        known = self.store.action(f"{task.task_id}:tags")
+        told = json.loads(known[1]) if known and known[1] else []
+        if tags == told:
+            return "", None
+        if not tags:
+            return "The ticket's tags changed since you started: it has no tags now.", tags
+        return "The ticket's tags changed since you started.\n\n" + self._tags_section(tags), tags
+
+    def platforms_missing(self, task: Task, changed: set[str], attempt: int) -> bool:
+        """The ticket's tags name a platform (tracker.platforms) none of whose repositories has changes (`changed`:
+        the repositories of this round's commits and of the task's MRs): nothing is published. The first time the
+        work goes back to the agent with what is missing; after that the ticket comes back to people, who can
+        /continue it or take the tag off. True when publishing stops here (Publisher.publish asks before any push)."""
+        if not self.cfg.tracker.platforms:
+            return False
+        tags = self._ticket_tags(task)
+        gaps = platforms.missing(tags, self.cfg.tracker.platforms, changed)
+        if not gaps:
+            return False
+        what = platforms.describe_missing(gaps)
+        done = ", ".join(f"`{r}`" for r in sorted(changed))
+        self.events.emit("platforms_missing", task_id=task.task_id, attempt=attempt, missing=sorted(gaps),
+                         changed=sorted(changed))
+        key = f"{task.task_id}:platforms"
+        if not self.store.action(key):
+            sent = self._platforms_back(task, key, what, done, tags)
+            if sent != "refused":
+                return True  # back with the agent, or waiting to go back: tried again on a later tick
+        self.fail(task, "the ticket's tags name a platform the work did not change, so nothing was published",
+                  f"Tagged, with no changes: {what}.\nThe changes are in: {done}.\n"
+                  "If the ticket needs no work for that platform, take its tag off before you continue.",
+                  attempt=attempt)
+        return True
+
+    def _platforms_back(self, task: Task, key: str, what: str, done: str, tags: list[str]) -> str:
+        """The work back to the agent once, with what the tags ask: "sent", "wait" (the workspace or Bulava is
+        busy: the task stays in publishing and is looked at again) or "refused"."""
+        text = (f"The runner did not publish your work. The ticket is tagged for platforms your changes do not "
+                f"touch: {what}. You changed only {done}. Do this ticket's work for each tagged platform in its "
+                "repository, then finish as before; the work you already did stays. If a tagged platform truly "
+                "needs no change, do not finish: ask (needs_input) and say why.\n\n"
+                # Only the names the config gives: the runner's own words, nothing a person typed.
+                + self._tags_section(list(platforms.tagged_platforms(tags, self.cfg.tracker.platforms))))
+        if not self.workspace.followup_ready(task):
+            return "wait"
+        reply = self.engine.send(task_id=task.task_id, message_id=f"platforms-{task.task_id}", source="other",
+                                 author=self.cfg.tracker.bot_user, repo=Path(task.repo_path), text=text,
+                                 clearance=trusted(text), extra_dirs=self.workspace.extra_dirs_file(task))
+        if reply.rc == 6:
+            self.events.emit("send_busy", task_id=task.task_id, reason=reply.why())
+            return "wait"
+        if not reply.accepted:
+            self.events.emit("platforms_back_refused", task_id=task.task_id, reason=reply.why())
+            return "refused"
+        with self.store.transaction():
+            self.store.action_intent(key, task.task_id, "platforms")
+            self.store.action_done(key, json.dumps({"attempt": reply.data.get("attempt")}))
+            self.store.update_task(task.task_id, state="dispatched", attempt_started=self.now().isoformat())
+        self._remember_tags(task, tags)
+        self.events.emit("platforms_sent_back", task_id=task.task_id, attempt=reply.data.get("attempt"))
+        return "sent"
 
     # -- what people wrote and attached on the ticket ---------------------------------------------
 
@@ -1101,6 +1188,9 @@ class Delivery:
                     continue  # the answer is read again on a later tick; the task stays in needs_input
                 files = self.ticket_files(task, {str(answer.id)}, [answer])
                 text = answer.text if answer.text.strip() else f"{answer.author} answered with files only."
+                tags, new_tags = self._changed_tags(task)
+                if tags:
+                    text += f"\n\n{tags}"
                 if files:
                     text, files = materials.with_section(
                         text, files, self._files_folder(task),
@@ -1127,6 +1217,8 @@ class Delivery:
                                              text=text, clearance=clearance,
                                              extra_dirs=self.workspace.extra_dirs_file(task))
                 if self._after_send(task, reply, "answer_sent", untag=c.tags.needs_input, author=answer.author):
+                    if new_tags is not None:
+                        self._remember_tags(task, new_tags)
                     if hasattr(self.store, "consume_signal"):
                         self.store.consume_signal(f"yt-{answer.id}", task.task_id, "ticket", answer.author,
                                                   answer.text, self.now().isoformat(), "answer")
@@ -1224,11 +1316,14 @@ class Delivery:
         files = self.ticket_files(task, {asked.id}, [asked])
         if data.get("text"):
             text += f"\n\n{data['text']}"
+        tags, new_tags = self._changed_tags(task)
+        if tags:
+            text += f"\n\n{tags}"
         if files:
             text, files = materials.with_section(
                 text, files, self._files_folder(task),
                 [(f"the request by {data['author']}", asked.id, data.get("text") or "")])
-        if data.get("text") or files:
+        if data.get("text") or files or tags:
             clearance = self.gate.clear(task, "continue", text, authors=[data["author"],
                                                                          *(m.attachment.author for m in files)],
                                         resume_state=task.state, ref=key, files=materials.screen_files(files))
@@ -1241,6 +1336,8 @@ class Delivery:
                                  source=self.tracker.engine_source, author=data["author"], repo=Path(task.repo_path),
                                  text=text, clearance=clearance, extra_dirs=self.workspace.extra_dirs_file(task))
         if reply.accepted:  # dispatched, or a duplicate of what Bulava took before a crash
+            if new_tags is not None:
+                self._remember_tags(task, new_tags)
             self._resumed(task, key, data, state="dispatched", attempt=reply.data.get("attempt"))
         elif reply.rc == 6:
             self.events.emit("send_busy", task_id=task.task_id, reason=reply.why())

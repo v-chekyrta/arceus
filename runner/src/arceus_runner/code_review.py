@@ -1609,7 +1609,11 @@ class ReviewAgent:
         if row.request:
             lines += [f"What {row.author} asked of the review: {row.request}", ""]
         lines += ["## The ticket", "", f"{issue.key}: {issue.summary}", "", issue.description.strip() or "(no description)",
-                  "", "## Comments on the ticket, oldest first", ""]
+                  ""]
+        tags = self.d._tags_section(self.d._ticket_tags(task), reviewer=True)
+        if tags:
+            lines += [tags, ""]
+        lines += ["## Comments on the ticket, oldest first", ""]
         shown = [x for x in comments if x.text.strip()]
         for x in shown:
             who = "Arceus (the runner)" if x.author == bot else x.author

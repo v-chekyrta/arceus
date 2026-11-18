@@ -193,12 +193,35 @@ class IssueTrackerConfig(Strict):
     token_env: str  # name of the variable in secrets.env; each provider has its own default
     bot_user: str = Field(min_length=1)  # the bot's login: its own comments are never read as people's
     allowed_users: list[str] = Field(min_length=1)  # tracker logins who may start the agent with the queue tag
+    # Tags that name a platform -> the repositories (paths in the workspace) where its work goes, e.g.
+    # {android: [mobile/app-android], ios: [mobile/app-ios]}. Every tag reaches the agent anyway; a mapped one
+    # also holds back publishing until one of its repositories has changes (platforms.py).
+    platforms: dict[str, list[str]] = {}
     tags: TrackerTags = TrackerTags()
     tags_on: TagsOn = TagsOn()
     states: TrackerStates
 
     _gone = _refuse_gone("tracker")
     _check_env = field_validator("token_env")(_env_name)
+
+    @model_validator(mode="after")
+    def _platforms(self) -> IssueTrackerConfig:
+        from arceus_runner.platforms import runner_tags  # platforms.py imports this module
+        own = runner_tags(self.tags)
+        seen: set[str] = set()
+        for name, repos in self.platforms.items():
+            key = name.strip().lower()
+            if not key or key != name.lower():
+                raise ValueError(f"tracker.platforms: {name!r} is not a tag name")
+            if key in own:
+                raise ValueError(f"tracker.platforms: {name!r} is one of the runner's own tags")
+            if key in seen:
+                raise ValueError(f"tracker.platforms: {name!r} is given twice")
+            seen.add(key)
+            if not repos or any(not r.strip() or r.strip() != r or r.startswith("/") for r in repos):
+                raise ValueError(f"tracker.platforms.{name}: a list of repository paths in the workspace "
+                                 f"(as `mobile/app-ios`), got {repos!r}")
+        return self
 
     @model_validator(mode="after")
     def _users(self) -> IssueTrackerConfig:
