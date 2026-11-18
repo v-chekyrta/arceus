@@ -165,6 +165,10 @@ class IssueTracker(Protocol):
 
     def tags(self, db_id: str) -> set[str]: ...
 
+    def tag_author(self, db_id: str, tag: str) -> str | None:
+        """Who put `tag` on the issue most recently, from the tracker's own history; None when it does not say.
+        The same security boundary as trigger(): never the reporter, the assignee or the last editor."""
+
     def add_tag(self, db_id: str, name: str) -> None:
         """Idempotent: a tag already there is left as it is."""
 
@@ -367,6 +371,10 @@ class CodeHost(Protocol):
     def description(self, repo_id: Id, iid: Id) -> str: ...
 
     def set_description(self, repo_id: Id, iid: Id, description: str) -> None: ...
+
+    def merge_when_green(self, repo_id: Id, iid: Id, sha: str) -> None:
+        """Merge the MR once its pipeline passes (at once if it already has), only while its head is `sha`.
+        Raises ServiceError when the host refuses (conflicts, a draft, no right to merge)."""
 
     def note_mr(self, repo_id: Id, iid: Id, body: str) -> None:
         """A plain comment on the merge request."""

@@ -190,6 +190,9 @@ class FakeGitLab:
         self.retry_after: str | None = None
         self.requests: list[httpx.Request] = []
         self.repos = ["acme-platform", "acme-theme", "acme-infra"]
+        self.merge_requests: list[tuple[int, dict]] = []   # PUT …/merge: (iid, body)
+        self.merge_refusal = ""                             # set: GitLab refuses every merge with this message
+        self.head_sha = ""                                  # the source head an MR reports when it has no "sha" of its own
         self.token = {"scopes": ["api"], "expires_at": "2027-06-01", "active": True}
         self.branch_late = 0  # MR creations refused with "source_branch does not exist" before one goes through
         self.urls: dict[str, str] = {}
@@ -251,7 +254,7 @@ class FakeGitLab:
             tail = parts[parts.index("merge_requests") + 2:]
             if not tail and request.method == "GET":
                 return json_response({**mr, "detailed_merge_status": mr.get("detailed_merge_status", "mergeable"),
-                                      "sha": mr.get("sha", ""), "head_pipeline": mr.get("head_pipeline")})
+                                      "sha": mr.get("sha") or self.head_sha, "head_pipeline": mr.get("head_pipeline")})
             if not tail and request.method == "PUT":
                 body = json.loads(request.content)
                 if body.pop("state_event", None) == "close":
@@ -264,6 +267,15 @@ class FakeGitLab:
                 more = len(versions) > page * n
                 return json_response(versions[(page - 1) * n:page * n],
                                      headers={"x-next-page": str(page + 1) if more else ""})
+            if tail == ["merge"] and request.method == "PUT":
+                body = json.loads(request.content)
+                self.merge_requests.append((iid, body))
+                if self.merge_refusal:
+                    return json_response({"message": self.merge_refusal}, 405)
+                if body.get("sha") and body["sha"] != mr.get("sha", body["sha"]):
+                    return json_response({"message": "SHA does not match HEAD of source branch"}, 409)
+                mr["merge_when_pipeline_succeeds"] = True
+                return json_response(mr)
             if tail == ["approvals"]:
                 return json_response({"approved_by": [{"user": {"username": u}} for u in mr.get("approved_by", [])]})
             if tail == ["approve"] and request.method == "POST":

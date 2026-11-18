@@ -21,6 +21,8 @@ tracker:
     needs_input: agent-needs-input
     failed: agent-failed
     research: agent-research           # with the queue tag: answer the question, no MR
+    merge: agent-merge                 # with the queue tag, from someone allowed: the reviewed MRs merge once
+                                       # green (a default branch that deploys dev: "deploy to dev")
   # Tags the runner adds to / removes from the ticket at its own steps. Optional, nothing by default.
   # The tags must already exist in YouTrack; the ones in `tags:` above are not allowed here.
   # tags_on:

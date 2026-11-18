@@ -35,6 +35,7 @@ from arceus_runner.integrations import (
     Issue,
     IssueDetails,
     IssueTracker,
+    MergeRequest,
     Repo,
     key_part,
 )
@@ -75,7 +76,7 @@ RESUME = "The session was interrupted (a reboot or a crash). Continue the task f
 CONTINUE = "/continue"  # a comment that starts with this, from someone allowed, resumes a failed task (_continuable)
 # Which client a journaled action goes through: one that fails holds back only its own actions (retry_pending).
 # Reactions have their own client on the code host (GitLabHost.reactions_client); the rest go to the tracker.
-ACTION_CLIENTS = {"reply": "code_host", "mr_react": "reactions"}
+ACTION_CLIENTS = {"reply": "code_host", "mr_react": "reactions", "merge": "code_host"}
 TAKEN = "eyes"  # the reaction on a command the runner took: the person sees it was seen and will be done
 
 
@@ -101,7 +102,8 @@ class Delivery:
         self.gate = Gate(self, classify)  # every text from people or CI passes it before the engine sees it
         self.workspace = Workspace(cfg, store, events, git, engine, host, now)
         self.publisher = Publisher(cfg, store, events, git, host, tracker, self.workspace, fail=self.fail,
-                                   comment_with_media=self.comment_with_media)
+                                   comment_with_media=self.comment_with_media, journal_merges=self.journal_merges,
+                                   arm_merges=self.arm_merges)
         self.reviewer = None  # code_review.ReviewAgent, set by the loop: told of MRs and merges (review.py)
 
     @property
@@ -147,6 +149,79 @@ class Delivery:
         self.store.action_done(key)
 
     # -- comments: once per (task, kind), even across a crash -----------------------------------
+
+    # -- tracker.tags.merge: the reviewed MRs merge once green ------------------------------------------
+
+    def journal_merges(self, task: Task, published: list[tuple[Repo, MergeRequest, str]]) -> list[tuple[str, dict]]:
+        """tracker.tags.merge on the ticket, put there by someone in allowed_users: each reviewed MR is to merge
+        once its pipeline passes (where the default branch deploys dev by itself: "deploy it to dev"). Written to
+        the action journal, one entry per published commit, before the ticket moves on (Publisher.publish), so a
+        crash or an unwell host only delays it."""
+        c = self.cfg.tracker
+        tag = c.tags.merge
+        if not published or tag not in self.tracker.tags(task.issue_db_id):
+            return []
+        who = self.tracker.tag_author(task.issue_db_id, tag)
+        if who not in c.allowed_users:
+            shas = "-".join(sha[:10] for _, _, sha in published)
+            self.events.emit("merge_refused", task_id=task.task_id, by=who or None)
+            self.comment_once(task, f"merge-refused:{shas}",
+                              f"The `{tag}` tag was put on by {who or 'someone the tracker does not name'}, who is "
+                              f"not among the people who may start the agent, so nothing was merged. The merge "
+                              f"requests wait for people as usual.")
+            return []
+        out = []
+        for repo, mr, sha in published:
+            key = f"{task.task_id}:merge:{key_part(repo.id)}:{key_part(mr.iid)}:{sha[:12]}"
+            act = self.store.action(key)
+            if act and act[0] == "done":
+                continue
+            data = {"repo_id": repo.id, "repo": repo.relative_path, "iid": mr.iid, "url": mr.url, "sha": sha,
+                    "target": repo.default_branch or "", "by": who, "tag": tag}
+            if not act:
+                self.store.action_intent(key, task.task_id, "merge", json.dumps(data))
+            out.append((key, data))
+        return out
+
+    def arm_merges(self, task: Task, merges: list[tuple[str, dict]]) -> None:
+        """The journaled merges of a publish, once the ticket is in Code Review. A host that is unwell leaves the
+        rest in the journal for retry_pending."""
+        for key, data in merges:
+            try:
+                self._arm_merge(task, key, data)
+            except ServiceError as e:
+                self.events.emit("notify_pending", task_id=task.task_id, action=key, reason=str(e))
+                break
+
+    def _arm_merge(self, task: Task, key: str, data: dict) -> None:
+        """Set one journaled MR to merge when green, after checking it is still the reviewed change into the
+        default branch. A refusal (by these checks or by the host) is final and said on the ticket; a host that is
+        unwell raises ServiceError and the journal entry waits for the next try."""
+        st = self.host.mr_status(data["repo_id"], data["iid"])
+        if st.state == "merged":
+            result = "merged"
+        elif st.state != "opened":
+            result = "refused: the merge request is closed"
+        elif not data["target"] or st.target != data["target"]:
+            # Dev only: a default branch deploys dev; any other target (a release branch) is not ours to merge.
+            result = f"refused: it merges into `{st.target}`, not the default branch `{data['target'] or '?'}`"
+        elif st.sha != data["sha"]:
+            result = "refused: it has commits the review did not see"
+        else:
+            try:
+                self.host.merge_when_green(data["repo_id"], data["iid"], data["sha"])
+                result = "set"
+            except (BadRequest, NotFound) as e:  # conflicts, a draft, no right to merge: the host's final answer
+                result = f"refused: {str(e)[:300]}"
+        self.store.action_done(key, json.dumps({"result": result, "by": data["by"]}))
+        self.events.emit("merge_when_green" if result in ("set", "merged") else "merge_when_green_refused",
+                         task_id=task.task_id, repo=data["repo"], mr_iid=data["iid"], sha=data["sha"],
+                         detail=None if result == "set" else result)
+        said = {"set": "merges into the default branch as soon as its pipeline passes",
+                "merged": "is already merged"}.get(result, f"not set to merge ({result.removeprefix('refused: ')})")
+        self.comment_once(task, f"merge:{key_part(data['repo_id'])}:{key_part(data['iid'])}:{data['sha'][:10]}",
+                          f"Asked by {data['by']} with `{data['tag']}`: {data['url']} {said}. What the default "
+                          f"branch deploys by itself (dev) follows its merge.")
 
     def comment_once(self, task: Task, kind: str, text: str) -> tuple[str, int] | None:
         """Post a comment unless it is already there. Returns (id, created ms) of the comment."""
@@ -257,6 +332,8 @@ class Delivery:
                     self.store.action_done(key)
                 elif kind == "mr_react":
                     self.react_mr(task_id, key, data)
+                elif kind == "merge":
+                    self._arm_merge(task, key, data)
             except ServiceError as e:
                 self.events.emit("notify_pending", task_id=task_id, action=key, reason=str(e))
                 unwell.add(side)  # still unwell; the next tick tries again

@@ -1734,3 +1734,108 @@ def test_a_screenshot_shown_with_the_question_is_not_attached_again_when_the_wor
     assert attached == ["email.png", "final.png"]  # each file on the ticket once
     desc = w.gl.mrs[0]["description"]
     assert "![Admin email, draft](/uploads/" in desc and "![Admin email, final](/uploads/" in desc
+
+
+# tracker.tags.merge: "deploy it to dev". With the tag from someone allowed, the published MRs are set to merge once
+# their pipeline passes; from anyone else, nothing is merged and the ticket says why.
+
+def _merge_tag(w, who: str) -> None:
+    w.yt.issue_tags["2-1"].add("agent-merge")
+    w.yt.activities["2-1"].append({"id": "m1", "timestamp": 99, "author": {"login": who},
+                                   "added": [{"name": "agent-merge"}], "removed": []})
+
+
+def test_the_merge_tag_sets_the_reviewed_mr_to_merge_when_green(w):
+    take(w)
+    _merge_tag(w, "j.doe")
+    sha = w.agent_commits()
+    w.gl.head_sha = sha                            # GitLab sees the pushed, reviewed head
+    w.settle("ACME-1", "waiting_review")
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review"
+    [(iid, body)] = w.gl.merge_requests
+    assert iid == w.gl.mrs[0]["iid"] and body["sha"] == sha
+    assert body["auto_merge"] is True and body["merge_when_pipeline_succeeds"] is True
+    assert any("as soon as its pipeline passes" in t and "j.doe" in t for t in w.bot_comments())
+    assert w.events_named("merge_when_green")
+    w.tick()
+    assert len(w.gl.merge_requests) == 1          # once per published commit
+
+
+def test_no_merge_without_the_tag(w):
+    take(w)
+    w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review" and w.gl.merge_requests == []
+
+
+def test_the_merge_tag_from_someone_not_allowed_merges_nothing(w):
+    take(w)
+    _merge_tag(w, "stranger")
+    w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    w.tick()
+    assert w.gl.merge_requests == []
+    assert any("stranger" in t and "nothing was merged" in t for t in w.bot_comments())
+    assert w.events_named("merge_refused")
+
+
+def test_a_refused_merge_is_said_on_the_ticket(w):
+    take(w)
+    _merge_tag(w, "j.doe")
+    w.gl.head_sha = w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    w.gl.merge_refusal = "Branch cannot be merged"
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review" and len(w.gl.merge_requests) == 1
+    assert any("not set to merge" in t and "Branch cannot be merged" in t for t in w.bot_comments())
+    assert w.events_named("merge_when_green_refused")
+    w.tick()
+    assert len(w.gl.merge_requests) == 1          # a refusal is an answer: not retried every tick
+
+
+def test_an_mr_with_commits_the_review_did_not_see_is_not_merged(w):
+    take(w)
+    _merge_tag(w, "j.doe")
+    w.agent_commits()
+    w.gl.head_sha = "f" * 40                       # someone pushed on top after the review
+    w.settle("ACME-1", "waiting_review")
+    w.tick()
+    assert w.gl.merge_requests == []
+    assert any("commits the review did not see" in t for t in w.bot_comments())
+
+
+def test_an_mr_into_another_branch_is_not_merged(w):
+    take(w)
+    _merge_tag(w, "j.doe")
+    w.gl.head_sha = w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    real = w.runner.delivery.host.mr_status
+    w.runner.delivery.host.mr_status = lambda repo_id, iid: __import__("dataclasses").replace(
+        real(repo_id, iid), target="release/1.2")
+    w.tick()
+    assert w.gl.merge_requests == []
+    assert any("not the default branch" in t for t in w.bot_comments())
+
+
+def test_a_merge_the_host_could_not_take_now_is_tried_again(w):
+    take(w)
+    _merge_tag(w, "j.doe")
+    w.gl.head_sha = w.agent_commits()
+    w.settle("ACME-1", "waiting_review")
+    host = w.runner.delivery.host
+    real = host.merge_when_green
+    calls = []
+
+    def unwell_once(*a):
+        calls.append(a)
+        if len(calls) == 1:
+            from arceus_runner.http import ServiceError
+            raise ServiceError("gitlab", "503 Service Unavailable", 503)
+        return real(*a)
+    host.merge_when_green = unwell_once
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review" and w.gl.merge_requests == []
+    w.tick()                                       # retry_pending finishes the journaled merge
+    assert len(w.gl.merge_requests) == 1 and len(calls) == 2

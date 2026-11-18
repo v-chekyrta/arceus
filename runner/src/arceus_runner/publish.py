@@ -33,7 +33,9 @@ from arceus_runner.workspace import Workspace
 class Publisher:
     def __init__(self, cfg: Config, store: TaskStore, events: EventLog, git: Git, host: CodeHost,
                  tracker: IssueTracker, workspace: Workspace, *, fail: Callable[..., Any],
-                 comment_with_media: Callable[..., tuple[str, int] | None]):
+                 comment_with_media: Callable[..., tuple[str, int] | None],
+                 journal_merges: Callable[..., list[tuple[str, dict]]] | None = None,
+                 arm_merges: Callable[..., None] | None = None):
         self.cfg = cfg
         self.store = store
         self.events = events
@@ -43,6 +45,9 @@ class Publisher:
         self.workspace = workspace
         self.fail = fail  # Delivery.fail: the task fails with a reason, told on the ticket
         self.comment_with_media = comment_with_media  # Delivery.comment_with_media: a journaled ticket comment
+        # Delivery.journal_merges / arm_merges: tracker.tags.merge, the published MRs set to merge once green.
+        self.journal_merges = journal_merges
+        self.arm_merges = arm_merges
         # review.ReviewLoop, set by the loop: counts the round, follows the MRs, sends a person's push back to the
         # agent (count_round, after_publish, note_moved).
         self.review = None
@@ -97,6 +102,7 @@ class Publisher:
         for line in skipped:
             self.events.emit("media_skipped", task_id=task.task_id, detail=line)
         urls: list[str] = []
+        published: list[tuple[Repo, MergeRequest, str]] = []
         for path, r in plan:
             repo = group[path]
             sha, branch = r["reviewed_sha"], r["branch"]
@@ -114,6 +120,7 @@ class Publisher:
                 self.host.set_description(repo.id, mr.iid, description)
             self.store.upsert_mr(task.task_id, repo.relative_path, repo.id, mr.iid, mr.url, sha)
             urls.append(mr.url)
+            published.append((repo, mr, sha))
             self.events.emit("mr_ready", task_id=task.task_id, repo=repo.relative_path, mr_iid=mr.iid, url=mr.url)
 
         task = self.review.count_round(task)  # a review round counts once it ends in published code
@@ -128,10 +135,14 @@ class Publisher:
                 "\n".join(f"- {mr.url}" for _, mr, _ in dropped)
         posted = self.comment_with_media(task, f"mr:{shas}", body, visuals)
         self.review.after_publish(task, {self._repo_name(p): r["reviewed_sha"] for p, r in plan})
+        # Before the ticket moves on: a crash after this still leaves the merges in the journal.
+        merges = self.journal_merges(task, published) if self.journal_merges else []
         self.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.code_review)
         self.store.update_task(task.task_id, state="code_review", reason=None,
                                published_at_ms=task.published_at_ms or (posted[1] if posted else None))
         self.events.emit("task_published", task_id=task.task_id, mrs=urls, round=follow_up)
+        if merges and self.arm_merges:
+            self.arm_merges(task, merges)
         return True
 
     def _why_rejected(self, path: Path, branch: str, sha: str, remote: str | None, err: GitError) -> tuple[str, str]:

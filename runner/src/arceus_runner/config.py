@@ -114,10 +114,14 @@ class TrackerTags(Strict):
     # Next to the queue tag when the ticket is taken: a question to answer on the ticket, no merge request.
     # Who may start the agent is still read from the queue tag alone.
     research: str = "agent-research"
+    # Next to the queue tag, put on by someone in allowed_users: once the runner has published the reviewed
+    # change, it sets the merge requests to merge when their pipeline passes. For a project whose default
+    # branch deploys to a dev environment by itself, this is "deploy it to dev". Never a release or a tag.
+    merge: str = "agent-merge"
 
     @model_validator(mode="after")
     def _distinct(self) -> TrackerTags:
-        names = [self.queue, self.needs_input, self.failed, self.research]
+        names = [self.queue, self.needs_input, self.failed, self.research, self.merge]
         if len(set(names)) != len(names):
             raise ValueError(f"tags must be different, got {names}")
         return self
@@ -211,7 +215,7 @@ class IssueTrackerConfig(Strict):
     @model_validator(mode="after")
     def _own_tags(self) -> IssueTrackerConfig:
         # The runner's own tags drive what it does: the queue tag on a merged ticket would take it again.
-        own = {self.tags.queue, self.tags.needs_input, self.tags.failed, self.tags.research}
+        own = {self.tags.queue, self.tags.needs_input, self.tags.failed, self.tags.research, self.tags.merge}
         for step in TagsOn.model_fields:
             clash = sorted(own & set(getattr(self.tags_on, step).names))
             if clash:

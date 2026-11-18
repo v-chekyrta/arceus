@@ -972,6 +972,9 @@ class Notifier:
                "merge requests for review",
                f"`{esc(tags.queue)}` with `{esc(tags.research)}`: it investigates and answers on the ticket, no code "
                "changes",
+               f"`{esc(tags.queue)}` with `{esc(tags.merge)}`, the second tag put on by someone on the list: once "
+               "its own review passed the merge requests, each is set to merge into the default branch when its "
+               "pipeline passes (where that branch deploys dev by itself: deploy to dev)",
                f"`/continue` in a comment on a failed or stopped ticket (within {days} days): it picks the work up "
                "again, branches kept"]
         r = self.cfg.review_agent
