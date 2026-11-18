@@ -1,0 +1,72 @@
+#!/bin/bash
+# The assistant's only door to its own Night Shift engine (installed as /usr/local/bin/fa-ticket-engine, root-owned,
+# called by the assistant's run user through `sudo -n`). The engine runs as its own Linux user, which can read
+# nothing of the assistant's or the factory's: no database, no tokens, no secrets. It sees only its workspace, a copy
+# of the code mirror that this script refreshes before every ticket.
+#
+#   fa-ticket-engine sync                      refresh the workspace's code from the mirror (no task may be running)
+#   fa-ticket-engine dispatch <id> <task> <dir>  start a ticket task: <task> is its text; <dir> (brief.md and the
+#                                              ticket's files) is unpacked into briefs/<id>/ by the engine user
+#   fa-ticket-engine show <id>                 `night-shift task show --json` for it
+#   fa-ticket-engine artifact <id>             the ticket the worker wrote (artifacts/<id>.md), or exit 3
+#   fa-ticket-engine status                    doctor --server --json for the workspace
+#
+# Root never reads or writes a file itself: the engine user's folders are that user's, the assistant's (its mirror,
+# its task files) the assistant's, and a link planted in either would turn root's read or write into one on any file
+# of the machine. Every read is done by the user who owns the folder, every write by the engine user. Everything inside the
+# workspace is done as the engine user, with its own rights; and the task file and brief folder the caller names are read
+# as the assistant's user (ASSISTANT_USER), so a caller without root of its own cannot have root read a file for it.
+#
+# One desk per assistant: the script's own name picks its config, /etc/<name>.conf, and its staging copy
+# (/usr/local/bin/fa-ticket-engine-contoso -> /etc/fa-ticket-engine-contoso.conf). Desks may share one engine user,
+# each with its own WORKSPACE and MIRROR.
+set -euo pipefail
+NAME="$(basename "$0")"
+[[ "$NAME" =~ ^fa-ticket-engine(-[a-z0-9]+)?$ ]] || { echo "bad desk name" >&2; exit 2; }
+CONF=/etc/$NAME.conf
+# shellcheck disable=SC1090
+. "$CONF"     # ENGINE_USER, ENGINE_HOME, WORKSPACE, MIRROR, ENGINE_BIN, ASSISTANT_USER
+: "${ENGINE_USER:?}" "${WORKSPACE:?}" "${MIRROR:?}" "${ENGINE_BIN:?}" "${ASSISTANT_USER:?}"
+as_engine() { sudo -n -u "$ENGINE_USER" -H env -C "$WORKSPACE" bash -lc 'set -a; . "$HOME/engine.conf"; [ -f "$HOME/engine.env" ] && . "$HOME/engine.env"; set +a; exec "$@"' _ "$@"; }
+valid_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]{2,80}$ ]] || { echo "bad task id" >&2; exit 2; }; }
+
+as_user() { sudo -n -u "$ENGINE_USER" -H "$@"; }
+as_caller() { sudo -n -u "$ASSISTANT_USER" -H "$@"; }
+# A folder of the assistant's, packed by the assistant's user with its own rights: whatever a link in it points to,
+# root never reads it. Only folders and regular files go in; links, devices and pipes stay out, so nothing in the
+# engine's copy points anywhere, at the engine user's own secrets included.
+pack_as_caller() {
+  as_caller bash -c 'cd -- "$1" && find . \( -type d -o -type f \) -print0 | tar --null --no-recursion -cf - -T -' _ "$1"
+}
+# Unpacked by the engine user into a fresh folder that then takes the place of the old one: owner and modes are its own.
+unpack_as_engine() {   # $1 = destination folder (inside the workspace)
+  as_user bash -c 'set -e; new="$1.new"; rm -rf -- "$new"; mkdir -p -- "$new"
+                   tar -C "$new" --no-same-owner --no-same-permissions -xf -
+                   rm -rf -- "$1"; mv -- "$new" "$1"' _ "$1"
+}
+
+case "${1:-}" in
+  sync)
+    as_caller test -d "$MIRROR" || { echo "no mirror" >&2; exit 2; }
+    pack_as_caller "$MIRROR" | unpack_as_engine "$WORKSPACE/code"
+    ;;
+  dispatch)
+    valid_id "${2:-}"
+    [[ "${3:-}" == /* && "${4:-}" == /* ]] || { echo "task file and brief folder must be absolute paths" >&2; exit 2; }
+    as_caller test -f "$3" && as_caller test -d "$4" || { echo "no task file or brief folder" >&2; exit 2; }
+    text="$(as_caller cat -- "$3")"
+    as_user mkdir -p "$WORKSPACE/briefs"
+    pack_as_caller "$4" | unpack_as_engine "$WORKSPACE/briefs/$2"
+    as_engine "$ENGINE_BIN/dispatch.sh" --task-id "$2" --message-id "$2" --source other --author assistant \
+      --runspec "$ENGINE_HOME/ticket-runspec.json" --dirty fail "$WORKSPACE" "$text"
+    ;;
+  show)
+    valid_id "${2:-}"; as_engine night-shift task show --task-id "$2" --json ;;
+  artifact)
+    valid_id "${2:-}"
+    as_user test -f "$WORKSPACE/artifacts/$2.md" || exit 3
+    as_user cat -- "$WORKSPACE/artifacts/$2.md" ;;
+  status)
+    as_engine night-shift doctor --server --json "$WORKSPACE" ;;
+  *) echo "usage: fa-ticket-engine sync|dispatch <id> <task> <dir>|show <id>|artifact <id>|status" >&2; exit 2 ;;
+esac

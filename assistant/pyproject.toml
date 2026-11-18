@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arceus-assistant"
+version = "0.1.0"
+description = "The project's assistant beside an Arceus factory: a web chat behind the console and a bot in Slack"
+requires-python = ">=3.12"
+dependencies = [
+  # Its settings are the `assistant:` section of the runner's config.yaml, read and checked by the runner's own code.
+  "arceus-runner",
+  "starlette>=1.10,<2",
+  "uvicorn>=0.54,<0.55",
+  "python-multipart>=0.0.33,<0.1",
+  "PyYAML>=6.0,<7",
+  "httpx>=0.28,<0.29",
+  "slack_sdk>=3.36,<4",
+  "aiohttp>=3.14,<4",
+  "python-docx>=1.2,<2",
+  "openpyxl>=3.1,<4",
+  "python-pptx>=1.0,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+# Voice notes and video are transcribed on the machine (models in the assistant's own folder, ~3 GB for `medium`).
+voice = ["faster-whisper>=1.1,<2"]
+
+[project.scripts]
+arceus-assistant = "assistant.server:main"
+
+[tool.setuptools.packages.find]
+include = ["assistant*"]
+
+[tool.setuptools.package-data]
+# The prompt and the session's permissions are read at start: without them the service does not run.
+assistant = ["static/*", "static/vendor/*", "prompt.md", "session-settings.json",
+             "slack-app-manifest.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

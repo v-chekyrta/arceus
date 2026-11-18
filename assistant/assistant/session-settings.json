@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": ["Read(./**)", "Grep(./**)", "Glob(./**)"],
+    "deny": [
+      "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent",
+      "Read(//home/*/arceus/data/**)", "Read(//home/*/.ssh/**)", "Read(//home/*/.claude/**)",
+      "Read(//home/*/.codex/**)", "Read(//home/*/.config/**)", "Read(//home/*/assistant/data/**)",
+      "Read(//home/*/assistant/secrets/**)", "Read(//etc/**)", "Read(//opt/**)", "Read(//root/**)",
+      "Read(//proc/**)", "Read(**/.env)", "Read(**/*.pem)", "Read(**/*secret*)", "Read(**/*token*)"
+    ]
+  },
+  "hooks": {},
+  "autoMemoryEnabled": false,
+  "env": {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+}

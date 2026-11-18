@@ -14,6 +14,12 @@ The console runs in a container without sudo; it asks by writing a request into 
   output), written by root without following any link: the data folder is writable by the console's user, so a
   link planted there must never make root write elsewhere.
 
+The assistant's keys (`assistant-key`) are the one request that carries a secret. It is taken at once, inside
+`dispatch`, never by a transient unit: the value goes from the request straight into assistant.env (600, the run
+user's, written without following links) and the request file is removed. The ledger, the console's copy of it, the
+log and what `dispatch` prints name the key and who set it, never its value. `assistant-keys.json` in the console's
+folder says which keys are set and since when.
+
 Restarting the engine ends its tasks' sessions, so `restart-engine` first asks the runner to start nothing new in
 the engine (the drain, runner_state in runner.db; the runner acknowledges it on its next pass), waits for the
 engine's running tasks to end, restarts it, and lifts the drain however it ends.
@@ -41,12 +47,19 @@ OPS = {
     "restart-engine": ("Restart the engine when it is idle", ["bulava-engine"], "ops.restart"),
     "setup-check": ("Run the setup check", [], "ops.check"),
     "setup": ("Run setup", ["runner", "bulava-engine", "the console", "observability"], "ops.setup"),
+    "restart-assistant": ("Restart the assistant", ["assistant"], "ops.restart"),
 }
+# The assistant's keys (assistant/assistant/secrets.py): name -> what a value starts with. Set from the console's
+# Assistant page by admins (settings.edit), never read back.
+ASSISTANT_KEYS = {"ANTHROPIC_API_KEY": "sk-ant-", "OPENAI_API_KEY": "sk-", "SLACK_APP_TOKEN": "xapp-",
+                  "SLACK_BOT_TOKEN": "xoxb-", "YOUTRACK_TOKEN": "perm"}
+KEY_VALUE = re.compile(r"^[\x21-\x7e]{12,400}$")   # one printable word: no spaces, quotes or line breaks
+SLACK_KEYS = ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")
 ACTIVE = ("accepted", "running", "waiting")
 FINAL = ("succeeded", "failed", "cancelled", "interrupted", "refused")
 _ID = re.compile(r"^[0-9a-f]{32}$")
 MAX_REQUEST = 4096
-SERVICES = ("runner", "bulava-engine")
+SERVICES = ("runner", "bulava-engine", "assistant")
 ACK_WAIT = 600          # seconds the runner has to acknowledge a drain while it is active
 RESTART_WAIT = 120      # seconds a restarted service has to be active again
 POLL = 5
@@ -119,10 +132,11 @@ class SafeDir:
         except FileNotFoundError:
             pass
 
-    def write(self, name: str, data: bytes) -> None:
+    def write(self, name: str, data: bytes, mode: int = 0o644) -> None:
         tmp = f".{name}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=self.fd)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=self.fd)
         try:
+            os.fchmod(fd, mode)
             os.write(fd, data)
             os.fsync(fd)
             if self.owner:
@@ -148,7 +162,11 @@ class Host:
     """What the operations need of the machine; the tests give stand-ins."""
     data: Path                      # ~/arceus/data
     setup: Path                     # ~/arceus/setup/setup.sh
+    runner_unit: str = "runner"     # this data folder's runner and engine (another project's on a shared machine)
+    engine_unit: str = "bulava-engine"
     ledger: Path = Path("/var/lib/arceus/ops")
+    # The nginx.conf setup wrote for the console (its console phase): whether it routes /assistant/, and where.
+    console_nginx: Path = Path("/opt/arceus-console/nginx.conf")
     exe: str = sys.argv[0]          # this program, for the transient unit
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run
     popen: Callable[..., subprocess.Popen] = subprocess.Popen
@@ -167,8 +185,24 @@ class Host:
     def ops_dir(self) -> Path:
         return self.data / "console" / "ops"
 
+    def unit(self, name: str) -> str:
+        """The systemd unit of a service the page names ("runner", "bulava-engine", "assistant") for this data
+        folder. The assistant's is setup's template unit, one per run user."""
+        if name == "assistant":
+            return f"arceus-assistant@{self.run_user.pw_name}"
+        return {"runner": self.runner_unit, "bulava-engine": self.engine_unit}[name]
+
+    @property
+    def setup_user(self) -> pwd.struct_passwd:
+        """Who runs setup.sh: the owner of its Arceus folder, which may not be this data folder's owner."""
+        try:
+            return pwd.getpwuid(os.stat(self.setup).st_uid)
+        except FileNotFoundError:
+            return self.run_user  # no setup.sh to run: the operation fails on its own, as the run user
+
     def args(self) -> list[str]:
-        return ["--data", str(self.data), "--setup", str(self.setup), "--ledger", str(self.ledger)]
+        return ["--data", str(self.data), "--setup", str(self.setup), "--ledger", str(self.ledger),
+                "--runner-unit", self.runner_unit, "--engine-unit", self.engine_unit]
 
     def as_user(self, args: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
         """A command as the run user, with their home: the runner's database and the engine are theirs."""
@@ -290,6 +324,8 @@ def _one(host: Host, ledger: Ledger, requests: SafeDir, name: str) -> str:
         return f"{op_id}: seen before, ignored"
     by = (fields["requested_by"] or "")[:200]
     op = fields["op"]
+    if op == "assistant-key":
+        return _assistant_key(host, ledger, op_id, by, req)
     if op == "cancel":
         target = fields["target"] or ""
         rec = ledger.get(target) if _ID.match(target) else None
@@ -444,13 +480,13 @@ def _wait_active(host: Host, name: str, say, after: str = "") -> dict:
 
 
 def op_restart_runner(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str, str]:
-    before = service(host, "runner")
-    say(f"runner.service is {before['active']}, since {before['since'] or '?'}")
+    before = service(host, host.unit("runner"))
+    say(f"{host.unit('runner')}.service is {before['active']}, since {before['since'] or '?'}")
     say("A task in work keeps going: the agent's session is the engine's, and the runner picks the task up again.")
-    r = host.root(["systemctl", "restart", "runner"], timeout=120)
+    r = host.root(["systemctl", "restart", host.unit("runner")], timeout=120)
     if r.returncode != 0:
-        raise Failed(f"systemctl restart runner failed: {(r.stderr or r.stdout).strip()[-300:]}")
-    s = _wait_active(host, "runner", say, after=before["since"] if before["active"] == "active" else "")
+        raise Failed(f"systemctl restart {host.unit('runner')} failed: {(r.stderr or r.stdout).strip()[-300:]}")
+    s = _wait_active(host, host.unit("runner"), say, after=before["since"] if before["active"] == "active" else "")
     # The runner writes which config it started with once its database is open: proof it got that far.
     deadline = time.monotonic() + 60
     loaded = ""
@@ -462,7 +498,7 @@ def op_restart_runner(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str,
         if loaded and loaded >= (ledger.get(op_id) or {}).get("started_at", ""):
             break
         host.sleep(2)
-    health = f"runner.service active since {s['since']}"
+    health = f"{host.unit('runner')}.service active since {s['since']}"
     if loaded:
         health += f"; it loaded config.yaml at {loaded}"
     else:
@@ -484,7 +520,7 @@ def op_restart_engine(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str,
             if (st.get("ack") or {}).get("token") == op_id:
                 say("The runner acknowledged: nothing new starts in the engine.")
                 break
-            if service(host, "runner")["active"] != "active":
+            if service(host, host.unit("runner"))["active"] != "active":
                 say("The runner is not running: nothing else starts work in the engine.")
                 break
             if time.monotonic() > deadline:
@@ -504,22 +540,23 @@ def op_restart_engine(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str,
                 last = running
             host.sleep(15)
         ledger.update(op_id, state="running", waiting_for="")
-        before = service(host, "bulava-engine")
-        say("No task is running in the engine. Restarting bulava-engine.")
-        r = host.root(["systemctl", "restart", "bulava-engine"], timeout=120)
+        engine = host.unit("bulava-engine")
+        before = service(host, engine)
+        say(f"No task is running in the engine. Restarting {engine}.")
+        r = host.root(["systemctl", "restart", engine], timeout=120)
         if r.returncode != 0:
-            raise Failed(f"systemctl restart bulava-engine failed: {(r.stderr or r.stdout).strip()[-300:]}")
-        s = _wait_active(host, "bulava-engine", say, after=before["since"] if before["active"] == "active" else "")
+            raise Failed(f"systemctl restart {engine} failed: {(r.stderr or r.stdout).strip()[-300:]}")
+        s = _wait_active(host, engine, say, after=before["since"] if before["active"] == "active" else "")
     finally:
         if lift(host, ledger, op_id):
             say("Work may start in the engine again.")
         else:
             say("The drain could not be lifted now: the executor's next passes keep trying until it is.")
-    return "the engine restarted between tasks", f"bulava-engine active since {s['since']}"
+    return "the engine restarted between tasks", f"{host.unit('bulava-engine')} active since {s['since']}"
 
 
 def _setup(host: Host, say, *args: str) -> int:
-    u = host.run_user
+    u = host.setup_user  # setup.sh runs everything as its folder's owner, whichever project the console shows
     env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
            "SUDO_USER": u.pw_name, "HOME": "/root"}
     return stream(host, say, ["/bin/bash", str(host.setup), *args], env=env)
@@ -538,13 +575,182 @@ def op_setup(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str, str]:
     rc = _setup(host, say)
     if rc != 0:
         raise Failed(f"setup.sh ended with exit {rc}: see the output")
-    s = service(host, "runner")
+    s = service(host, host.unit("runner"))
     return ("setup is done. A new runner or engine runs once restarted: restart them here between tasks",
-            f"runner.service {s['active']} since {s['since'] or '?'}")
+            f"{host.unit('runner')}.service {s['active']} since {s['since'] or '?'}")
+
+
+def op_restart_assistant(host: Host, ledger: Ledger, op_id: str, say) -> tuple[str, str]:
+    unit = host.unit("assistant")
+    before = service(host, unit)
+    if not before["installed"]:
+        raise Failed(f"{unit} is not installed: turn the assistant on in Settings, then run setup (its assistant "
+                     "phase installs it)")
+    say(f"{unit}.service is {before['active']}, since {before['since'] or '?'}")
+    say("A reply being written now is cut off and says so; messages from Slack are kept and answered after.")
+    r = host.root(["systemctl", "restart", unit], timeout=120)
+    if r.returncode != 0:
+        raise Failed(f"systemctl restart {unit} failed: {(r.stderr or r.stdout).strip()[-300:]}")
+    s = _wait_active(host, unit, say, after=before["since"] if before["active"] == "active" else "")
+    # The assistant writes its status (with the config.yaml it read) once it has started: proof it got that far.
+    started = (ledger.get(op_id) or {}).get("started_at", "")
+    deadline = time.monotonic() + 60
+    status: dict = {}
+    while time.monotonic() < deadline:
+        status = assistant_status(host)
+        if (status.get("started_at") or "") >= started:
+            break
+        host.sleep(2)
+    health = f"{unit} active since {s['since']}"
+    if (status.get("started_at") or "") >= started:
+        health += "; it read config.yaml at " + status["started_at"]
+    else:
+        health += "; it has not written its status yet (see the Assistant page)"
+    return "the assistant restarted", health
+
+
+def assistant_route(host: Host) -> dict:
+    """Whether the console's nginx routes /assistant/, and to which port: setup writes it from config.yaml, so a saved
+    change of assistant.web is in nginx only once setup has run."""
+    try:
+        text = host.console_nginx.read_text()
+    except FileNotFoundError:
+        return {"known": False, "why": "the console's nginx.conf is not there (setup's console phase writes it)"}
+    except OSError as e:
+        return {"known": False, "why": f"the console's nginx.conf cannot be read ({e.strerror or e})"}
+    m = re.search(r"location /assistant/ \{[^}]*?proxy_pass http://127\.0\.0\.1:(\d+);", text)
+    return {"known": True, "port": int(m.group(1)) if m else None}
+
+
+def assistant_status(host: Host) -> dict:
+    try:
+        d = SafeDir(host.data, create=False)
+    except (Unsafe, OSError):
+        return {}
+    try:
+        return json.loads(d.read("assistant-status.json", 64 * 1024))
+    except (Unsafe, OSError, ValueError):
+        return {}
+    finally:
+        d.close()
+
+
+# -- the assistant's keys: write-only --------------------------------------------------------------------------------
+
+KEYS_FILE = "assistant.env"
+
+
+def _key_lines(text: str) -> list[tuple[str | None, str]]:
+    """assistant.env as (name or None, the line as written)."""
+    out: list[tuple[str | None, str]] = []
+    for line in text.splitlines():
+        name = line.split("=", 1)[0].strip().removeprefix("export ").strip() if "=" in line and \
+            not line.lstrip().startswith("#") else None
+        out.append((name, line))
+    return out
+
+
+def _keys_set(text: str) -> set[str]:
+    return {n for n, line in _key_lines(text) if n and line.split("=", 1)[1].strip().strip("\"'")}
+
+
+def write_key_state(host: Host) -> None:
+    """Which keys are set and since when, for the console (no value, ever)."""
+    try:
+        times = json.loads((host.ledger / "assistant-keys.json").read_text())
+    except (FileNotFoundError, ValueError):
+        times = {}
+    present: set[str] | None
+    try:
+        d = SafeDir(host.data, create=False)
+        try:
+            present = _keys_set(d.read(KEYS_FILE, 64 * 1024).decode("utf-8", "replace"))
+        except FileNotFoundError:
+            present = set()
+        finally:
+            d.close()
+    except (Unsafe, OSError):
+        present = None
+    state = {"at": now_iso(), "readable": present is not None,
+             "keys": {n: {"set": bool(present and n in present), **(times.get(n) or {})} for n in ASSISTANT_KEYS}}
+    try:
+        out = SafeDir(host.ops_dir, owner=host.owner)
+    except (Unsafe, OSError):
+        return
+    try:
+        out.write("assistant-keys.json", json.dumps(state).encode())
+    finally:
+        out.close()
+
+
+def _assistant_key(host: Host, ledger: Ledger, op_id: str, by: str, req: dict) -> str:
+    """Set, replace or remove one of the assistant's keys, now. The value is never recorded anywhere but
+    assistant.env; what is said back names the key alone."""
+    name, value = req.get("name"), req.get("value")
+    rec = {"id": op_id, "op": "assistant-key", "requested_by": by, "requested_at": now_iso(),
+           "title": f"The assistant's {name if name in ASSISTANT_KEYS else 'key'}"}
+
+    def finish(state: str, result: str) -> str:
+        ledger.put({**rec, "state": state, "result": result, "finished_at": now_iso()})
+        return f"{op_id}: assistant key {name if name in ASSISTANT_KEYS else '?'}: {state}"
+
+    if name not in ASSISTANT_KEYS or not isinstance(value, str):
+        return finish("refused", "not one of the assistant's keys")
+    remove = value == ""
+    rec["title"] = f"{'Remove' if remove else 'Set'} the assistant's {name}"
+    if not remove and (not KEY_VALUE.match(value) or not value.startswith(ASSISTANT_KEYS[name])):
+        return finish("refused", f"not a {name}: it starts with {ASSISTANT_KEYS[name]}, one line, no spaces")
+    # Only the data folder's own assistant.env, which setup made: config.yaml may name another file, and root does
+    # not write where an editable setting points.
+    r = host.as_user([host.exe, "--config", str(host.data / "config.yaml"), "console", "env"], timeout=60)
+    wanted = next((line.split("=", 1)[1] for line in (r.stdout or "").splitlines()
+                   if line.startswith("ASSISTANT_SECRETS=")), "")
+    if r.returncode != 0 or wanted != str(host.data / KEYS_FILE):
+        return finish("refused", "assistant.secrets in config.yaml is not this data folder's assistant.env: set the "
+                                 "keys on the server")
+    try:
+        d = SafeDir(host.data, owner=host.owner, create=False)
+    except (Unsafe, OSError) as e:
+        return finish("failed", f"the data folder cannot be opened safely ({e})")
+    try:
+        try:
+            text = d.read(KEYS_FILE, 64 * 1024).decode("utf-8")
+        except FileNotFoundError:
+            text = "# The assistant's tokens (docs/assistant.md). Set from the console's Assistant page.\n"
+        lines = [line for n, line in _key_lines(text) if n != name]
+        if not remove:
+            lines.append(f"{name}={value}")
+        d.write(KEYS_FILE, ("\n".join(lines) + "\n").encode(), mode=0o600)
+    except (Unsafe, OSError, UnicodeDecodeError) as e:
+        return finish("failed", f"assistant.env was not written ({type(e).__name__})")
+    finally:
+        d.close()
+    try:
+        times = json.loads((host.ledger / "assistant-keys.json").read_text())
+    except (FileNotFoundError, ValueError):
+        times = {}
+    if remove:
+        times.pop(name, None)
+    else:
+        times[name] = {"at": now_iso(), "by": by}
+    (host.ledger / "assistant-keys.json").write_text(json.dumps(times))
+    write_key_state(host)
+    result = f"{name} {'removed' if remove else 'set'}."
+    unit = host.unit("assistant")
+    if name in SLACK_KEYS:
+        if service(host, unit)["active"] == "active":
+            r = host.root(["systemctl", "restart", unit], timeout=120)
+            result += (" The assistant restarted to connect to Slack with it." if r.returncode == 0 else
+                       " The assistant could not be restarted: restart it from the Assistant page.")
+        else:
+            result += " The assistant is not running: it connects with it when it starts."
+    else:
+        result += " Her next reply uses it." if name.endswith("_API_KEY") else " Her next ticket uses it."
+    return finish("succeeded", result)
 
 
 RUNS = {"restart-runner": op_restart_runner, "restart-engine": op_restart_engine, "setup-check": op_setup_check,
-        "setup": op_setup}
+        "setup": op_setup, "restart-assistant": op_restart_assistant}
 assert set(RUNS) == set(OPS)
 
 
@@ -569,13 +775,15 @@ def tick(host: Host) -> None:
         if rec.get("drain_owed") and rec.get("state") not in ACTIVE:
             if lift(host, ledger, rec["id"]):
                 ledger.log(rec["id"], "The drain is lifted: work may start in the engine again.")
-    services = {name: service(host, name) for name in SERVICES}
+    services = {name: service(host, host.unit(name)) for name in SERVICES}
+    routes = {"assistant": assistant_route(host)}
+    write_key_state(host)
     try:
         d = SafeDir(host.ops_dir, owner=host.owner)
     except (Unsafe, OSError):
         return
     try:
-        d.write("host.json", json.dumps({"at": now_iso(), "services": services}).encode())
+        d.write("host.json", json.dumps({"at": now_iso(), "services": services, "routes": routes}).encode())
     finally:
         d.close()
 
@@ -588,7 +796,8 @@ def _age(iso: str | None) -> float:
 
 
 def main(args) -> int:
-    host = Host(data=Path(args.data), setup=Path(args.setup), ledger=Path(args.ledger), exe=sys.argv[0])
+    host = Host(data=Path(args.data), setup=Path(args.setup), ledger=Path(args.ledger), exe=sys.argv[0],
+                runner_unit=getattr(args, "runner_unit", "runner"), engine_unit=getattr(args, "engine_unit", "bulava-engine"))
     if args.step == "dispatch":
         for line in dispatch(host):
             print(line)

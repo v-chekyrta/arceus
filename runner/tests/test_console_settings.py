@@ -94,7 +94,8 @@ def test_every_setting_of_the_schema_is_in_the_form(w):
     cfg = Config.model_validate(yaml.safe_load(w.config.read_text()))
     names = set()
     for section, fields in sf.sections(cfg, w.config.read_text()):
-        page = admin.get(f"/settings/{section}/").text
+        # The assistant's section has a page of its own; its fields are on its edit page.
+        page = admin.get(f"/settings/{section}/edit/" if section == "assistant" else f"/settings/{section}/").text
         for f in sf.flatten(fields):
             assert f'name="{f.name}"' in page, f.name
             names.add(f.name)

@@ -1,0 +1,19 @@
+[Unit]
+Description=Bulava engine for the tickets of @NAME@ (@PROJECT@'s assistant): tmux server for the workers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@
+EnvironmentFile=@HOME@/engine.conf
+EnvironmentFile=-@HOME@/engine.env
+ExecStart=/usr/bin/tmux -L bulava new-session -d -s keeper 'sleep infinity'
+ExecStop=/usr/bin/tmux -L bulava kill-server
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -22,3 +22,6 @@ bulava-agreement.md
 bulava-todo.md
 proxy_chat.md
 bulava-requirements.md
+
+# What a non-editable pip install of runner/ or assistant/ leaves behind
+build/

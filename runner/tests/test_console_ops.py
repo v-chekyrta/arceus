@@ -346,6 +346,84 @@ def test_a_lost_operation_is_interrupted_never_succeeded_and_its_drain_lifted(ho
     assert hostops.run(host, ID) == 1  # and it is not run after all
 
 
+@pytest.fixture
+def other_project(tmp_path):
+    """The console shows a second project of the machine: its own runner and engine units, setup.sh the first's."""
+    data = tmp_path / "data"
+    (data / "console" / "ops" / "requests").mkdir(parents=True)
+    system = FakeSystem(data)
+    system.units.update({"runner-contoso": {"ActiveState": "active", "ActiveEnterTimestamp": "o0"},
+                         "bulava-engine-contoso": {"ActiveState": "active", "ActiveEnterTimestamp": "oe0"}})
+    (tmp_path / "setup.sh").write_text("#!/bin/bash\n")
+    h = Host(data=data, setup=tmp_path / "setup.sh", ledger=tmp_path / "ledger", exe="/opt/arceus-runner/venv/bin/a",
+             run=system, sleep=lambda s: None, runner_unit="runner-contoso", engine_unit="bulava-engine-contoso")
+    h.system = system
+    return h
+
+
+def restarts(host: Host) -> list[str]:
+    return [c[2] for c in host.system.calls if c[:2] == ["systemctl", "restart"]]
+
+
+def test_another_projects_runner_restart_restarts_its_unit_and_never_the_first_projects(other_project):
+    request(other_project, ID, {"op": "restart-runner", "requested_by": "x"})
+    hostops.dispatch(other_project)
+    started = next(c for c in other_project.system.calls if c[0] == "systemd-run")
+    assert started[-4:-2] == ["--engine-unit", "bulava-engine-contoso"] or "--runner-unit" in started
+    assert started[started.index("--runner-unit") + 1] == "runner-contoso"
+    other_project.system.config = {"loaded_at": "2000-01-01T00:00:00+00:00"}
+    real = other_project.system.__call__
+
+    def loads(args, **kw):  # the real runner records its start whatever its unit is called
+        r = real(args, **kw)
+        if args[:3] == ["systemctl", "restart", "runner-contoso"]:
+            other_project.system.config = {"loaded_at": datetime.now(UTC).isoformat(timespec="seconds")}
+        return r
+    other_project.run = loads
+    hostops.run(other_project, ID)
+    rec = Ledger(other_project).get(ID)
+    assert rec["state"] == "succeeded", rec
+    assert restarts(other_project) == ["runner-contoso"]
+    assert "runner-contoso.service active since runner-contoso-restarted" in rec["health"]
+
+
+def test_another_projects_engine_restart_restarts_its_engine_only(other_project):
+    request(other_project, ID, {"op": "restart-engine", "requested_by": "x"})
+    hostops.dispatch(other_project)
+    hostops.run(other_project, ID)
+    rec = Ledger(other_project).get(ID)
+    assert rec["state"] == "succeeded", rec
+    assert restarts(other_project) == ["bulava-engine-contoso"]
+    assert "bulava-engine-contoso active since" in rec["health"]
+
+
+def test_another_projects_page_shows_its_own_units_state(other_project):
+    other_project.system.units["runner"] = {"ActiveState": "failed"}
+    hostops.tick(other_project)
+    state = json.loads((other_project.ops_dir / "host.json").read_text())["services"]
+    assert state["runner"]["since"] == "o0" and state["runner"]["active"] == "active"
+    assert state["bulava-engine"]["since"] == "oe0"
+
+
+def test_setup_from_another_projects_console_runs_as_setups_owner_not_the_data_folders(other_project, monkeypatch):
+    seen = {}
+    owner = hostops.pwd.struct_passwd(("factory", "x", 1000, 1000, "", "/home/factory", "/bin/bash"))
+    monkeypatch.setattr(Host, "setup_user", property(lambda self: owner))
+
+    def popen(args, **kw):
+        seen["env"] = kw["env"]
+        return FakeProc(["[ ok ] console\n"], 0)
+    other_project.popen = popen
+    request(other_project, ID, {"op": "setup-check", "requested_by": "x"})
+    hostops.dispatch(other_project)
+    hostops.run(other_project, ID)
+    assert seen["env"]["SUDO_USER"] == "factory"
+
+
+def test_setup_runs_as_the_owner_of_setup_sh(other_project, tmp_path):
+    assert other_project.setup_user.pw_uid == os.stat(tmp_path / "setup.sh").st_uid
+
+
 class FakeProc:
     def __init__(self, lines, rc):
         self.stdout, self.rc = iter(lines), rc

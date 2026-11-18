@@ -188,9 +188,10 @@ class Ctx:
             css=self.app.asset_url("console.css"), js=self.app.asset_url("console.js"), **values)
         return HTMLResponse(body, status_code=status)
 
-    def redirect(self, to: str, notice: str = "") -> RedirectResponse:
-        if notice:
-            to += ("&" if "?" in to else "?") + urllib.parse.urlencode({"notice": notice})
+    def redirect(self, to: str, notice: str = "", error: str = "") -> RedirectResponse:
+        said = {k: v for k, v in (("notice", notice), ("error", error)) if v}
+        if said:
+            to += ("&" if "?" in to else "?") + urllib.parse.urlencode(said)
         return RedirectResponse(to, status_code=303)
 
 
@@ -375,13 +376,14 @@ async def healthz(_request: Request) -> Response:
 
 
 def create_app(settings: Settings | None = None) -> Starlette:
-    from arceus_runner.console import (views_arch, views_auth, views_home, views_ops, views_qa, views_secops,
-                                       views_settings, views_tasks, views_users)
+    from arceus_runner.console import (views_arch, views_assistant, views_auth, views_home, views_ops, views_qa,
+                                       views_secops, views_settings, views_tasks, views_users)
     settings = settings or Settings.from_env()
     console = ConsoleApp(settings)
     routes = [Route("/static/{name}", static), Route("/healthz", healthz)]
-    for module in (views_auth, views_home, views_tasks, views_qa, views_arch, views_secops, views_settings, views_ops,
-                   views_users):
+    # The assistant's routes before Settings' /settings/{name}/: its page stands for that section.
+    for module in (views_auth, views_home, views_tasks, views_qa, views_arch, views_secops, views_assistant,
+                   views_settings, views_ops, views_users):
         routes += module.routes()
         console.sections.update(getattr(module, "SECTIONS", ()))
     app = Starlette(routes=routes)

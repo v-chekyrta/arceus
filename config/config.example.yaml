@@ -239,6 +239,29 @@ console:
   #                                         # proxy in Docker on this machine: its network's gateway, nothing else
   tls: false                                # true if the load balancer talks HTTPS to backends
 
+# The project's assistant (docs/assistant.md): a web chat behind the console at /assistant/ and a colleague in the
+# project's Slack. Its tokens (Slack, YouTrack, Anthropic) are in assistant.env beside this file, never here.
+assistant:
+  enabled: false
+  project: Acme Shop                        # the project's name as people say it
+  name: Олена                               # who she or he is in the chat
+  gender: f                                 # f | m: the prompt's {сама|сам}
+  # persona_file: ~/assistant/persona.md    # character and legend
+  home: ~/assistant                         # data/, uploads/, mirror/ (the code she reads), models/
+  port: 8190                                # 127.0.0.1; another project's assistant on this machine needs another
+  web: true                                 # the web chat at /assistant/ (the console's project only)
+  allowed_users: [lead@example.com]         # console accounts let into the web chat
+  ticket_creators: [lead@example.com]       # who may have tickets made; empty: anyone she talks to
+  expert: lead@example.com                  # whom she calls for what is past her
+  provider: claude                          # claude | codex: what writes her replies
+  auth: subscription                        # subscription (the factory's own sign-in) | api_key (assistant.env)
+  model: sonnet                             # with claude; codex_model with codex (gpt-6.1-terra)
+  youtrack:
+    project: SHOP                           # where her tickets are made, in the tracker above
+  # slack:                                  # Socket Mode; SLACK_APP_TOKEN and SLACK_BOT_TOKEN in assistant.env
+  #   read_channels: [C0123ABCD]            # project channels she reads and searches
+  #   call_names: [Олено]
+
 paths:
   workspace: ~/arceus/workspace
   bulava: /opt/bulava/engine           # engine folder

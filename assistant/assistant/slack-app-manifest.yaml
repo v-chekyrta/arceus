@@ -1,0 +1,45 @@
+# The assistant's Slack app, for the company's own workspace only (not distributed, not in the Marketplace).
+# `arceus-assistant slack-manifest` prints it with this project's assistant in it (assistant.name, assistant.project);
+# create the app at https://api.slack.com/apps → Create New App → From a manifest → paste that.
+# Socket Mode: the VM opens the connection to Slack, so no public URL is needed and every event is acknowledged
+# on the socket at once; the answer comes later in the thread.
+display_information:
+  name: "@NAME@"
+  description: "Асистент проєкту @PROJECT@ для менеджерів і команди"
+  background_color: "#1d1c1d"
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true            # people can write to it directly
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: "@NAME@"
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read                 # @mention in a channel
+      - im:history                        # direct messages to it
+      - im:read
+      - im:write
+      - channels:history                  # the thread it was called into (public channels)
+      - groups:history                    # the same in private channels it is added to
+      - channels:read                     # whether a channel is shared with another company (Slack Connect):
+      - groups:read                       #   checked again before a late answer; unknown means she does not post
+      - chat:write                        # its replies
+      - reactions:write                   # 👀 at once, so people see it has taken the message
+      - files:read                        # screenshots, voice notes and documents in the message
+      - users:read                        # who wrote: name, and their workspace (ours or a client's)
+      - users:read.email                  # matched against the assistant's allowed_users
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - message.channels
+      - message.groups
+  interactivity:
+    is_enabled: true                      # the «Створити тікет» button under a draft
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

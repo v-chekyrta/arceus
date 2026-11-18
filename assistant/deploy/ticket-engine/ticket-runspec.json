@@ -1,0 +1,6 @@
+{"schema": 1, "mode": "broad",
+ "objective": "Write the ticket for the factory from the conversation into artifacts/<task id>.md (or, for an investigation, the report); change no code.",
+ "acceptance": ["The ticket stands alone for an agent that never saw the conversation.",
+                "«Рішення» holds only what the manager said; everything else is listed as not decided.",
+                "It says what is expected, in plain words, not how to change the code; any hint about the code is short, checked, and marked as a hint."],
+ "surface": {"user_facing_copy": false}}

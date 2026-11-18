@@ -87,7 +87,7 @@ def cmd_users(_args, config_path: Path) -> int:
 
 def env_lines(cfg: Config) -> list[str]:
     """What the console's compose project and nginx need, from config.yaml (setup.sh writes them into .env)."""
-    c = cfg.console
+    c, a = cfg.console, cfg.assistant
     return [f"CONSOLE_ENABLED={'1' if c.enabled else '0'}",
             f"CONSOLE_PUBLIC_URL={c.public_url or ''}",
             f"CONSOLE_PORT={c.port}",
@@ -96,10 +96,21 @@ def env_lines(cfg: Config) -> list[str]:
             f"CONSOLE_TRUSTED_PROXIES={' '.join(c.trusted_proxies)}",
             f"CONSOLE_SESSION_IDLE={int(c.session_idle.total_seconds())}s",
             f"CONSOLE_SESSION_MAX={int(c.session_max.total_seconds())}s",
+            # The project's name and its runner's metrics: Grafana, which follows the console, scrapes and labels it.
+            f"CONSOLE_PROJECT={cfg.project}",
+            f"CONSOLE_METRICS_PORT={cfg.metrics.port}",
             # Folders the console reads (mounted read-only at the same path when outside the data folder), and the
             # secret files it must never see; one line each.
             *(f"CONSOLE_READ_DIR={p}" for p in _read_dirs(cfg)),
-            *(f"CONSOLE_SECRET_FILE={p}" for p in (cfg.paths.secrets, cfg.paths.bulava_env))]
+            *(f"CONSOLE_SECRET_FILE={p}" for p in (cfg.paths.secrets, cfg.paths.bulava_env, cfg.assistant.secrets)),
+            # The project's assistant (setup.sh's `assistant` phase): its own service, and /assistant/ in nginx
+            # when this is the console's project and the web chat is on.
+            f"ASSISTANT_ENABLED={'1' if a.enabled else '0'}",
+            f"ASSISTANT_WEB={'1' if a.enabled and a.web else '0'}",
+            f"ASSISTANT_PORT={a.port}",
+            f"ASSISTANT_HOME={a.home}",
+            f"ASSISTANT_SECRETS={a.secrets}",
+            f"ASSISTANT_WORKSPACE={cfg.paths.workspace}"]
 
 
 def _read_dirs(cfg: Config) -> list[Path]:
@@ -212,6 +223,8 @@ def add_parser(sub) -> None:
     h.add_argument("--data", required=True, help="the data folder (~/arceus/data)")
     h.add_argument("--setup", required=True, help="setup.sh")
     h.add_argument("--ledger", default="/var/lib/arceus/ops")
+    h.add_argument("--runner-unit", default="runner", help="the systemd unit of this data folder's runner")
+    h.add_argument("--engine-unit", default="bulava-engine", help="the systemd unit of this data folder's engine")
     h.add_argument("step", choices=["dispatch", "run", "tick"])
     h.add_argument("id", nargs="?")
     h.set_defaults(console_fn=cmd_hostops)

@@ -31,11 +31,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: runner/pyproject.toml
+          cache-dependency-path: |
+            runner/pyproject.toml
+            assistant/pyproject.toml
       - name: Install the runner with its test dependencies
         run: |
           python -m venv runner/.venv
           runner/.venv/bin/pip install -q -e 'runner[test,console]'
+      - name: Install the assistant (with the runner's package: its settings are config.yaml's) and its tests
+        run: |
+          python -m venv assistant/.venv
+          assistant/.venv/bin/pip install -q -e runner -e 'assistant[test]'
       - name: ./verify.sh --offline
         env:
           # Why each skipped test skipped, and where the time went.

@@ -209,6 +209,12 @@ def save(ctx: Ctx) -> Response:
                                                                                  f"{e.strerror or e}")
     if not saved:
         return ctx.redirect(origin, "Nothing changed: config.yaml is already this text.")
+    if origin.startswith("/settings/assistant/"):
+        if sf.needs_setup(current.text, text, _path(ctx).parent):
+            return ctx.redirect("/settings/assistant/", "Saved. Turning the assistant on or off, or its web chat, "
+                                                        "is done by setup.sh: run setup (Operations).")
+        return ctx.redirect("/settings/assistant/", "Saved. The assistant reads config.yaml when it starts: restart "
+                                                    "it below to apply.")
     words = "Saved. The runner reads config.yaml when it starts: restart it to apply."
     if sf.needs_setup(current.text, text, _path(ctx).parent):
         words = "Saved. This change is read by setup.sh: run setup, then restart the runner."

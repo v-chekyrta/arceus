@@ -1,6 +1,6 @@
 #!/bin/bash
-# Everything that proves this repository works, in one command, from its root: the runner's tests and the
-# setup script's test. The sandbox (sandbox/) and its live scenarios are not part of it: they are for work on
+# Everything that proves this repository works, in one command, from its root: the runner's and the assistant's
+# tests and the setup script's tests. The sandbox (sandbox/) and its live scenarios are not part of it: they are for work on
 # the pipeline itself and run by hand, sandbox/sandbox.sh test and sandbox/sandbox.sh live.
 # Exits non-zero when a part fails. No model is called.
 # --offline leaves out the one step that needs the network (the engine's real upstream on GitHub): what CI runs
@@ -29,6 +29,10 @@ step() {   # $1=what, then the command
 }
 
 step "runner tests (Mac or wherever this runs)" bash -c 'cd runner && .venv/bin/pytest -q -n auto'
+# The assistant's venv holds the runner's package too (its settings are config.yaml's assistant: section):
+#   cd assistant && python3 -m venv .venv && .venv/bin/pip install -e ../runner -e '.[test]'
+step "assistant tests: the chat, Slack, tickets, memory, attachments and its settings" \
+  bash -c 'cd assistant && .venv/bin/python -m pytest -q'
 step "setup: running services are enabled for good, so they come back after a reboot" \
   bash setup/tests/test-autostart.sh
 step "setup: claude and codex are only the pinned ones, the sign-ins stay" \
@@ -41,6 +45,10 @@ step "setup: the install's own packages go into the runner, leave it with the li
   bash setup/tests/test-extra-packages.sh
 step "setup: a package in a folder is built from a clean copy with real setuptools: a removed module is gone" \
   bash setup/tests/test-extra-build.sh
+step "setup: the assistant runs as its project's user, never beside the old bot; its tokens' file is 600" \
+  bash setup/tests/test-assistant.sh
+step "setup: Grafana follows the console's project and never shows another project's history as its own" \
+  bash setup/tests/test-observability-project.sh
 if [ -n "$live" ]; then  # the base image and PyPI: the network, so not in --offline
   step "console: the image builds from console/Dockerfile, with the install's own packages, and runs without root, sudo or secrets" \
     bash setup/tests/test-console-image.sh

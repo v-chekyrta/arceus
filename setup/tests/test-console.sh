@@ -20,9 +20,10 @@ type yaml_str console_secret_paths console_mounts console_nginx_conf >/dev/null 
 
 RUN_USER="$(id -un)"; RUN_GROUP="$(id -gn)"; RUN_HOME="$T/home"
 DATA_DIR="$T/home/arceus/data"; CONSOLE_APP=127.0.0.1:8180
+CONSOLE_USER="$RUN_USER"; CONSOLE_GROUP="$RUN_GROUP"; CONSOLE_HOME="$RUN_HOME"; CONSOLE_DATA="$DATA_DIR"
 mkdir -p "$DATA_DIR/google" "$DATA_DIR/qa/runs" "$T/srv/arch runs" "$T/home/.config/claude"
 for f in config.yaml runner.db runner.db-wal secrets.env secrets.vso_korean.env grafana-admin-password \
-         config.linker.yaml events.jsonl my.pem; do echo x > "$DATA_DIR/$f"; done
+         config.linker.yaml events.jsonl my.pem assistant.env; do echo x > "$DATA_DIR/$f"; done
 echo token > "$T/home/.config/claude/oauth.env"
 ln -s "$T/home/.config/claude/oauth.env" "$DATA_DIR/bulava.env"
 install() { mkdir -p "${@: -1}"; }   # the read-only folders setup makes when missing; no chown here
@@ -46,6 +47,7 @@ mounts="$(console_mounts)"; [ -n "${SHOW:-}" ] && printf "%s\n" "$mounts"
 printf '%s\n' "$mounts" > "$T/mounts.yaml"
 masked() { grep -qF "target: \"$1\"" <<< "$mounts" && ! grep -qF "source: \"$1\"" <<< "$mounts"; }
 check "the runner's secrets are replaced by empty files" "masked '$DATA_DIR/secrets.env' && masked '$DATA_DIR/secrets.vso_korean.env'"
+check "so are the assistant's tokens (assistant.env)" "masked '$DATA_DIR/assistant.env'"
 check "so is Grafana's admin password and a key file" "masked '$DATA_DIR/grafana-admin-password' && masked '$DATA_DIR/my.pem'"
 check "the Google key's folder is an empty one in memory" "grep -qF 'type: tmpfs, target: \"$DATA_DIR/google\"' <<< \"\$mounts\""
 check "a link to a file outside is left alone: its target is not there to read" "! grep -qF '$DATA_DIR/bulava.env' <<< \"\$mounts\""
@@ -76,16 +78,41 @@ TLS=0
 check "and believes X-Forwarded-For only from the trusted proxies" \
   "grep -q 'set_real_ip_from 10.0.0.0/8;' <<< \"\$conf\" && grep -q 'set_real_ip_from 192.168.0.0/16;' <<< \"\$conf\" && grep -q 'real_ip_recursive on;' <<< \"\$conf\""
 check "and passes everything to the console on localhost" "grep -q 'proxy_pass http://127.0.0.1:8180;' <<< \"\$conf\""
+check "with no CONSOLE_EXTRA_LOCATIONS nothing else is served" "! grep -q '/assistant/' <<< \"\$conf\""
+cat > "$T/extra.conf" <<'LOC'
+    location /assistant/ {
+      auth_request /_console_auth;
+      auth_request_set $arceus_user $upstream_http_x_arceus_user;
+      proxy_set_header X-Assistant-User $arceus_user;
+      proxy_pass http://127.0.0.1:8190;
+    }
+LOC
+CONSOLE_EXTRA_LOCATIONS="$T/extra.conf"
+conf_x="$(console_nginx_conf)"
+check "CONSOLE_EXTRA_LOCATIONS: its blocks are written into nginx.conf" "grep -q 'location /assistant/ {' <<< \"\$conf_x\" && grep -q 'proxy_pass http://127.0.0.1:8190;' <<< \"\$conf_x\""
+check "…before location /, so they are matched as their own paths" \
+  "[ \"\$(grep -n 'location /assistant/ {' <<< \"\$conf_x\" | cut -d: -f1)\" -lt \"\$(grep -n 'location / {' <<< \"\$conf_x\" | cut -d: -f1)\" ]"
+check "…with nginx's own variables kept as written" "grep -qF 'proxy_set_header X-Assistant-User \$arceus_user;' <<< \"\$conf_x\""
+check "…and the console's own routes untouched" "grep -q 'location /grafana/ {' <<< \"\$conf_x\" && grep -q 'proxy_pass http://127.0.0.1:8180;' <<< \"\$conf_x\""
+CONSOLE_EXTRA_LOCATIONS=
 
 eval "$(sed -n '/^OPS_UNITS=/p; /^ops_command() {/,/^}/p; /^ops_unit_text() {/,/^}/p' "$HERE/../setup.sh")"
-RUNNER_OPT=/opt/arceus-runner; ARCEUS_HOME="$T/home/arceus"
+RUNNER_OPT=/opt/arceus-runner; ARCEUS_HOME="$T/home/arceus"; CONSOLE_RUNNER_UNIT=runner; CONSOLE_ENGINE_UNIT=bulava-engine
 check "the executor's units are the four it needs" "[ \"\${OPS_UNITS[*]}\" = 'arceus-ops.path arceus-ops.service arceus-ops-tick.service arceus-ops-tick.timer' ]"
 check "the path unit wakes on a request in the data folder" \
   "ops_unit_text arceus-ops.path | grep -qx 'DirectoryNotEmpty=$DATA_DIR/console/ops/requests'"
 check "the service takes requests with the runner's own code, as root, from the fixed list" \
-  "ops_unit_text arceus-ops.service | grep -qx 'ExecStart=/opt/arceus-runner/venv/bin/arceus-runner console hostops --data $DATA_DIR --setup $T/home/arceus/setup/setup.sh dispatch' && ! ops_unit_text arceus-ops.service | grep -q '^User='"
+  "ops_unit_text arceus-ops.service | grep -qx 'ExecStart=/opt/arceus-runner/venv/bin/arceus-runner console hostops --data $DATA_DIR --setup $T/home/arceus/setup/setup.sh --runner-unit runner --engine-unit bulava-engine dispatch' && ! ops_unit_text arceus-ops.service | grep -q '^User='"
 check "the timer passes every 20 seconds, from boot on" \
   "ops_unit_text arceus-ops-tick.timer | grep -qx 'OnUnitActiveSec=20s' && ops_unit_text arceus-ops-tick.timer | grep -qx 'OnBootSec=15s' && ops_unit_text arceus-ops-tick.service | grep -q 'hostops .* tick$'"
+
+# A second project of the machine shown instead: its data folder, user and units, setup.sh still the first's.
+O="$T/contoso/arceus/data"; mkdir -p "$O/console/ops/requests"
+saved=("$CONSOLE_DATA" "$CONSOLE_RUNNER_UNIT" "$CONSOLE_ENGINE_UNIT")
+CONSOLE_DATA="$O"; CONSOLE_RUNNER_UNIT=runner-contoso; CONSOLE_ENGINE_UNIT=bulava-engine-contoso
+check "another project's executor watches its data folder and restarts its own units" \
+  "ops_unit_text arceus-ops.path | grep -qx 'DirectoryNotEmpty=$O/console/ops/requests' && ops_unit_text arceus-ops.service | grep -qx 'ExecStart=/opt/arceus-runner/venv/bin/arceus-runner console hostops --data $O --setup $T/home/arceus/setup/setup.sh --runner-unit runner-contoso --engine-unit bulava-engine-contoso dispatch'"
+CONSOLE_DATA="${saved[0]}"; CONSOLE_RUNNER_UNIT="${saved[1]}"; CONSOLE_ENGINE_UNIT="${saved[2]}"
 
 env_text="$(console_env)"
 check "the container runs as the run user" "grep -qx \"RUN_UID=$(id -u)\" <<< \"\$env_text\" && grep -qx 'CONSOLE_IMAGE_TAG=0123456789abcdef' <<< \"\$env_text\""

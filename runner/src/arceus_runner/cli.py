@@ -241,6 +241,13 @@ def cmd_run(args) -> int:
     return run(cfg, secrets, once=args.once, config_sha=config_sha)
 
 
+def cmd_assistant_import(args) -> int:
+    """An assistant set up before it was part of Arceus becomes config.yaml's assistant section and assistant.env."""
+    from arceus_runner import assistant_import
+    return assistant_import.run(_config_path(args.config), Path(args.old).expanduser(), port=args.port,
+                                web=not args.no_web, apply=args.apply)
+
+
 def cmd_rebind(args) -> int:
     """Bind runner.db to the tracker or code host config.yaml names now: the same one under a new address."""
     cfg, secrets = _load(args)
@@ -612,6 +619,16 @@ def build_parser() -> argparse.ArgumentParser:
                                        "(the same one under a new address; stop the runner first)")
     rb.add_argument("role", choices=["tracker", "code_host"])
     rb.set_defaults(fn=cmd_rebind)
+
+    a = sub.add_parser("assistant", help="the project's assistant (docs/assistant.md)")
+    asub = a.add_subparsers(dest="action", required=True)
+    ai = asub.add_parser("import", help="carry an assistant set up before it was part of Arceus (~/assistant) into "
+                                        "config.yaml and assistant.env; its conversations stay where they are")
+    ai.add_argument("old", help="its config, e.g. ~/assistant/config.yaml")
+    ai.add_argument("--port", type=int, default=8190, help="its port on 127.0.0.1 (the old unit's ASSISTANT_PORT)")
+    ai.add_argument("--no-web", action="store_true", help="no web chat at /assistant/: Slack only")
+    ai.add_argument("--apply", action="store_true", help="write it (without: only say what would be written)")
+    ai.set_defaults(fn=cmd_assistant_import)
 
     st = sub.add_parser("slack-test", help="post one test message to the project's channel through the webhook")
     st.set_defaults(fn=cmd_slack_test)

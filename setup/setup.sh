@@ -15,7 +15,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SELF_DIR/.." && pwd)"
 CONF="${ARCEUS_SETUP_CONF:-$SELF_DIR/setup.conf}"
 FACTS_DIR=/var/lib/arceus
-PHASES=(packages legacy docker chrome agent_tools mcp_config dirs bulava bulava_install agent_reports agent_notes runner systemd observability console)
+PHASES=(packages legacy docker chrome agent_tools mcp_config dirs bulava bulava_install agent_reports agent_notes runner systemd assistant observability console)
 
 c_ok=$'\e[32m'; c_warn=$'\e[33m'; c_fail=$'\e[31m'; c_off=$'\e[0m'
 [ -t 1 ] || { c_ok=; c_warn=; c_fail=; c_off=; }
@@ -89,6 +89,22 @@ OBS_DIR=/opt/arceus-observability
 OBS_SERVICES=(grafana prometheus loki alloy node-exporter)
 CONSOLE_DIR=/opt/arceus-console
 CONSOLE_APP=127.0.0.1:8180   # the console's own server; nginx in front of it is what people reach
+# The project the console and Grafana show. By default this one; a machine that runs a second project by hand
+# (its own user, an Arceus folder with data/, its own runner and engine units) may show that one instead:
+# CONSOLE_PROJECT_DIR, CONSOLE_RUNNER_UNIT and CONSOLE_ENGINE_UNIT in setup.conf. Its user is the folder's owner.
+CONSOLE_PROJECT_DIR="${CONSOLE_PROJECT_DIR:-$ARCEUS_HOME}"
+CONSOLE_PROJECT_DIR="${CONSOLE_PROJECT_DIR%/}"
+CONSOLE_RUNNER_UNIT="${CONSOLE_RUNNER_UNIT:-runner}"
+CONSOLE_ENGINE_UNIT="${CONSOLE_ENGINE_UNIT:-bulava-engine}"
+# Other services behind the console's nginx and its sign-in (the factory assistant's /assistant/, for one):
+# CONSOLE_EXTRA_LOCATIONS in setup.conf names a file of nginx location blocks. They go into the server block,
+# before `location /`, every time setup writes nginx.conf, so an update no longer drops a route someone added
+# by hand. The file is read as root and only when setup runs: edit it, then run setup again.
+CONSOLE_EXTRA_LOCATIONS="${CONSOLE_EXTRA_LOCATIONS:-}"
+CONSOLE_DATA="$CONSOLE_PROJECT_DIR/data"
+CONSOLE_USER="$(stat -c %U "$CONSOLE_PROJECT_DIR" 2>/dev/null || true)"
+CONSOLE_HOME="$(getent passwd "$CONSOLE_USER" | cut -d: -f6)"
+CONSOLE_GROUP="$(id -gn "$CONSOLE_USER" 2>/dev/null || true)"
 # Config files mounted into a container one by one, as service:path-inside:file-in-OBS_DIR. An update
 # replaces the file on disk, but the container keeps reading the one it started with.
 OBS_FILE_MOUNTS=(prometheus:/etc/prometheus/prometheus.yml:prometheus.yml loki:/etc/loki/loki.yaml:loki.yaml
@@ -113,6 +129,18 @@ preflight() {
   fi
   [ -z "$CONF_RUN_USER" ] || [ "$CONF_RUN_USER" = "$RUN_USER" ] \
     || die "setup.conf says RUN_USER=$CONF_RUN_USER, but everything runs as the user who runs setup ('$RUN_USER'). Remove RUN_USER from setup.conf."
+  if [ "$CONSOLE_PROJECT_DIR" != "$ARCEUS_HOME" ]; then
+    [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != root ] && [ -d "$CONSOLE_DATA" ] && [ -f "$CONSOLE_DATA/config.yaml" ] \
+      || die "CONSOLE_PROJECT_DIR=$CONSOLE_PROJECT_DIR in setup.conf: it must be a normal user's Arceus folder with data/config.yaml"
+    local u
+    for u in "$CONSOLE_RUNNER_UNIT" "$CONSOLE_ENGINE_UNIT"; do
+      [ "$(systemctl show "$u" -p LoadState --value 2>/dev/null)" = loaded ] \
+        || die "setup.conf names the unit $u for the console's project, but systemd has no such unit"
+    done
+  fi
+  # Named and missing is refused rather than skipped: skipped, the route would vanish from nginx without a word.
+  [ -z "$CONSOLE_EXTRA_LOCATIONS" ] || { [ -f "$CONSOLE_EXTRA_LOCATIONS" ] && [ -r "$CONSOLE_EXTRA_LOCATIONS" ]; } \
+    || die "CONSOLE_EXTRA_LOCATIONS=$CONSOLE_EXTRA_LOCATIONS in setup.conf: no such readable file"
   [ -n "$RUN_HOME" ] && [ -d "$RUN_HOME" ] || die "user '$RUN_USER' has no home folder"
   # The services are machine-wide. Setup never moves them from one user to another behind his back.
   local unit owner
@@ -723,15 +751,252 @@ apply_systemd() {
   fi
 }
 
+# The project's assistant (assistant/ in the repository, docs/assistant.md): a process of its own per project,
+# arceus-assistant@<run user>, from one install in ASSISTANT_OPT; config.yaml's `assistant:` section says whether it
+# runs. Every project this setup knows counts: this folder's and the console's (CONSOLE_PROJECT_DIR). Its tokens are
+# in assistant.env, made here empty and 600 before the console phase, so the console's container never sees it.
+ASSISTANT_OPT=/opt/arceus-assistant
+SYSTEMD_DIR=/etc/systemd/system
+ASSISTANT_UNIT=$SYSTEMD_DIR/arceus-assistant@.service
+MIRROR_UNIT=$SYSTEMD_DIR/arceus-assistant-mirror@.service
+MIRROR_TIMER=$SYSTEMD_DIR/arceus-assistant-mirror@.timer
+assistant_projects() {   # user data-folder home, one project a line
+  printf '%s %s %s\n' "$RUN_USER" "$DATA_DIR" "$RUN_HOME"
+  [ "$CONSOLE_PROJECT_DIR" = "$ARCEUS_HOME" ] || [ -z "$CONSOLE_USER" ] \
+    || printf '%s %s %s\n' "$CONSOLE_USER" "$CONSOLE_DATA" "$CONSOLE_HOME"
+}
+assistant_env() {   # user data home: the project's ASSISTANT_* lines; nothing when config.yaml cannot say
+  [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] && [ -f "$2/config.yaml" ] || return 0
+  runuser -u "$1" -- env HOME="$3" "$RUNNER_OPT/venv/bin/arceus-runner" --config "$2/config.yaml" console env \
+    2>/dev/null | grep '^ASSISTANT_' || true
+}
+aget() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
+assistant_source_hash() {   # the venv holds the runner's package too: its settings are the runner's config
+  (cd "$REPO_DIR" && find assistant/pyproject.toml assistant/assistant assistant/deploy runner/pyproject.toml runner/src \
+    -type f ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path '*.egg-info*' ! -path 'runner/src/build/*' -print0 \
+    | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+}
+# The same bot from before Arceus (~/assistant with its own unit): two connections to one Slack app split its
+# events between them, so the new one never starts beside it.
+legacy_assistant_units() {   # user
+  local f n
+  for f in "$SYSTEMD_DIR"/*.service; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f" .service)"
+    case "$n" in arceus-assistant*) continue ;; esac
+    grep -q 'assistant\.server' "$f" || continue
+    [ "$(sed -n 's/^User=//p' "$f" | head -1)" = "$1" ] || continue
+    { systemctl is-active --quiet "$n" || systemctl is-enabled --quiet "$n"; } 2>/dev/null && printf '%s\n' "$n"
+  done
+  return 0
+}
+assistant_unit_text() {
+  cat <<UNIT
+[Unit]
+Description=Arceus assistant of %i: the web chat behind the console and the bot in Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+WorkingDirectory=~
+Environment=PYTHONUNBUFFERED=1
+# Which config.yaml: the drop-in setup writes for each project (arceus-assistant@<user>.service.d/arceus.conf).
+# No EnvironmentFile: the assistant reads assistant.env itself, at every use; its tokens never sit in an environment.
+ExecStart=$ASSISTANT_OPT/venv/bin/arceus-assistant
+Restart=on-failure
+RestartSec=5
+# 2 = config.yaml refused: restarting will not fix it.
+RestartPreventExitStatus=2
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+mirror_unit_text() {
+  cat <<UNIT
+[Unit]
+Description=Arceus assistant of %i: refresh the read-only code mirror it reads from the factory's clones
+
+[Service]
+Type=oneshot
+User=%i
+# ASSISTANT_WORKSPACE and ASSISTANT_MIRROR: the drop-in setup writes for each project.
+ExecStart=/bin/bash $ASSISTANT_OPT/src/deploy/mirror.sh \${ASSISTANT_WORKSPACE} \${ASSISTANT_MIRROR}
+Nice=10
+UNIT
+}
+mirror_timer_text() {
+  cat <<UNIT
+[Unit]
+Description=Arceus assistant of %i: refresh its code mirror every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+assistant_dropin() {  # unit user: its drop-in's path
+  printf '%s/%s@%s.service.d/arceus.conf' "$SYSTEMD_DIR" "$1" "$2"
+}
+assistant_dropin_text() {  # data env
+  printf '%s\n' "# Written by setup.sh: this project's config.yaml. Do not edit." "[Service]" \
+    "Environment=ARCEUS_RUNNER_CONFIG=$1/config.yaml"
+}
+mirror_dropin_text() {  # env
+  printf '%s\n' "# Written by setup.sh from config.yaml (paths.workspace, assistant.home). Do not edit." "[Service]" \
+    "Environment=ASSISTANT_WORKSPACE=$(aget "$1" ASSISTANT_WORKSPACE)" \
+    "Environment=ASSISTANT_MIRROR=$(aget "$1" ASSISTANT_HOME)/mirror"
+}
+assistant_secrets_ok() {  # user data env: its assistant.env, when in the data folder, is there and the user's alone
+  local s; s="$(aget "$3" ASSISTANT_SECRETS)"
+  case "$s" in "$2"/*) [ -f "$s" ] && [ ! -L "$s" ] && [ "$(stat -c '%a %U' "$s")" = "600 $1" ] ;; *) return 0 ;; esac
+}
+assistant_wanted() {
+  local u d h
+  while read -r u d h; do
+    [ "$(aget "$(assistant_env "$u" "$d" "$h")" ASSISTANT_ENABLED)" = 1 ] && return 0
+  done <<< "$(assistant_projects)"
+  return 1
+}
+assistant_installed() {
+  [ -x "$ASSISTANT_OPT/venv/bin/arceus-assistant" ] \
+    && [ "$(cat "$ASSISTANT_OPT/.source-sha256" 2>/dev/null)" = "$(assistant_source_hash)" ]
+}
+started_after_install() {  # unit: active since the code now installed (setup restarts it after an install)
+  local since installed
+  since="$(date -d "$(systemctl show "$1" -p ActiveEnterTimestamp --value)" +%s 2>/dev/null)" || return 1
+  installed="$(stat -c %Y "$ASSISTANT_OPT/.source-sha256" 2>/dev/null)" || return 1
+  [ "$since" -ge "$installed" ]
+}
+check_assistant() {
+  local u d h env wanted=0
+  while read -r u d h; do
+    env="$(assistant_env "$u" "$d" "$h")"
+    [ -n "$env" ] || continue
+    assistant_secrets_ok "$u" "$d" "$env" || return 1
+    if [ "$(aget "$env" ASSISTANT_ENABLED)" = 1 ]; then
+      wanted=1
+      [ -z "$(legacy_assistant_units "$u")" ] || return 1
+      same_file "$(assistant_dropin arceus-assistant "$u")" "$(assistant_dropin_text "$d")" 644 root:root || return 1
+      same_file "$(assistant_dropin arceus-assistant-mirror "$u")" "$(mirror_dropin_text "$env")" 644 root:root \
+        || return 1
+      systemctl is-enabled --quiet "arceus-assistant@$u" && systemctl is-active --quiet "arceus-assistant@$u" \
+        && systemctl is-enabled --quiet "arceus-assistant-mirror@$u.timer" || return 1
+      started_after_install "arceus-assistant@$u" || return 1
+    else
+      ! systemctl is-enabled --quiet "arceus-assistant@$u" 2>/dev/null \
+        && ! systemctl is-active --quiet "arceus-assistant@$u" 2>/dev/null || return 1
+    fi
+  done <<< "$(assistant_projects)"
+  [ "$wanted" = 1 ] || return 0
+  assistant_installed && same_file "$ASSISTANT_UNIT" "$(assistant_unit_text)" 644 root:root \
+    && same_file "$MIRROR_UNIT" "$(mirror_unit_text)" 644 root:root \
+    && same_file "$MIRROR_TIMER" "$(mirror_timer_text)" 644 root:root
+}
+apply_assistant() {
+  local u d h env s legacy units_changed=0 code_changed=0 own
+  # assistant.env first, for every project: made before the console phase lists the data folder's secrets.
+  while read -r u d h; do
+    env="$(assistant_env "$u" "$d" "$h")"
+    [ -n "$env" ] || continue
+    s="$(aget "$env" ASSISTANT_SECRETS)"
+    case "$s" in "$d"/*) ;; *) continue ;; esac
+    [ ! -L "$s" ] || die "$s is a symbolic link: the assistant's tokens must be a file of the run user's"
+    if [ ! -e "$s" ]; then
+      ( umask 077; printf '%s\n' "# The assistant's tokens (docs/assistant.md): SLACK_APP_TOKEN, SLACK_BOT_TOKEN," \
+          "# YOUTRACK_TOKEN, ANTHROPIC_API_KEY. Never in config.yaml. Set them from the console's Assistant page." > "$s" )
+      chown "$u:$(id -gn "$u")" "$s"
+      say "  created $s (600): the assistant's tokens go there"
+    else
+      chmod 600 "$s"; chown "$u:$(id -gn "$u")" "$s"
+    fi
+  done <<< "$(assistant_projects)"
+  if ! assistant_wanted; then
+    while read -r u d h; do
+      if systemctl is-enabled --quiet "arceus-assistant@$u" 2>/dev/null \
+         || systemctl is-active --quiet "arceus-assistant@$u" 2>/dev/null; then
+        systemctl disable --now --quiet "arceus-assistant@$u" "arceus-assistant-mirror@$u.timer" 2>/dev/null || true
+        say "  arceus-assistant@$u stopped: assistant.enabled is off in its config.yaml"
+      fi
+    done <<< "$(assistant_projects)"
+    return 0
+  fi
+  # Refused before anything is installed or started: the old bot must be carried over and stopped first.
+  while read -r u d h; do
+    [ "$(aget "$(assistant_env "$u" "$d" "$h")" ASSISTANT_ENABLED)" = 1 ] || continue
+    legacy="$(legacy_assistant_units "$u" | tr '\n' ' ')"
+    [ -z "${legacy// /}" ] || die "the assistant of '$u' still runs from before Arceus (${legacy% }): two connections to one Slack app split its events. Carry it over (arceus-runner assistant import ~/assistant/config.yaml --apply, as $u), stop it (sudo systemctl disable --now ${legacy% }), then run setup again. Its conversations stay where they are."
+  done <<< "$(assistant_projects)"
+  if ! assistant_installed; then
+    install -d -m 755 -o root -g root "$ASSISTANT_OPT"
+    rsync -a --delete --exclude '__pycache__' --exclude '*.egg-info' --exclude '.venv' --exclude 'tests' \
+      "$REPO_DIR/assistant/pyproject.toml" "$REPO_DIR/assistant/assistant" "$REPO_DIR/assistant/deploy" \
+      "$ASSISTANT_OPT/src/"
+    [ -x "$ASSISTANT_OPT/venv/bin/python" ] || python3 -m venv "$ASSISTANT_OPT/venv"
+    rm -rf "$ASSISTANT_OPT/src/build" "$ASSISTANT_OPT/src/"*.egg-info
+    # The runner's package from its own install (the runner phase ran first), then the assistant with voice.
+    "$ASSISTANT_OPT/venv/bin/pip" install --quiet --disable-pip-version-check --upgrade \
+      "$RUNNER_OPT/src" "$ASSISTANT_OPT/src[voice]"
+    assistant_source_hash > "$ASSISTANT_OPT/.source-sha256"
+    chown -R root:root "$ASSISTANT_OPT"; chmod -R go-w "$ASSISTANT_OPT"
+    code_changed=1
+    say "  installed the assistant in $ASSISTANT_OPT"
+  fi
+  put_file "$ASSISTANT_UNIT" 644 root:root "$(assistant_unit_text)" && units_changed=1
+  put_file "$MIRROR_UNIT" 644 root:root "$(mirror_unit_text)" && units_changed=1
+  put_file "$MIRROR_TIMER" 644 root:root "$(mirror_timer_text)" && units_changed=1
+  while read -r u d h; do
+    env="$(assistant_env "$u" "$d" "$h")"
+    [ "$(aget "$env" ASSISTANT_ENABLED)" = 1 ] || continue
+    put_file "$(assistant_dropin arceus-assistant "$u")" 644 root:root "$(assistant_dropin_text "$d")" \
+      && units_changed=1
+    put_file "$(assistant_dropin arceus-assistant-mirror "$u")" 644 root:root "$(mirror_dropin_text "$env")" \
+      && units_changed=1
+  done <<< "$(assistant_projects)"
+  systemctl daemon-reload
+  while read -r u d h; do
+    env="$(assistant_env "$u" "$d" "$h")"
+    own="arceus-assistant@$u"
+    if [ "$(aget "$env" ASSISTANT_ENABLED)" != 1 ]; then
+      if systemctl is-enabled --quiet "$own" 2>/dev/null || systemctl is-active --quiet "$own" 2>/dev/null; then
+        systemctl disable --now --quiet "$own" "arceus-assistant-mirror@$u.timer" 2>/dev/null || true
+        say "  $own stopped: assistant.enabled is off in its config.yaml"
+      fi
+      continue
+    fi
+    systemctl enable --quiet --now "arceus-assistant-mirror@$u.timer"
+    [ -d "$(aget "$env" ASSISTANT_HOME)/mirror" ] \
+      || systemctl start --no-block "arceus-assistant-mirror@$u.service"
+    if systemctl is-active --quiet "$own" && { [ "$code_changed" = 1 ] || [ "$units_changed" = 1 ] \
+         || ! started_after_install "$own"; }; then
+      systemctl restart "$own" && say "  $own restarted with the new code (a reply under way says it was cut off)"
+    elif ! systemctl is-active --quiet "$own"; then
+      systemctl enable --quiet --now "$own" && say "  $own started (127.0.0.1:$(aget "$env" ASSISTANT_PORT))"
+    fi
+    systemctl enable --quiet "$own"
+  done <<< "$(assistant_projects)"
+}
+
 # Grafana, Prometheus, Loki, Alloy and node_exporter in Docker, all on 127.0.0.1.
 # Grafana is reached through an SSH tunnel; its admin password is generated once into data/.
 obs_source_hash() {
   (cd "$REPO_DIR/observability" && find . -type f ! -name build_dashboards.py -print0 | sort -z \
     | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
 }
+# Grafana shows the console's project (CONSOLE_PROJECT_DIR): its runner's metrics and events, labelled with its
+# name, and the dashboards keep to that label, so another project's history in the same Prometheus and Loki is
+# never shown as this one's.
+obs_project() { console_get CONSOLE_PROJECT; }
+obs_metrics_port() { console_get CONSOLE_METRICS_PORT; }
 obs_env() {
-  printf 'GRAFANA_ADMIN_FILE=%s\nARCEUS_DATA=%s\nBULAVA_STATE=%s\n' \
-    "$OBS_DIR/secrets/grafana-admin" "$DATA_DIR" "$RUN_HOME/.claude/supervisor"
+  printf 'GRAFANA_ADMIN_FILE=%s\nARCEUS_DATA=%s\nBULAVA_STATE=%s\nARCEUS_PROJECT=%s\n' \
+    "$OBS_DIR/secrets/grafana-admin" "$CONSOLE_DATA" "$CONSOLE_HOME/.claude/supervisor" "$(obs_project)"
   # With the console on, Grafana is its /grafana/ and lets in only whom the console names (docs/console.md).
   if console_enabled; then
     printf 'GRAFANA_ANONYMOUS=false\nGRAFANA_AUTH_PROXY=true\nGRAFANA_SUB_PATH=true\nGRAFANA_ROOT_URL=%s/grafana/\n' \
@@ -758,9 +1023,57 @@ obs_stale_services() {  # services whose container still reads an older copy of 
     [ "$(sha256sum < "/proc/$pid/root$inside")" = "$(sha256sum < "$OBS_DIR/$file")" ] || printf '%s\n' "$svc"
   done
 }
+# The repository's prometheus.yml and dashboards, made the project's: the runner's scrape target is its metrics
+# port and carries `project`, and every query of the runner's metrics or events asks for that label.
+obs_render() {  # $1: a folder holding a copy of the repository's observability/
+  local project port
+  project="$(obs_project)"; port="$(obs_metrics_port)"
+  # config.yaml not readable yet (a first setup before it is filled in): the repository's files as they are.
+  [ -n "$project" ] && [ -n "$port" ] || return 0
+  "$RUNNER_OPT/venv/bin/python" - "$1" "$project" "$port" <<'PY'
+import json, pathlib, re, sys
+root, project, port = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+prom = root / "prometheus.yml"
+text, n = re.subn(r'(job_name: runner\n\s*static_configs: )\[\{targets: \["127\.0\.0\.1:\d+"\]\}\]',
+                  r'\1[{targets: ["127.0.0.1:%s"], labels: {project: "%s"}}]' % (port, project), prom.read_text())
+if n != 1:
+    sys.exit("prometheus.yml: the runner's scrape job is not where setup.sh expects it")
+prom.write_text(text)
+sel = 'project="%s"' % project
+def metric(m):  # runner_x or runner_x{...} -> with the project's label
+    name, labels = m.group(1), m.group(2)
+    return '%s{%s%s}' % (name, sel, (',' + labels) if labels else '')
+for path in sorted((root / "grafana" / "dashboards").glob("*.json")):
+    def fix(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "expr" and isinstance(v, str):
+                    v = re.sub(r'\b(runner_[a-z0-9_]+)(?:\{([^}]*)\})?', metric, v)
+                    node[k] = re.sub(r'\{(?=source=)', '{%s, ' % sel, v)  # Loki: {source=...} streams
+                else:
+                    fix(v)
+        elif isinstance(node, list):
+            for v in node:
+                fix(v)
+    data = json.loads(path.read_text())
+    fix(data)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+}
+obs_rendered_ok() {  # the installed copy is the repository's, made this project's
+  local tmp ok=0
+  tmp="$(mktemp -d)"
+  rsync -a --exclude build_dashboards.py "$REPO_DIR/observability/" "$tmp/"
+  (obs_render "$tmp") >/dev/null 2>&1 || ok=1
+  if [ "$ok" = 0 ]; then
+    cmp -s "$tmp/prometheus.yml" "$OBS_DIR/prometheus.yml" && diff -rq "$tmp/grafana/dashboards" "$OBS_DIR/grafana/dashboards" >/dev/null || ok=1
+  fi
+  rm -rf "$tmp"; return "$ok"
+}
 check_observability() {
   load_console_settings 2>/dev/null || true  # Grafana's sign-in follows the console's; unreadable: as without it
   [ "$(cat "$OBS_DIR/.source-sha256" 2>/dev/null)" = "$(obs_source_hash)" ] || return 1
+  obs_rendered_ok || return 1
   [ -z "$(obs_stale_services)" ] || return 1
   same_file "$OBS_DIR/.env" "$(obs_env)" 644 root:root || return 1
   [ -s "$DATA_DIR/grafana-admin-password" ] && [ -s "$OBS_DIR/secrets/grafana-admin" ] || return 1
@@ -771,6 +1084,7 @@ apply_observability() {
   install -d -m 755 -o root -g root "$OBS_DIR"
   rsync -a --delete --exclude build_dashboards.py --exclude .env --exclude .source-sha256 --exclude secrets \
     "$REPO_DIR/observability/" "$OBS_DIR/"
+  obs_render "$OBS_DIR"
   chown -R root:root "$OBS_DIR"; chmod -R go-w "$OBS_DIR"
   put_file "$OBS_DIR/.env" 644 root:root "$(obs_env)" || true
   if [ ! -s "$DATA_DIR/grafana-admin-password" ]; then
@@ -802,8 +1116,8 @@ load_console_settings() {
   [ -n "$CONSOLE_SETTINGS" ] && return 0
   [ -x "$RUNNER_OPT/venv/bin/arceus-runner" ] || return 1
   # As the run user, with its home: config.yaml's ~ means that home, as for the runner.
-  CONSOLE_SETTINGS="$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
-    --config "$DATA_DIR/config.yaml" console env 2>&1)" \
+  CONSOLE_SETTINGS="$(runuser -u "$CONSOLE_USER" -- env HOME="$CONSOLE_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
+    --config "$CONSOLE_DATA/config.yaml" console env 2>&1)" \
     || { printf '  %s\n' "$CONSOLE_SETTINGS" | head -5 >&2; CONSOLE_SETTINGS=""; return 1; }
 }
 console_settings() { printf '%s\n' "$CONSOLE_SETTINGS"; }
@@ -818,8 +1132,8 @@ console_source_hash() {   # the image is built from runner/, console/ and the ex
     | sha256sum | cut -d' ' -f1)" | cut -c1-16
 }
 console_env() {
-  printf '%s\n' "CONSOLE_IMAGE_TAG=$(console_source_hash)" "RUN_UID=$(id -u "$RUN_USER")" \
-    "RUN_GID=$(id -g "$RUN_USER")" "RUN_HOME=$RUN_HOME" "DATA_DIR=$DATA_DIR" \
+  printf '%s\n' "CONSOLE_IMAGE_TAG=$(console_source_hash)" "RUN_UID=$(id -u "$CONSOLE_USER")" \
+    "RUN_GID=$(id -g "$CONSOLE_USER")" "RUN_HOME=$CONSOLE_HOME" "DATA_DIR=$CONSOLE_DATA" \
     "CONSOLE_PUBLIC_URL=$(console_get CONSOLE_PUBLIC_URL)" "CONSOLE_SESSION_IDLE=$(console_get CONSOLE_SESSION_IDLE)" \
     "CONSOLE_SESSION_MAX=$(console_get CONSOLE_SESSION_MAX)"
 }
@@ -829,18 +1143,18 @@ yaml_str() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
 # their targets are outside what the container sees.
 console_secret_paths() {
   { console_get CONSOLE_SECRET_FILE
-    find "$DATA_DIR" -mindepth 1 -maxdepth 1 \( -type f -o -type d \) \( -iname '*.env' -o -iname 'secrets*' \
+    find "$CONSOLE_DATA" -mindepth 1 -maxdepth 1 \( -type f -o -type d \) \( -iname '*.env' -o -iname 'secrets*' \
       -o -iname '*password*' -o -iname '*credential*' -o -iname '*.key' -o -iname '*.pem' -o -iname '*token*' \
       -o -name google \) 2>/dev/null
   } | while IFS= read -r p; do
-    case "$p" in "$DATA_DIR"/*) [ -e "$p" ] && [ ! -L "$p" ] && printf '%s\n' "$p" ;; esac
+    case "$p" in "$CONSOLE_DATA"/*) [ -e "$p" ] && [ ! -L "$p" ] && printf '%s\n' "$p" ;; esac
   done | sort -u
 }
 console_forbidden_dir() {  # $1: a folder outside the data folder that config.yaml asks the console to read
   local p="${1%/}" sys
   [ -z "$p" ] && return 0
-  case "$RUN_HOME/" in "$p"/*) return 0 ;; esac          # the home itself, or a folder above it (/home, /)
-  case "$p/" in "$RUN_HOME"/.*) return 0 ;; esac         # the home's hidden folders: .ssh, .claude, .config
+  case "$CONSOLE_HOME/" in "$p"/*) return 0 ;; esac          # the home itself, or a folder above it (/home, /)
+  case "$p/" in "$CONSOLE_HOME"/.*) return 0 ;; esac         # the home's hidden folders: .ssh, .claude, .config
   for sys in /etc /root /proc /sys /dev /run /boot /usr /bin /sbin /lib /lib64 /var /opt/arceus-runner \
              /opt/arceus-console /opt/arceus-observability /opt/agent-tools /opt/bulava; do
     case "$p/" in "$sys"/*) return 0 ;; esac
@@ -852,14 +1166,14 @@ console_mounts() {
   printf '%s\n' "# Written by setup.sh from config.yaml and the data folder. Do not edit." "services:" "  console:" "    volumes:"
   while IFS= read -r p; do
     [ -n "$p" ] || continue
-    case "$p/" in "$DATA_DIR"/*) continue ;; esac
+    case "$p/" in "$CONSOLE_DATA"/*) continue ;; esac
     # Never the machine's own folders, the run user's home or anything above it: what is in them (keys, tokens,
     # other users' files) is not the console's to read. A reports folder there is refused, and said.
     if console_forbidden_dir "$p"; then
       printf '  console: %s is not mounted into the console: it is the home, above it, or a system folder\n' "$p" >&2
       continue
     fi
-    [ -d "$p" ] || install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$p"
+    [ -d "$p" ] || install -d -m 700 -o "$CONSOLE_USER" -g "$CONSOLE_GROUP" "$p"
     printf '      - {type: bind, source: %s, target: %s, read_only: true}\n' "$(yaml_str "$p")" "$(yaml_str "$p")"
   done <<< "$(console_get CONSOLE_READ_DIR)"
   while IFS= read -r p; do
@@ -962,6 +1276,27 @@ $(if [ "$(console_get CONSOLE_TLS)" = 1 ]; then
     }
     location = /grafana { return 301 /grafana/; }
     location @signin { return 302 /login?next=\$grafana_path; }
+$(if [ "$(console_get ASSISTANT_WEB)" = 1 ]; then cat <<ASSISTANT
+    # The project's assistant (assistant: in config.yaml): its web chat, for whom the console says is signed in.
+    # nginx writes X-Assistant-User from the console's answer over anything the browser sent.
+    location /assistant/ {
+      auth_request /_console_auth;
+      auth_request_set \$arceus_user \$upstream_http_x_arceus_user;
+      error_page 401 = @assistant_signin;
+      proxy_set_header X-Assistant-User \$arceus_user;
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_http_version 1.1;
+      proxy_buffering off;
+      proxy_read_timeout 900s;
+      client_max_body_size 60m;
+      proxy_pass http://127.0.0.1:$(console_get ASSISTANT_PORT);
+    }
+    location = /assistant { return 301 /assistant/; }
+    location @assistant_signin { return 302 /login?next=/assistant/; }
+ASSISTANT
+fi)
+$([ -n "${CONSOLE_EXTRA_LOCATIONS:-}" ] && printf '    # From %s (CONSOLE_EXTRA_LOCATIONS in setup.conf).\n' "$CONSOLE_EXTRA_LOCATIONS" && cat -- "$CONSOLE_EXTRA_LOCATIONS")
     location / {
       proxy_pass http://$CONSOLE_APP;
       proxy_http_version 1.1;
@@ -979,8 +1314,9 @@ CONF
 # services' state for the console. Root reads the data folder without following links.
 OPS_UNITS=(arceus-ops.path arceus-ops.service arceus-ops-tick.service arceus-ops-tick.timer)
 ops_command() {
-  printf '%s console hostops --data %s --setup %s %s' "$RUNNER_OPT/venv/bin/arceus-runner" "$DATA_DIR" \
-    "$ARCEUS_HOME/setup/setup.sh" "$1"
+  printf '%s console hostops --data %s --setup %s --runner-unit %s --engine-unit %s %s' \
+    "$RUNNER_OPT/venv/bin/arceus-runner" "$CONSOLE_DATA" "$ARCEUS_HOME/setup/setup.sh" "$CONSOLE_RUNNER_UNIT" \
+    "$CONSOLE_ENGINE_UNIT" "$1"
 }
 ops_unit_text() {
   case "$1" in
@@ -989,7 +1325,7 @@ ops_unit_text() {
 Description=Arceus console: requests for the host's operations
 
 [Path]
-DirectoryNotEmpty=$DATA_DIR/console/ops/requests
+DirectoryNotEmpty=$CONSOLE_DATA/console/ops/requests
 Unit=arceus-ops.service
 
 [Install]
@@ -1034,12 +1370,12 @@ ops_units_ok() {
   for u in "${OPS_UNITS[@]}"; do same_file "/etc/systemd/system/$u" "$(ops_unit_text "$u")" 644 root:root || return 1; done
   systemctl is-enabled -q arceus-ops.path && systemctl is-active -q arceus-ops.path \
     && systemctl is-enabled -q arceus-ops-tick.timer && systemctl is-active -q arceus-ops-tick.timer \
-    && [ "$(stat -c '%U' "$DATA_DIR/console/ops/requests" 2>/dev/null)" = "$RUN_USER" ]
+    && [ "$(stat -c '%U' "$CONSOLE_DATA/console/ops/requests" 2>/dev/null)" = "$CONSOLE_USER" ]
 }
 apply_ops_units() {
   local u changed=0
-  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console/ops"
-  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console/ops/requests"
+  install -d -m 700 -o "$CONSOLE_USER" -g "$CONSOLE_GROUP" "$CONSOLE_DATA/console/ops"
+  install -d -m 700 -o "$CONSOLE_USER" -g "$CONSOLE_GROUP" "$CONSOLE_DATA/console/ops/requests"
   install -d -m 700 -o root -g root "$FACTS_DIR/ops"
   for u in "${OPS_UNITS[@]}"; do put_file "/etc/systemd/system/$u" 644 root:root "$(ops_unit_text "$u")" && changed=1; done
   systemctl daemon-reload
@@ -1088,7 +1424,7 @@ check_console() {
 }
 apply_console() {
   load_console_settings \
-    || die "the console's settings cannot be read from $DATA_DIR/config.yaml: run arceus-runner check --offline"
+    || die "the console's settings cannot be read from $CONSOLE_DATA/config.yaml: run arceus-runner check --offline"
   if ! console_enabled; then
     if [ -f "$CONSOLE_DIR/compose.yaml" ]; then
       console_compose down 2>&1 | sed 's/^/  /'
@@ -1096,6 +1432,11 @@ apply_console() {
     fi
     [ ! -f /etc/systemd/system/arceus-ops.path ] || remove_ops_units
     return 0
+  fi
+  # The assistant's route used to be added by hand through CONSOLE_EXTRA_LOCATIONS; twice, nginx would not start.
+  if [ "$(console_get ASSISTANT_WEB)" = 1 ] && [ -n "$CONSOLE_EXTRA_LOCATIONS" ] \
+     && grep -q 'location /assistant/' "$CONSOLE_EXTRA_LOCATIONS"; then
+    die "$CONSOLE_EXTRA_LOCATIONS (CONSOLE_EXTRA_LOCATIONS in setup.conf) still has the assistant's /assistant/: setup writes it now from config.yaml. Take that block out of the file (or the line out of setup.conf), then run setup again."
   fi
   console_port_taken && die "port $(console_get CONSOLE_PORT) is taken by something else (ss -ltnp): free it or set console.port"
   install -d -m 755 -o root -g root "$CONSOLE_DIR" "$CONSOLE_DIR/build"
@@ -1118,7 +1459,7 @@ apply_console() {
       "$CONSOLE_DIR/build" 2>&1 | sed 's/^/  /'
   fi
   # console.db and the operations' requests: the run user's, in the data folder the container sees.
-  install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$DATA_DIR/console"
+  install -d -m 700 -o "$CONSOLE_USER" -g "$CONSOLE_GROUP" "$CONSOLE_DATA/console"
   apply_ops_units
   apply_console_tls
   put_file "$CONSOLE_DIR/.env" 644 root:root "$(console_env)" || true
@@ -1136,8 +1477,8 @@ apply_console() {
     [ "$old" = "$tag" ] || docker image rm -f "arceus-console:$old" >/dev/null 2>&1 || true
   done
   console_source_hash > "$CONSOLE_DIR/.source-sha256"
-  if [ -z "$(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
-        --config "$DATA_DIR/config.yaml" console users 2>/dev/null | grep -v '^No accounts')" ]; then
+  if [ -z "$(runuser -u "$CONSOLE_USER" -- env HOME="$CONSOLE_HOME" "$RUNNER_OPT/venv/bin/arceus-runner" \
+        --config "$CONSOLE_DATA/config.yaml" console users 2>/dev/null | grep -v '^No accounts')" ]; then
     say "  console: nobody can sign in yet. Make the first admin:"
     say "    $RUNNER_OPT/venv/bin/arceus-runner console invite --admin you@example.com"
   fi

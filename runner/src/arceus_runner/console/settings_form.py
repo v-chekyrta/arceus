@@ -50,12 +50,15 @@ TITLES = {
     "secops": ("Advisory triage", "On/off, schedule, which repositories, whether verdicts go to the register."),
     "cleanup": ("Cleanup", "What is removed between tasks and when."),
     "console": ("Console", "This console's address, port, trusted proxies and sessions."),
+    "assistant": ("Assistant", "The project's assistant in Slack and the web chat: who it is, who may use it, who "
+                               "pays for its Claude, its keys."),
     "metrics": ("Metrics", "The runner's Prometheus endpoint."),
     "paths": ("Paths", "Where the workspace, the engine, the database and the secrets file are."),
 }
 # What a change needs before it takes effect. Everything the runner reads needs it restarted; these are also read by
 # setup.sh, which writes them into systemd units, Docker files or nginx, so setup has to run first.
-SETUP_KEYS = ("console", "paths", "bulava.mcp_config", "metrics")
+SETUP_KEYS = ("console", "paths", "bulava.mcp_config", "metrics", "assistant.enabled", "assistant.web",
+              "assistant.port")
 
 # Settings the console shows and never changes: they decide what runs on the machine (a shell command, the engine,
 # the agent's MCP servers, the files the runner reads its environment and tokens from) or where the tokens go (the
@@ -66,7 +69,12 @@ LOCKED_KEYS = ("paths", "health.devstack_check", "bulava.mcp_config", "tracker.t
                "tracker.token_env", "code_host.type", "code_host.url", "code_host.token_env", "code_host.approver",
                "slack.token_env", "slack.webhook_env", "console", "metrics", "qa.instructions", "qa.reports",
                "architect.instructions", "architect.reports", "secops.register", "secops.instructions",
-               "secops.reports")
+               "secops.reports",
+               # The assistant: the program it runs, the command its ticket desk is reached by (through sudo), the
+               # files it reads into what it says (a persona pointed at secrets.env would be told to anyone), where
+               # its tokens are and the folder it keeps, and its port behind nginx.
+               "assistant.claude_bin", "assistant.codex_bin", "assistant.ticket_engine", "assistant.home", "assistant.secrets",
+               "assistant.persona_file", "assistant.knowledge_file", "assistant.port")
 
 # Folders the console reads (cli._read_dirs): moved outside the data folder, setup.sh mounts them for it.
 MOUNTED_KEYS = ("qa.reports", "qa.instructions", "architect.reports", "architect.instructions", "secops.reports")

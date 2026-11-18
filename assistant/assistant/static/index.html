@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Асистент фабрики</title>
+<link rel="stylesheet" href="/assistant/static/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="bar-in">
+    <a class="brand" href="/">Arceus <span id="project">асистент</span></a>
+    <button class="linkish list-toggle" id="list-toggle" type="button" aria-controls="sidebar" aria-expanded="false">Розмови</button>
+    <div class="who"><span id="who"></span><a href="/">Консоль</a></div>
+  </div>
+</header>
+<div class="shell">
+  <nav class="sidebar" id="sidebar" aria-label="Розмови">
+    <button class="btn primary block" id="new-conv" type="button">Нова розмова</button>
+    <ul class="convs" id="convs" role="list"></ul>
+    <p class="empty-list" id="convs-empty" hidden>Розмов ще немає.</p>
+  </nav>
+  <main class="chat" id="chat">
+    <div class="thread" id="thread" aria-live="polite">
+      <section class="intro" id="intro">
+        <h1>Асистент фабрики</h1>
+        <p class="lede">Опишіть запит клієнта чи проблему своїми словами. Асистент подивиться код і тікети, запропонує, як краще вчинити, і допоможе оформити задачу для фабрики.</p>
+      </section>
+    </div>
+    <form class="composer" id="composer">
+      <ul class="tray" id="tray" role="list" aria-label="Файли до повідомлення" hidden></ul>
+      <p class="tray-note" id="tray-note" role="alert" hidden></p>
+      <input type="file" id="file-input" multiple hidden>
+      <button class="icon-btn" id="attach" type="button" aria-label="Додати файл" title="Додати файл">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 11.5 12.4 19.6a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>
+      </button>
+      <button class="icon-btn" id="mic" type="button" aria-label="Записати голосове" title="Записати голосове" aria-pressed="false">
+        <svg class="i-mic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+        <svg class="i-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>
+      </button>
+      <label class="sr" for="input">Повідомлення</label>
+      <textarea id="input" rows="1" placeholder="Напишіть повідомлення…" autocomplete="off"></textarea>
+      <button class="btn primary" id="send" type="submit">Надіслати</button>
+      <p class="composer-hint">Enter — надіслати, Shift+Enter — новий рядок. Файли можна перетягнути сюди або вставити з буфера.</p>
+    </form>
+    <div class="drop" id="drop" aria-hidden="true"><p>Відпустіть, щоб додати файли</p></div>
+  </main>
+</div>
+<script src="/assistant/static/vendor/marked.min.js"></script>
+<script src="/assistant/static/vendor/purify.min.js"></script>
+<script src="/assistant/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% from "macros.html" import flash, csrf_field %}
+{% macro restart_form(label="Restart the assistant") %}
+<form method="post" action="/settings/assistant/restart">{{ csrf_field(csrf) }}<button class="btn{{ ' primary' if s.applied == 'differs' }}" type="submit">{{ label }}</button></form>
+{% endmacro %}
+{% macro setup_link() %}
+{% if can_setup %}<a class="btn primary" href="/operations/new/setup">Run setup</a>{% else %}<span class="meta">An admin runs setup (Operations).</span>{% endif %}
+{% endmacro %}
+{% block body %}
+<p class="crumb"><a href="/settings/">Settings</a></p>
+<h1>Assistant</h1>
+<p class="lede">{% if a.enabled %}{{ a.name }}, the assistant of {{ a.project or project }}.{% else %}The project's assistant is off.{% endif %}
+ Its settings are the <code class="lit">assistant:</code> section of config.yaml. Its keys are kept apart, in assistant.env, and are never shown here.</p>
+{{ flash(notice, error) }}
+
+{% set st = s.status %}
+{% if not a.enabled %}
+<p class="notice warn">The assistant is off in config.yaml. Turn it on in its settings, then run setup: setup installs it and starts it.</p>
+{% elif s.applied == "differs" %}
+<div class="notice warn applied"><p>config.yaml has changed since the assistant started ({{ st.started_at|when }}). It still runs with the earlier settings.{% if s.needs_setup %} Her web chat's route in nginx is written by setup: run setup as well.{% endif %}</p>{% if can_restart %}{{ restart_form("Restart to apply") }}{% endif %}{% if s.needs_setup %}{{ setup_link() }}{% endif %}</div>
+{% elif s.applied == "setup" %}
+<div class="notice warn applied"><p>She runs with this config.yaml, but her web chat is {{ "on" if s.saved_web else "off" }} in it and nginx {{ "has no route to her" if s.saved_web else "still routes /assistant/ to port " ~ s.route_port }}. That route is written by setup, not by a restart.</p>{{ setup_link() }}</div>
+{% elif s.applied == "same" %}
+<p class="notice">The assistant runs with this config.yaml (started {{ st.started_at|when }}).</p>
+{% else %}
+<p class="notice warn">Not known which config.yaml the assistant runs with: {{ s.why }}.</p>
+{% endif %}
+
+<div class="tiles">
+  <section class="tile">
+    <h2>Service</h2>
+    {% if s.running is none %}<p class="value unknown">Unknown now</p><p class="note">{% if s.service %}last seen {{ s.service.active }}{% if s.host.at %} {{ s.host.at|when }}{% endif %}; {% endif %}{{ s.host.why or "the host has not reported it" }}</p>
+    {% elif s.service.active == "active" %}<p class="value good"><span aria-hidden="true">✓</span> Running</p><p class="note">since {{ s.service.since or "?" }}</p>
+    {% elif not s.service.installed %}<p class="value unknown">Not installed</p><p class="note">setup's assistant phase installs it</p>
+    {% else %}<p class="value bad"><span aria-hidden="true">✕</span> {{ s.service.active|capitalize }}</p><p class="note">{{ s.service.sub }}{% if s.service.status %}, exit status {{ s.service.status }}{% endif %}</p>{% endif %}
+  </section>
+  <section class="tile">
+    <h2>Slack</h2>
+    {% set sl = (st.slack or {}) %}
+    {% if s.running_slack is none %}<p class="value unknown">Unknown now</p><p class="note">{{ s.why or "the assistant is not reporting" }}{% if sl.state %}; last said {{ sl.state }} {{ sl.at|when }}{% endif %}</p>
+    {% elif s.running_slack == "off" %}<p class="value unknown">Off</p><p class="note">she is not in Slack</p>
+    {% elif s.running_slack == "connected" %}<p class="value good"><span aria-hidden="true">✓</span> Connected</p><p class="note">as {{ sl.bot }} in {{ sl.team }}</p>
+    {% elif s.running_slack == "reconnecting" %}<p class="value bad"><span aria-hidden="true">✕</span> Connection lost</p><p class="note">as {{ sl.bot }} in {{ sl.team }}: reconnecting since {{ sl.at|when }}</p>
+    {% elif s.running_slack == "failed" %}<p class="value bad"><span aria-hidden="true">✕</span> Not connected</p><p class="note">{{ sl.error }}</p>
+    {% else %}<p class="value unknown">Connecting</p><p class="note">since {{ sl.at|when }}</p>{% endif %}
+    {% if s.slack_pending %}<p class="note"><strong>Saved:</strong> {{ "in Slack" if a.slack else "out of Slack" }}, from her next start</p>{% endif %}
+  </section>
+  <section class="tile">
+    <h2>Chat</h2>
+    {% set cl = (st.claude or {}) %}
+    {% if not s.running_payer %}<p class="value unknown">Unknown now</p><p class="note">{{ s.why or "the assistant is not reporting" }}</p>
+    {% elif s.running_key %}
+      {% if not (s.key_state.get(s.running_key) or {}).set and s.keys_known %}<p class="value bad"><span aria-hidden="true">✕</span> No key</p><p class="note">{{ s.running_payer }}: she answers that the key is not set up</p>
+      {% elif cl.last == "bad_key" %}<p class="value bad"><span aria-hidden="true">✕</span> Key refused</p><p class="note">{{ s.running_payer }} refused {{ cl.at|when }}: replace it below</p>
+      {% elif cl.last == "ok" %}<p class="value good"><span aria-hidden="true">✓</span> {{ s.running_payer }}</p><p class="note">last reply {{ cl.at|when }}</p>
+      {% else %}<p class="value unknown">{{ s.running_payer }}</p><p class="note">{% if cl.last == "error" %}the last reply failed {{ cl.at|when }}{% else %}no reply yet{% endif %}</p>{% endif %}
+    {% elif cl.last == "ok" %}<p class="value good"><span aria-hidden="true">✓</span> {{ s.running_payer }}</p><p class="note">the factory's own sign-in · last reply {{ cl.at|when }}</p>
+    {% else %}<p class="value unknown">{{ s.running_payer }}</p><p class="note">the factory's own sign-in{% if cl.last == "error" %} · the last reply failed {{ cl.at|when }}{% endif %}</p>{% endif %}
+    {% if s.auth_pending %}<p class="note"><strong>Saved:</strong> {{ s.saved_payer }}, from her next start</p>{% endif %}
+  </section>
+  <section class="tile">
+    <h2>Web chat</h2>
+    {% if s.running_web is none %}<p class="value unknown">Unknown now</p><p class="note">{{ s.why or "the assistant is not reporting" }}</p>
+    {% elif s.running_web and s.reachable %}<p class="value good"><span aria-hidden="true">✓</span> On</p><p class="note"><a href="/assistant/">Open it</a></p>
+    {% elif s.running_web and s.reachable is none %}<p class="value unknown">On in her</p><p class="note">whether nginx routes /assistant/ to her is not known: {{ s.route_why }}</p>
+    {% elif s.running_web %}<p class="value bad"><span aria-hidden="true">✕</span> Not reachable</p><p class="note">she serves it, but nginx {{ "has no route to her" if s.route_port is none else "routes /assistant/ to port " ~ s.route_port }}: setup writes that route</p>
+    {% else %}<p class="value unknown">Off</p><p class="note">{% if s.route_port is not none %}nginx still routes /assistant/ here and she answers «off» to it, until setup removes the route{% else %}{{ "Slack only" if s.running_slack not in (none, "off") else "nobody reaches her there" }}{% endif %}</p>{% endif %}
+    {% if s.web_pending %}<p class="note"><strong>Saved:</strong> {{ "on" if s.saved_web else "off" }}, from her next start{% if s.needs_setup %} and setup{% endif %}</p>{% endif %}
+  </section>
+</div>
+
+<div class="toolbar spaced-top">
+  <a class="btn" href="/settings/assistant/edit/">{{ "Change her settings" if can_edit else "See her settings" }}</a>
+  {% if can_restart and a.enabled and s.applied != "differs" %}{{ restart_form() }}{% endif %}
+  <a class="btn" href="/settings/history/">Settings history</a>
+</div>
+
+<div class="split assistant-split">
+  <div>
+    <h2>Who pays for her replies</h2>
+    <div class="card">
+      {% if s.auth_pending %}
+      <p class="notice warn">She still runs on the {{ s.running_payer }}. The saved settings say the {{ s.saved_payer }}: that applies from her next start.</p>
+      {% elif not s.running_payer and a.enabled %}
+      <p class="meta">What she runs on now is not known ({{ s.why }}). Her settings say:</p>
+      {% endif %}
+      <p class="value-line">The {{ s.saved_payer }}</p>
+      {% if a.auth == "api_key" %}
+      <p>Every reply is billed to the key's owner{% if a.key_owner %}: <strong>{{ a.key_owner }}</strong>{% endif %} (<code class="lit">{{ s.saved_key }}</code> below). Without the key she writes no reply and says the key is not set up; she never falls back to the factory's own sign-in.</p>
+      {% if not a.key_owner %}<p class="meta">Whose key it is is not named: set <code class="lit">key_owner</code> in her settings, so people know who pays.</p>{% endif %}
+      {% else %}
+      <p>The sign-in the factory already runs on, as before. To bill an API key instead, set <code class="lit">auth: api_key</code> in her settings and the key below.</p>
+      {% endif %}
+      <p class="meta">Choose with <code class="lit">provider</code> (claude or codex) and <code class="lit">auth</code> (subscription or api_key). Tickets and «розберусь» go to the Night Shift desk on the factory owner's subscription either way.</p>
+    </div>
+
+    <h2>Who talks to her</h2>
+    <p class="meta">As her settings say{% if s.applied == "differs" %}: what differs from the running assistant applies from her next start{% endif %}.</p>
+    <ul class="rows">
+      <li><span class="label">Web chat</span><span class="what">{% if who.web is none %}Off.{% else %}{{ who.web|join(", ") or "nobody yet" }}<span class="note">console accounts; the console checks who is signed in, the assistant checks this list</span>{% endif %}</span></li>
+      <li><span class="label">Slack</span><span class="what">{% if not who.slack %}Off.{% else %}{{ who.slack.who }}{% if who.slack.partner %}<span class="note">Also people of the partner in {{ who.slack.partner|join(", ") }}.</span>{% endif %}{% if who.slack.listen %}<span class="note">Reads {{ who.slack.listen|join(", ") }} and never speaks there.</span>{% endif %}{% endif %}</span></li>
+      <li><span class="label">Tickets for</span><span class="what">{{ who.creators|join(", ") }}</span></li>
+      <li><span class="label">Calls for help</span><span class="what">{% if who.expert %}{{ who.expert }}<span class="note">she tells people she has called {{ who.expert_name }}</span>{% else %}Nobody: she says it is a question for the tech lead.{% endif %}</span></li>
+    </ul>
+  </div>
+
+  <div>
+    <h2 id="keys">Keys</h2>
+    <p class="meta">Write-only. The console never reads assistant.env: a key goes to the host, which writes it there for the run user alone, and it is never shown again.</p>
+    {% if not s.keys_known %}<p class="notice warn">Which keys are set is not known: {{ s.host.why or "the host has not reported them yet" }}.</p>{% endif %}
+    <ul class="keys">
+      {% for name, (label, what) in key_words.items() %}
+      {% set k = s.key_state.get(name) or {} %}
+      <li class="card key">
+        <div class="key-head">
+          <h3 id="k-{{ name }}">{{ label }}</h3>
+          {% if k.set %}<span class="tag ok">Set</span>{% elif s.keys_known %}<span class="tag wait">Not set</span>{% else %}<span class="tag quiet">Unknown</span>{% endif %}
+        </div>
+        <p class="note"><code class="lit">{{ name }}</code> · {{ what }}{% if k.set and k.at %} Set {{ k.at|when }}{% if k.by %} by {{ k.by }}{% endif %}.{% endif %}</p>
+        {% if can_edit %}
+        <form class="inline-form" method="post" action="/settings/assistant/key">
+          {{ csrf_field(csrf) }}<input type="hidden" name="name" value="{{ name }}">
+          <label class="sr" for="v-{{ name }}">{{ "Replace the" if k.set else "The" }} {{ label }}</label>
+          <input class="grow" id="v-{{ name }}" name="value" type="password" autocomplete="off" spellcheck="false" placeholder="{{ 'Replace with a new one' if k.set else 'Paste it here' }}" aria-describedby="k-{{ name }}">
+          <button class="btn primary" type="submit" name="action" value="set">{{ "Replace" if k.set else "Save" }}</button>
+          {% if k.set %}<button class="btn danger" type="submit" name="action" value="remove" formnovalidate>Remove</button>{% endif %}
+        </form>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% if not can_edit %}<p class="meta">Admins set the keys.</p>{% endif %}
+    {% if a.slack %}<p class="meta">A new Slack app: <code class="lit">arceus-assistant slack-manifest</code> on the server prints its manifest for this assistant (docs/assistant.md).</p>{% endif %}
+  </div>
+</div>
+{% endblock %}

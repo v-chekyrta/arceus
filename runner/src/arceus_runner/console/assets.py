@@ -312,6 +312,21 @@ pre.diff .hunk { color: var(--blue); }
 pre.oplog { margin: 0; padding: 12px 14px; max-height: 32rem; overflow: auto; background: var(--surface);
             border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere;
             font: 0.825rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+/* the assistant */
+.assistant-split { grid-template-columns: minmax(0, 1fr) minmax(0, 24rem); margin-top: 8px; }
+.assistant-split h2:first-child { margin-top: 0; }
+.assistant-split .card p:last-child { margin-bottom: 0; }
+.assistant-split .card > :first-child { margin-top: 0; }
+.applied { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.applied p { margin: 0; flex: 1 1 18rem; }
+.applied form { margin: 0; }
+.keys { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 10px; }
+.key { padding: 14px 16px; margin: 0; }
+.key-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.key .note { margin: 4px 0 10px; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
+.key .inline-form input { min-width: 0; }
+.rows .label { margin: 0; color: var(--muted); }
+
 @media (max-width: 760px) {
   .split, .task-split { grid-template-columns: 1fr; }
   .roles-help li { grid-template-columns: 1fr; gap: 2px; }

@@ -286,6 +286,39 @@ and goes back through the same check. The runner records which `config.yaml` it 
 Operators see all of it read-only. Nobody else opens it. Secrets are not in `config.yaml` (only the names of
 the variables in `secrets.env`), and the console never reads `secrets.env`.
 
+## Assistant
+
+**Settings → Assistant** is the project's assistant ([assistant.md](assistant.md)) on one page. Operators see it;
+admins change it.
+
+- **How it is now:** its service (`arceus-assistant@<run user>`, as the host's executor last saw it), Slack (the
+  workspace and the bot as Slack's `auth.test` named them, or why it is not connected), who pays for its Claude and
+  how its last reply went, the web chat. The assistant writes that itself into `assistant-status.json` beside
+  config.yaml, without a secret in it, every 30 seconds, with the Slack connection checked anew (a drop shows as «Connection lost» until Slack's client is back). A status no longer kept, or a service the host's executor has not confirmed lately, is said as unknown now, with what was last seen and when; so is who pays: the page names what the running process uses, and a saved change of it as waiting for the restart.
+- **Saved is not applied:** the page compares the config.yaml the assistant started with and the file now, and offers
+  **Restart to apply** (operators and admins): the host's `restart-assistant` operation, which waits for the assistant
+  to write its status again before it counts as done.
+- **Who talks to her, and who pays:** the web chat's people, the Slack audience, who may have tickets made, whom she
+  calls; and what her replies run on (the factory's Claude or Codex subscription, or an Anthropic or OpenAI
+  API key), and whose key it is.
+- **Keys, write-only:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `YOUTRACK_TOKEN`. An admin pastes a
+  key and saves it, replaces it or removes it; the page shows only whether each is set, since when and by whom. The
+  console never reads `assistant.env` (its container sees it empty). It writes the key into a request readable by the
+  run user alone, and only when the host's executor is answering; the executor takes it at once (not as a unit of its
+  own), checks it again, writes it into the data folder's own `assistant.env` (600, never where config.yaml points
+  elsewhere) and removes the request. The ledger, the console's copy of it, the journal and the log name the key and
+  who set it, never the value. A Slack token restarts the assistant so it reconnects; the Anthropic and YouTrack keys
+  apply to her next reply.
+- **Its settings** are the `assistant:` section, edited through the same Check → Save and History as every section.
+  What would run code or read files into what she says (`claude_bin`, `ticket_engine`, `home`, `secrets`,
+  `persona_file`, `knowledge_file`, `port`) is shown and set on the server only; `enabled`, `web` and `port` are
+  applied by setup.
+- **The web chat is on only where nginx routes it.** setup writes `/assistant/` into the console's nginx from
+  `assistant.web`; a restart does not. The host's executor reads that nginx.conf and says whether it routes
+  `/assistant/` and to which port. The tile says **On** only when she serves the chat and nginx routes to her; with
+  the chat off she answers every web chat path with 404 (`assistant.web: false`), whatever nginx still routes. When
+  nginx does not route as the saved settings say, the page asks for **Run setup**, not for a restart.
+
 ## Operations
 
 **Operations** restarts the runner and the engine and runs setup. The console has no root on the machine, so it

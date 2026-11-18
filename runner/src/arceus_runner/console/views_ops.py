@@ -34,6 +34,9 @@ WHAT = {
                       "end, as long as they take, restarts bulava-engine, and lets work start again. While it "
                       "waits it can be cancelled, which also lets work start again.",
     "setup-check": "Runs setup.sh --check: says which phases are not done. Changes nothing.",
+    "restart-assistant": "Restarts the project's assistant (arceus-assistant@<run user>): it reads config.yaml again "
+                         "and reconnects to Slack. A reply being written is cut off and says so; messages that came "
+                         "from Slack meanwhile are kept and answered.",
     "setup": "Runs setup.sh: installs what the copy of the repository on the server holds, phase by phase. It may "
              "rebuild this console (the page comes back by itself) and restart the engine when no task runs; the "
              "runner then runs the new code once restarted.",
@@ -60,8 +63,8 @@ def host_state(ctx: Ctx) -> dict:
     if age > FRESH:
         return {"ok": False, "why": f"the host's executor last answered {status.ago(datetime.now(UTC).timestamp() - age)}"
                                     " (arceus-ops-tick.timer): operations wait until it runs again",
-                "services": data.get("services") or {}}
-    return {"ok": True, "services": data.get("services") or {}, "at": data["at"]}
+                "services": data.get("services") or {}, "at": data.get("at"), "routes": data.get("routes") or {}}
+    return {"ok": True, "services": data.get("services") or {}, "at": data["at"], "routes": data.get("routes") or {}}
 
 
 def records(ctx: Ctx) -> list[dict]:

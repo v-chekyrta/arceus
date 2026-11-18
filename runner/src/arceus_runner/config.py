@@ -814,6 +814,132 @@ class ConsoleConfig(Strict):
         return self
 
 
+_SLACK_CHANNEL = re.compile(r"^[CG][A-Z0-9]{2,}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _channels(v: list[str]) -> list[str]:
+    bad = [c for c in v if not _SLACK_CHANNEL.match(c)]
+    if bad:
+        raise ValueError(f"Slack channel IDs look like C0123ABCD (channel details, at the bottom): {', '.join(bad)}")
+    return v
+
+
+def _emails(v: list[str]) -> list[str]:
+    bad = [e for e in v if not _EMAIL.match(e)]
+    if bad:
+        raise ValueError(f"expected e-mail addresses, got {', '.join(map(repr, bad))}")
+    out = [e.lower() for e in v]
+    if len(set(out)) != len(out):
+        raise ValueError("has duplicates")
+    return out
+
+
+class AssistantSlack(Strict):
+    """The assistant in Slack, over Socket Mode (the server opens the connection; nothing listens on the internet).
+    Its two tokens are SLACK_APP_TOKEN (xapp-…, connections:write) and SLACK_BOT_TOKEN (xoxb-…) in assistant.env."""
+    web_url: str = Field(default="", pattern=r"^(https?://\S+)?$")   # the web chat, for links under its cards
+    read_channels: list[str] = []      # project channels she reads into her memory and may search
+    internal_channels: list[str] = []  # counted as ours alone when Slack will not say (never once Slack says shared)
+    listen_channels: list[str] = []    # read like project channels, never spoken in: a channel with the client
+    partner_channels: list[str] = []   # shared with another company on purpose: she reads and answers there
+    creator_channels: list[str] = []   # with creator_domain: members of these channels may have tickets made
+    creator_domain: str = Field(default="", pattern=r"^([a-z0-9-]+\.)+[a-z]{2,}$|^$")
+    history_days: int = Field(default=120, ge=1, le=3650)   # how far back channels are read and searched
+    call_names: list[str] = []         # names that call her without a tag (vocative forms included)
+
+    _check_channels = field_validator("read_channels", "internal_channels", "listen_channels", "partner_channels",
+                                      "creator_channels")(_channels)
+
+    @model_validator(mode="after")
+    def _creators(self) -> AssistantSlack:
+        if bool(self.creator_channels) != bool(self.creator_domain):
+            raise ValueError("creator_channels and creator_domain go together: members of those channels with an "
+                             "e-mail of that domain may have tickets made")
+        both = set(self.listen_channels) & set(self.partner_channels)
+        if both:
+            raise ValueError(f"a channel is either listened to or a partner's, not both: {', '.join(sorted(both))}")
+        return self
+
+
+class AssistantYouTrack(Strict):
+    """Where the tickets the assistant drafts are made: the tracker's own address (tracker.url), from the bot account
+    whose token is YOUTRACK_TOKEN in assistant.env. Without the token she still drafts them; nobody can make them."""
+    project: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*$")   # the short name: NWND
+    board: str = ""                    # the agile board's ID created tickets go on ("" = none)
+    queue_tag: str = ""                # put on created tickets; "" = a person tags them for the factory
+    state_field: str = Field(default="State", min_length=1)
+    queued_state: str = Field(default="To Do", min_length=1)
+    type_field: str = ""               # "" = the project has no type field
+    types: dict[Literal["bug", "feature", "research"], str] = {"bug": "Bug", "feature": "Feature",
+                                                                "research": "Task"}
+
+
+class AssistantTicketEngine(Strict):
+    """Tickets written and checked by the assistant's own Night Shift desk (assistant/deploy/ticket-engine)."""
+    bridge: str = Field(pattern=r"^\S+( \S+)*$")   # the desk's command: sudo -n /usr/local/bin/fa-ticket-engine
+    timeout: Duration = timedelta(minutes=25)   # a ticket not ready by then keeps her own draft, marked unchecked
+
+
+class AssistantConfig(Strict):
+    """The project's assistant (assistant/ beside the runner): a web chat behind the console at /assistant/ and,
+    with `slack`, a colleague in the project's Slack. It reads the code (a read-only mirror), the project's tickets
+    and channels, drafts tickets for the factory and tells how the factory works from this file.
+    Its own process (arceus-assistant@<run user>), set up by setup.sh's `assistant` phase. Its tokens are in
+    `secrets` (assistant.env), never here."""
+    enabled: bool = False
+    project: str = ""                  # the project's name as people say it (Northwind); "" = the runner's `project`
+    name: str = Field(default="Асистент", min_length=1)   # who she or he is in the chat
+    gender: Literal["f", "m"] = "f"    # the prompt's {сама|сам} forms and her own words
+    intro: str = ""                    # the empty web chat's opening line, in her voice
+    persona_file: ExpandedPath | None = None    # character and legend: the prompt's {persona}
+    knowledge_file: ExpandedPath | None = None  # what is known about the project, appended to the prompt
+    # Her own folder: data/ (the conversations), uploads/, mirror/ (the code she reads), models/ (voice).
+    home: ExpandedPath = Field(default="~/assistant", validate_default=True)
+    secrets: ExpandedPath = Field(default="~/arceus/data/assistant.env", validate_default=True)
+    port: int = Field(default=8190, ge=1024, le=65535)   # on 127.0.0.1; another project's assistant needs another
+    web: bool = True                   # the web chat at /assistant/ behind the console (the console's project only)
+    allowed_users: list[str] = []      # console accounts (e-mail) let into the web chat
+    ticket_creators: list[str] = []    # who may have tickets made (e-mail); empty and no creator_channels: anyone
+    expert: str = Field(default="", pattern=r"^([^@\s]+@[^@\s]+\.[^@\s]+)?$")   # whom she calls for what is past her
+    # How she names that person to others, as in «покликала …», «попросила …» (the accusative): «Андрія Мельника».
+    expert_name: str = Field(default="експерта проєкту", min_length=2)
+    # What writes her replies, and who pays for it. provider: claude (Claude Code) or codex (Codex, read-only through
+    # her own tools, no shell). auth: subscription is the developer's own sign-in on the factory, the one the factory
+    # already runs on (Claude, or Codex's ChatGPT login); api_key is ANTHROPIC_API_KEY (claude) or OPENAI_API_KEY
+    # (codex) in assistant.env instead, billed to the key's owner, never falling back to the sign-in. Tickets and
+    # «розберусь» go to the Night Shift desk (ticket_engine) on the factory owner's subscription either way.
+    provider: Literal["claude", "codex"] = "claude"
+    auth: Literal["subscription", "api_key"] = "subscription"
+    # Whose key it is, as people will recognise it: the company and its Anthropic Console organization or workspace
+    # the usage is billed to. Shown on the console's Assistant page; the key itself is in assistant.env.
+    key_owner: str = Field(default="", max_length=200)
+    model: str = Field(default="sonnet", pattern=MODEL_NAME)               # provider: claude
+    codex_model: str = Field(default="gpt-6.1-terra", pattern=MODEL_NAME)  # provider: codex
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
+    reply_timeout: Duration = timedelta(minutes=10)
+    voice_model: str = Field(default="medium", pattern=r"^[a-z0-9.-]*$")   # faster-whisper; "" = no transcription
+    claude_bin: str = Field(default="claude", min_length=1)
+    codex_bin: str = Field(default="codex", min_length=1)
+    youtrack: AssistantYouTrack | None = None
+    ticket_engine: AssistantTicketEngine | None = None
+    slack: AssistantSlack | None = None
+
+    _check_emails = field_validator("allowed_users", "ticket_creators")(_emails)
+
+    @field_validator("expert")
+    @classmethod
+    def _expert(cls, v: str) -> str:
+        return v.lower()
+
+    @model_validator(mode="after")
+    def _who(self) -> AssistantConfig:
+        if self.enabled and self.web and not self.allowed_users:
+            raise ValueError("allowed_users: name who may open the web chat (console e-mails), or set web: false; "
+                             "the console may show other projects' people too")
+        return self
+
+
 class MetricsConfig(Strict):
     enabled: bool = True
     address: str = "127.0.0.1"  # Prometheus scrapes it on the same machine; never open it outside
@@ -852,6 +978,7 @@ class Config(Strict):
     secops: SecOpsConfig = SecOpsConfig()
     cleanup: CleanupConfig = CleanupConfig()
     console: ConsoleConfig = ConsoleConfig()
+    assistant: AssistantConfig = AssistantConfig()
     metrics: MetricsConfig = MetricsConfig()
     paths: Paths = Paths()
 
@@ -873,6 +1000,17 @@ class Config(Strict):
             raise ValueError(f"security.reviewers must not contain the bot itself ({self.tracker.bot_user})")
         if len(set(s.reviewers)) != len(s.reviewers):
             raise ValueError("security.reviewers has duplicates")
+        return self
+
+    @model_validator(mode="after")
+    def _assistant(self) -> Config:
+        a = self.assistant
+        if a.enabled and a.youtrack and self.tracker.type != "youtrack":
+            raise ValueError(f"assistant.youtrack: the assistant makes tickets in YouTrack only; this tracker is "
+                             f"{self.tracker.type}")
+        if a.secrets == self.paths.secrets:
+            raise ValueError("assistant.secrets must be a file of its own, not the runner's secrets.env: the runner "
+                             "and its agents must never get the assistant's keys")
         return self
 
     @model_validator(mode="after")
