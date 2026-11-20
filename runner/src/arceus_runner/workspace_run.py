@@ -61,6 +61,7 @@ SLOT_GRACE = timedelta(hours=1)   # a scheduled time is queued within this long 
 # the root.
 CONSOLE_PATHS = {"qa": "/qa/", "arch": "/architecture/", "secops": "/secops/"}
 MAX_INSTRUCTIONS = 64 * 1024  # without comments; the brief is one argv string, and Linux caps one at 128 KB
+INSTRUCTIONS = "instructions.md"  # in a run's folder under the kind's reports: the instructions it started with
 
 
 def encodable(value):
@@ -527,7 +528,7 @@ class WorkspaceRun:
             return
         folder = self.run_dir(run)
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "instructions.md").write_text(text, encoding="utf-8")
+        (folder / INSTRUCTIONS).write_text(text, encoding="utf-8")
         # The run's clock starts here and its times are fixed now: the brief names them, the runner stops the run by
         # them and the console shows them, whatever config.yaml says later.
         now = self.d.now().astimezone(timezone.utc)

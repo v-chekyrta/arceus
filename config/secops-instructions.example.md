@@ -1,8 +1,10 @@
 <!--
 The team's notes on its stack for advisory triage (secops: in config.yaml). Everything outside these comments
-goes, as it is, to the agent at the end of every triage run, after the runner's own rules for the verdicts. Comments
-like this one are left out, so this file as it comes is empty, and that is fine: a triage run then works from the
-code alone.
+goes, as it is, to the agent at the end of every triage run, after the runner's own rules for the verdicts, and to
+the closing review that checks the agent's report, which reads it as the team's own rules for judging its stack
+(from a copy beside the advisories; if that copy is changed during the run, none of its verdicts are sent).
+Comments like this one are left out, so this file as it comes is empty, and that is fine: a triage run then works
+from the code alone.
 `arceus-runner check` shows which of the two a run will get.
 
 Write here what the repositories do not show and a verdict depends on:
@@ -11,7 +13,9 @@ Write here what the repositories do not show and a verdict depends on:
 - Which repositories are legacy, archived in practice, or only examples, so a verdict on them is read that way.
 - Versions decided outside the code: "production pins the base image by digest in the infra repository", "the
   database is a managed service, its version is in the cloud console, not here".
-- What counts as carrying a component: "a test-only dependency is not shipped".
+- What counts as carrying a component: "a test-only dependency is not shipped". A rule like this is what lets a
+  repository whose code has the component go without a verdict: the report names it with the rule, and the
+  closing review accepts no such rule that is not written here.
 
 Never put a secret here. Write it in the language you want the report and the evidence in; with nothing written,
 they are in bulava.report_language. At most 64 KB without the comments. A run reads this file when it starts and
