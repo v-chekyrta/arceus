@@ -591,6 +591,37 @@ def test_a_pause_the_runner_first_sees_after_a_restart_counts_from_when_the_engi
     assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")
 
 
+def test_two_pauses_the_runner_saw_as_one_across_a_restart_are_counted_apart(w):
+    """Paused 20–21 h (the runner saw it begin, then went down), paused again 27–29 h, the runner back at 28 h: 3 h of
+    pause, so at 29 h the attempt has worked 26 h and is past its ceiling."""
+    take(w)
+    start = w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for h in (5, 10, 15, 20):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w)
+        w.tick()
+    _paused(w)
+    w.tick()  # the runner sees the first pause, then goes down
+    w.restart()
+    last = w.cfg.paths.bulava_state / "instances" / "acme" / "pause-last.json"
+    w.now = start + timedelta(hours=21)
+    _paused(w, on=False)
+    last.write_text(json.dumps({"attempts": 0, "cleared_at": int(w.now.timestamp()), "verdict": "cleared-fresh"}))
+    w.now = start + timedelta(hours=27)
+    _paused(w)  # the second one, recorded at 27 h
+    w.now = start + timedelta(hours=28)
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"
+    w.now = start + timedelta(hours=29)
+    _paused(w, on=False)
+    last.write_text(json.dumps({"attempts": 0, "cleared_at": int(w.now.timestamp()), "verdict": "cleared-fresh"}))
+    _heartbeat(w)
+    w.tick()
+    assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")
+
+
 def test_hung_attempt_fails_after_the_timeout(w):
     take(w)
     w.now = datetime.now(UTC) + timedelta(hours=9)

@@ -1119,6 +1119,13 @@ class Delivery:
             since = rec if rec and rec <= now and not (floor and rec < floor) else now
             p["since"], changed = since.isoformat(), True
             self.events.emit("attempt_paused_for_limit", task_id=task.task_id, limits=limits)
+        elif waits and since and recorded_at and cleared_at:
+            # Still paused to the runner, but the engine took that pause off and recorded a new one meanwhile (the
+            # runner was down between them): two pauses, the time between them worked.
+            cleared, rec = datetime.fromtimestamp(cleared_at, UTC), datetime.fromtimestamp(recorded_at, UTC)
+            if since < cleared <= rec <= now:
+                p["total"] = float(p.get("total") or 0) + (cleared - since).total_seconds()
+                p["ended"], p["since"], since, changed = cleared.isoformat(), rec.isoformat(), rec, True
         elif not waits and since:
             cleared = datetime.fromtimestamp(cleared_at, UTC) if cleared_at else None
             end = cleared if cleared and since < cleared <= now else now
