@@ -81,11 +81,27 @@ as text; the advisories it was given are advisories.json in the same folder of t
 repositories are in the workspace at the commits its brief named. Judge the report by these points, and only these:
 
 1. The evidence supports the word: it names what was found (a file and line, a pinned version, a setting) and that
-   matches what the advisory says is affected or fixed. A verdict its evidence does not support is grounds for FAIL.
+   matches what the advisory says is affected or fixed. For affected, a version or a configuration the advisory
+   names as affected, pinned or shipped by the repository, is enough: the report need not show how the component is
+   used or what reaches it (that untrusted input gets to it, who calls the code that uses it), and a report that
+   does not show it gives no ground to ask for another word. An affected verdict whose evidence claims more of this
+   than the code shows is grounds for FAIL: the evidence is to be corrected, and the word stays. not_affected for
+   such a version needs the code to show that its configuration or use is outside what the advisory describes (or a
+   rule of the notes, point 7). That no caller is found for code that uses the component does not show it, nor does
+   a claim the code does not bear out: the word is then affected, or needs_review where point 3 calls for it. A
+   verdict its evidence does not support is grounds for FAIL.
 2. Every code reference is real: the file exists at the commit read, and the line shows what the evidence says.
 3. Where what decides the answer is not in the repository (a setting at run time, a package on a host, the version
    actually deployed), the verdict is needs_review, never a guess either way. A guess given as affected, fixed or
-   not_affected is grounds for FAIL.
+   not_affected is grounds for FAIL. So is needs_review for an affected version that the repository itself pins or
+   ships, given only because the report cannot show how the component is used, what reaches it or which build is
+   deployed: by point 1 that is affected, and an earlier needs_review given only for that becomes affected, with
+   saying so as the reason point 6 asks for. A setting the advisory names, decided at run time, is still
+   needs_review. So is a deployed version the repositories do not state: a repository that deploys the image of one
+   given affected, fixed or needs_review on the advisory, without stating which version of the component that image
+   holds, gets needs_review, and so does one through which the notes say the component ships (its hosts' own
+   packages, for example). Leaving such a repository without a verdict is an omission, unless the notes leave it
+   out (point 7).
 4. No advisory is silently dropped: every advisory of advisories.json has an entry in `checked`, and one that no
    repository carries says so there.
 5. The summary claims no more than the verdicts show, and its numbers agree with them.
@@ -109,8 +125,8 @@ repositories are in the workspace at the commits its brief named. Judge the repo
    successor (point 6). Without notes.md, this point changes nothing.
 
 Do not fail the report for its style, for a repository that has no verdict because it does not carry the component
-or because the project's stack notes leave it out as point 7 allows (when it had no earlier one), or for an advisory
-marked needs_review with what would settle it."""
+or because the project's stack notes leave it out as point 7 allows (when it had no earlier one), or for a
+needs_review that point 3 calls for, with what would settle it."""
 
 SCHEMA_EXAMPLE = """\
 {"summary": "Checked 2 open advisories against 4 repositories. The API image pins an affected OpenSSL; which one \
@@ -374,13 +390,26 @@ class SecOpsAgent(WorkspaceRun):
                   "For each advisory, find the repositories that carry its product or component: they ship it, pin "
                   "it, build it into an image or deploy it. Look at manifests and lock files, Dockerfiles and base "
                   "images, CI and deployment files, vendored code. Give each of those repositories one verdict:", "",
-                  "- `affected`: it pins or ships an affected version or configuration.",
+                  "- `affected`: it pins or ships an affected version or configuration. That is enough: you need "
+                  "not show how the component is used or what reaches it (that untrusted input gets to it, who "
+                  "calls the code that uses it). Say in the evidence what the code shows of that, also when it "
+                  "shows nothing (no caller in the repository), and claim no more.",
                   "- `fixed`: it carried the problem and now carries the fixed version or the patch.",
                   "- `not_affected`: the component is there, but its version, configuration or use is outside what "
-                  "the advisory describes.",
+                  "the advisory describes. The code has to show that, or the project's stack notes rule so: what "
+                  "you only suppose about who uses it or what reaches it is not evidence, and neither is finding "
+                  "no caller for code that uses it.",
                   "- `needs_review`: the component is there, but what decides the answer is not in the repository (a "
                   "setting at run time, a package on a host, the version actually deployed). Use this, never a "
-                  "guess, and say what would settle it.", "",
+                  "guess, and say what would settle it. It is also the word, in place of no verdict, for a "
+                  "repository that deploys the component without stating its version, unless the project's stack "
+                  "notes leave it out: one that deploys the image of a repository you give `affected`, `fixed` or "
+                  "`needs_review` on this advisory and does not state which version of the component that image "
+                  "holds, and one through which the notes say the component ships (its hosts' own packages, for "
+                  "example). Not knowing how the component is used, what reaches it or which build is deployed is "
+                  "no reason for this word where the repository itself pins or ships an affected version: that is "
+                  "`affected`, and so is one whose earlier `needs_review` was given only for that (say so in the "
+                  "evidence: it is the reason for the changed word).", "",
                   "A repository that does not carry the component, and had no earlier verdict, gets none. Nor does "
                   "one the project's stack notes leave out (they may say what counts as carrying a component) when "
                   "it had no earlier verdict; the advisory's `checked` note then says what was left out and by which "
