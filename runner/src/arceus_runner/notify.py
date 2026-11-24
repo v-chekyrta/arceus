@@ -703,7 +703,7 @@ class Notifier:
         step = f" (step: {esc(r['step'])})" if r.get("step") else ""
         self.put(f"quiet:{r['task_id']}:{r['ts']}", "agent_quiet", TRANSITION,
                  f"🤫 {self.line(r['task_id'])}: the agent has written nothing for {r.get('minutes')} min{step}. "
-                 f"It may be stuck; an attempt with no result after {timeout} is stopped.",
+                 f"It may be stuck; an attempt with no sign of activity for {timeout} is stopped.",
                  task_id=r["task_id"],
                  live_while={"state": "dispatched"} if ".review-" not in r["task_id"] and not is_run(r["task_id"]) else None)
 

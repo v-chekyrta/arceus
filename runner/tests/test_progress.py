@@ -376,3 +376,53 @@ def test_engine_state_is_written_when_it_changes_and_not_on_every_tick(w, cfg):
     d._note_engine_state(task, {"state": "waiting_review", "attempts": running["attempts"]})
     seen = [(e["state"], e["attempt_live"]) for e in w.emitted("engine_state")]
     assert seen == [("running", True), ("running", False), ("waiting_review", False)]
+
+
+def test_a_repeated_step_is_a_sign_of_life_and_is_not_written_out_again(w):
+    """Bulava repeats `gate.verify running` every minute while a long check runs (`heartbeat: true`, its note counting
+    the minutes): the attempt's newest line moves (its liveness), and events.jsonl does not get it sixty times an hour."""
+    p = w.watcher()
+    w.step("gate.verify", "running", 1_000)
+    w.step("gate.verify", "running", 61_000, note="Фінальні перевірки: 1 хв", heartbeat=True)
+    w.step("gate.verify", "running", 121_000, note="Фінальні перевірки: 2 хв", heartbeat=True)
+    p.poll()
+    assert [(s["stage"], s["state"]) for s in w.emitted("engine_step")] == [("gate.verify", "running")]
+    alive = p.liveness("ACME-1", DID)
+    assert alive.at == 121.0 and alive.step == "gate.verify (running)" and alive.round is None
+    assert p.snapshot()[0].step.since == 1.0  # the step is the one it was: "on this step since" does not move
+    w.step("gate.review", "running", 125_000, round=2, max=5)
+    p.poll()
+    assert p.liveness("ACME-1", DID).round == 2
+    w.step("gate.review", "retrying", 126_000, note="Повернуто на доопрацювання")
+    p.poll()
+    assert p.liveness("ACME-1", DID).round == 2  # a line without a round keeps the last one
+    assert [(s["stage"], s["state"]) for s in w.emitted("engine_step")] == [
+        ("gate.verify", "running"), ("gate.review", "running"), ("gate.review", "retrying")]
+
+
+def test_liveness_reads_the_attempt_now_and_never_counts_another_attempt_s(w):
+    p = w.watcher()
+    w.step("deliver", "delivered", 5_000)
+    w.transcript(tool("Read", file_path="x"), mtime=T0)
+    assert p.liveness("ACME-1", DID).at == max(5.0, T0.timestamp())  # no poll before: read on asking
+    w.step("gate.verify", "running", T0.timestamp() * 1000 + 60_000)
+    assert p.liveness("ACME-1", DID).at == T0.timestamp() + 60
+    gone = p.liveness("ACME-1", "dispatch-2")  # the record names another attempt: nothing of this one is known
+    assert (gone.at, gone.step) == (0.0, "")
+
+
+def test_a_pause_counts_only_when_the_engine_recorded_it_for_this_attempt(w):
+    p = w.watcher()
+    w.step("agent", "running", 1_000)
+    assert p.liveness("ACME-1", DID).paused is False
+    marker = w.instance / "paused-for-limit.json"
+    marker.write_text(json.dumps({"provider": "claude", "resume_after": 2, "reason": "usage limit", "recorded_at": 1,
+                                  "prior_attempts": 0, "run_id": "r", "dispatch_id": "dispatch-0"}))
+    assert p.liveness("ACME-1", DID).paused is False  # another attempt's
+    marker.write_text(json.dumps({"provider": "codex", "resume_after": 2, "reason": "reviewer unreachable",
+                                  "recorded_at": 1, "prior_attempts": 0, "run_id": "r", "dispatch_id": DID}))
+    assert p.liveness("ACME-1", DID).paused is False  # the same marker parks an unreachable reviewer: no usage window
+    for why in ("usage limit seen in the worker pane", "usage guard", "codex usage guard"):
+        marker.write_text(json.dumps({"provider": "claude", "resume_after": 2, "reason": why, "recorded_at": 1,
+                                      "prior_attempts": 0, "run_id": "r", "dispatch_id": DID}))
+        assert p.liveness("ACME-1", DID).paused is True, why

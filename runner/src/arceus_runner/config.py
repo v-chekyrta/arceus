@@ -410,7 +410,8 @@ class Limits(Strict):
     max_ci_fix_attempts: int = Field(default=3, ge=1)
     needs_input_reminder: Duration = timedelta(hours=24)
     needs_input_fail_after: Duration = timedelta(days=5)
-    attempt_timeout: Duration = timedelta(hours=8)  # an attempt with no verdict this long: "agent hung"
+    attempt_timeout: Duration = timedelta(hours=8)  # no sign of activity this long, no verdict: "agent hung"
+    attempt_ceiling: Duration = timedelta(hours=24)  # no verdict this long, however busy: "ran out of time"
     agent_quiet_after: Duration = timedelta(minutes=20)  # nothing in the transcript this long: agent_quiet
     # How long after a failure a `/continue` comment on the ticket still resumes the task.
     continue_window: Duration = timedelta(days=14)

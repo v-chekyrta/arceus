@@ -180,7 +180,8 @@ REASONS = [
     (ex.Facts(state="dispatched", turn="agent"), "working"),
     (ex.Facts(state="dispatched", turn="checks"), "checks"),
     (ex.Facts(state="dispatched", turn="paused"), "engine_wait"),
-    (ex.Facts(state="dispatched", turn="agent", used_up=["Claude's 5-hour window"]), "subscription"),
+    (ex.Facts(state="dispatched", turn="agent", used_up=["Claude's 5-hour window"], limit_paused=True),
+     "subscription"),
     (ex.Facts(state="publishing"), "publishing"),
     (ex.Facts(state="needs_input"), "person"),
     (ex.Facts(state="security_hold"), "security"),
@@ -211,14 +212,31 @@ def test_each_reason_has_its_own_words_and_only_a_person_is_asked_to_answer(fact
 
 
 def test_only_a_development_attempt_is_said_to_stop_its_clock_for_a_used_up_subscription():
-    task_ = ex.reason(ex.Facts(state="dispatched", turn="agent", used_up=["Claude's 5-hour window"]))
+    task_ = ex.reason(ex.Facts(state="dispatched", turn="agent", used_up=["Claude's 5-hour window"], limit_paused=True))
     assert task_["code"] == "subscription" and "clock stands still" in task_["detail"]
+    # A used-up limit alone pauses nothing: the attempt's clock stops only on the engine's record that it waits, as
+    # the runner's timer does. A final check that goes on running is checks running, and its time counts.
+    checks = ex.reason(ex.Facts(state="dispatched", turn="checks", used_up=["Claude's 5-hour window"]))
+    assert checks["code"] == "checks" and checks["title"] == "Checks running"
+    assert ex.reason(ex.Facts(state="dispatched", turn="agent", used_up=["Claude's 5-hour window"]))["code"] \
+        == "working"
     # A run or a code review keeps its wall-clock limit, and a used-up window alone does not say its step waits.
     for state in ("run:running", "review:running"):
         assert ex.reason(ex.Facts(state=state, turn="agent", used_up=["Claude's 5-hour window"]))["code"] == "working"
         paused = ex.reason(ex.Facts(state=state, turn="paused", used_up=["Claude's 5-hour window"]))
         assert paused["code"] == "subscription" and "clock stands still" not in paused["detail"]
         assert "time limit keeps running" in paused["detail"]
+
+
+def test_a_pause_is_shown_only_for_the_attempt_now_running():
+    from types import SimpleNamespace as Task
+    pause = json.dumps({"dispatch": "d-1", "since": "2026-11-24T10:00:00+00:00", "total": 0})
+    assert ex.limit_paused(Task(attempt_pause=pause, attempt_started="2026-11-24T09:00:00+00:00"))
+    # The next attempt started after that pause began: it was the earlier attempt's, and this one runs its checks.
+    later = Task(attempt_pause=pause, attempt_started="2026-11-24T12:00:00+00:00")
+    assert not ex.limit_paused(later)
+    assert ex.reason(ex.Facts(state="dispatched", turn="checks", used_up=["Claude's 5-hour window"],
+                              limit_paused=ex.limit_paused(later)))["title"] == "Checks running"
 
 
 def test_no_two_reasons_say_the_same():
@@ -230,7 +248,8 @@ def test_no_two_reasons_say_the_same():
 
 
 def test_a_used_up_subscription_is_the_whole_factorys_not_this_tasks_spend(w):
-    task(w.store, "ACME-12", "dispatched", "Fix the refund retry")
+    task(w.store, "ACME-12", "dispatched", "Fix the refund retry",
+         attempt_pause=json.dumps({"dispatch": "d-1", "since": "2026-11-24T10:00:00+00:00", "total": 0}))
     now = time.time()
     w.metrics_text = metrics(usage={("claude", "5h"): 100.0, ("claude", "7d"): 64.0},
                              resets={("claude", "5h"): now + 3600}, steps={"ACME-12": ("agent", "running", now - 60)},
@@ -239,6 +258,17 @@ def test_a_used_up_subscription_is_the_whole_factorys_not_this_tasks_spend(w):
     assert 'data-reason="subscription"' in html
     assert "shared by all the factory's work, not spent by this one alone" in text_of(html)
     assert "Claude's 5-hour window" in text_of(html) and "64" not in text_of(html.split('class="split task-split"')[0])
+    # The same limit used up while the attempt is not recorded as waiting for it: its final check runs, and counts.
+    w.store.update_task("ACME-12", attempt_pause=json.dumps({"dispatch": "d-1", "since": None, "total": 600}))
+    w.metrics_text = metrics(usage={("claude", "5h"): 100.0}, resets={("claude", "5h"): now + 3600},
+                             steps={"ACME-12": ("gate.verify", "running", now - 60)}, observed={"ACME-12": now - 5})
+    assert 'data-reason="checks"' in page(w, "/tasks/ACME-12/")
+    # An attempt the engine holds for background agents, a limit used up and no pause of this attempt: the engine
+    # waits, not for a subscription, and the clock runs.
+    w.metrics_text = metrics(usage={("claude", "5h"): 100.0}, resets={("claude", "5h"): now + 3600},
+                             steps={"ACME-12": ("agent", "waiting", now - 60)}, observed={"ACME-12": now - 5})
+    html = page(w, "/tasks/ACME-12/")
+    assert 'data-reason="engine_wait"' in html and "subscription limit is used up" not in html
     # Usage that is high but not used up does not make a task wait.
     w.metrics_text = metrics(usage={("claude", "5h"): 97.0}, steps={"ACME-12": ("agent", "running", now - 60)},
                              observed={"ACME-12": now - 5})

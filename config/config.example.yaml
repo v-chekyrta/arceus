@@ -110,7 +110,8 @@ limits:
   max_ci_fix_attempts: 3
   needs_input_reminder: 24h
   needs_input_fail_after: 5d           # not for the agent's conclusion that nothing needs changing: no deadline
-  attempt_timeout: 8h                  # no verdict this long: fails as "agent hung"
+  attempt_timeout: 8h                  # no sign of activity (engine step, heartbeat, agent) this long: "agent hung"
+  attempt_ceiling: 24h                 # no verdict this long, however busy: fails as "ran out of time"
   agent_quiet_after: 20m               # agent silent this long: agent_quiet
   continue_window: 14d                 # `/continue` resumes a failed task within this
 

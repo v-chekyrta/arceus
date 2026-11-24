@@ -191,6 +191,7 @@ def gather(cfg: Config, key: str, config_path, now: float | None = None) -> dict
             no_change=bool(q and q["no_change"]),
             turn=(view or review_view or {}).get("turn", ""),
             used_up=used_up if (running or (review_view and under_way.state == "running")) else [],
+            limit_paused=running and ex.limit_paused(task),
             holder="" if holder == key else holder, can_take=m.can_take, mode=mode, drain_by=drain,
             review=(under_way.n, under_way.state) if under_way and state == "code_review" else None,
             fixes_waiting=taken and state == "code_review" and ex.fixes_waiting(store, key),

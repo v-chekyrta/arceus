@@ -419,7 +419,7 @@ def test_question_goes_to_the_ticket_and_the_answer_back(w):
     w.tick()
     [send] = w.calls("worker-send")
     assert "--answers" in send["argv"] and send["argv"][send["argv"].index("--answers") + 1] == "q-1"
-    assert send["argv"][-1] == "2" and "a.smith" in send["argv"]
+    assert send["argv"][-1] == "2. SQLite" and "a.smith" in send["argv"]   # the option in words, not a bare number
     assert w.store.task("ACME-1").state == "dispatched"
     assert "agent-needs-input" not in w.yt.issue_tags["2-1"]
 
@@ -462,12 +462,290 @@ def test_a_reboot_is_sent_on_once_and_the_time_it_was_down_is_not_counted(w):
         == ["resume-ACME-1-1", "resume-ACME-1-2"]
 
 
+def test_an_attempt_that_works_on_while_a_limit_is_out_is_not_paused_and_stops_at_the_ceiling(w):
+    """A used-up subscription pauses only an attempt that waits for it. A final check that goes on beating meanwhile
+    is working: its time counts toward the ceiling."""
+    take(w)
+    w.cfg.paths.bulava_state.mkdir(parents=True, exist_ok=True)
+    (w.cfg.paths.bulava_state / "usage.json").write_text(json.dumps({"five_hour": {"used_percentage": 100}}))
+    start = w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for h in range(1, 24):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w, heartbeat=True, note=f"Фінальні перевірки: {h * 60} хв")
+        w.tick()
+        assert w.store.task("ACME-1").state == "dispatched", f"stopped at {h} h"
+    w.now = start + timedelta(hours=25)
+    _heartbeat(w, heartbeat=True, note="Фінальні перевірки: 1500 хв")
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed"
+    assert task.reason == ("the attempt ran out of time: no verdict in 24 h, still working "
+                           "(last step: gate.verify (running))")
+
+
+@pytest.mark.parametrize("step", [{"stage": "agent", "state": "waiting", "note": "Чекає на фонових агентів"}, None])
+def test_a_used_up_limit_without_the_engine_s_pause_of_this_attempt_pauses_nothing(w, step):
+    """Only Bulava's pause record for this very attempt stops its clock. A `waiting` step of another kind (background
+    agents), or no step at all, with a limit used up is no pause: the ceiling counts, and silence too."""
+    take(w)
+    w.cfg.paths.bulava_state.mkdir(parents=True, exist_ok=True)
+    (w.cfg.paths.bulava_state / "usage.json").write_text(json.dumps({"five_hour": {"used_percentage": 100}}))
+    start = w.now = datetime.now(UTC)
+    if step:
+        _heartbeat(w, **step)
+    else:
+        _heartbeat(w, did="d-0")  # the folder and record exist; no line of this attempt
+    _paused(w, did="d-0")  # a pause record another attempt left
+    w.tick()
+    if step:
+        for h in range(1, 24):
+            w.now = start + timedelta(hours=h)
+            _heartbeat(w, **step)
+            w.tick()
+            assert w.store.task("ACME-1").state == "dispatched", f"stopped at {h} h"
+        w.now = start + timedelta(hours=25)
+        _heartbeat(w, **step)
+        w.tick()
+        assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")
+    else:
+        w.now = start + timedelta(hours=8, minutes=1)
+        w.tick()
+        assert w.store.task("ACME-1").reason == "the agent hung: no sign of activity for 8 h"
+
+
+def test_a_reviewer_that_cannot_be_reached_is_no_pause_and_the_ceiling_counts(w):
+    """Bulava parks a run whose Codex cannot be reached with the same marker, "reviewer unreachable": no usage window,
+    so the clock goes on; a watchdog's quota pause in the same place stops it."""
+    take(w)
+    start = w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for h in range(1, 24):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w, heartbeat=True, note=f"Фінальні перевірки: {h * 60} хв")
+        _paused(w, reason="reviewer unreachable")
+        w.tick()
+    w.now = start + timedelta(hours=25)
+    _heartbeat(w, heartbeat=True, note="Фінальні перевірки: 1500 хв")
+    w.tick()
+    assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")
+
+
+def test_a_pause_the_engine_ended_while_the_runner_was_down_counts_only_until_it_ended(w):
+    """Paused from 20 h to 21 h, the runner down from 20 h to 30 h: the engine's own record of when it took the pause
+    off (pause-last.json) bounds it, so the attempt has worked 29 h, past its ceiling."""
+    take(w)
+    start = w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for h in (5, 10, 15, 20):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w)
+        w.tick()
+    _paused(w)
+    w.tick()
+    assert json.loads(w.store.task("ACME-1").attempt_pause)["since"]
+    w.restart()
+    w.now = start + timedelta(hours=21)
+    _paused(w, on=False)  # the watchdog takes it off and says when
+    (w.cfg.paths.bulava_state / "instances" / "acme" / "pause-last.json").write_text(json.dumps(
+        {"attempts": 0, "cleared_at": int(w.now.timestamp()), "verdict": "cleared-fresh"}))
+    for h in (23, 27, 30):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w)
+    w.tick()
+    assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")
+
+
+def test_a_pause_the_runner_first_sees_after_a_restart_counts_from_when_the_engine_recorded_it(w):
+    """Work to 20 h, the engine pauses at 20 h while the runner is down, the runner is back at 28 h, the engine goes on
+    at 30 h: 10 h of pause, so at 33 h the attempt has worked 23 h, and at 35 h it is past its ceiling."""
+    take(w)
+    start = w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for h in (5, 10, 15, 20):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w)
+        w.tick()
+    _paused(w)  # recorded at 20 h; the runner does not look again before it goes down
+    w.restart()
+    w.now = start + timedelta(hours=28)
+    w.tick()
+    since = datetime.fromisoformat(json.loads(w.store.task("ACME-1").attempt_pause)["since"])
+    assert since == (start + timedelta(hours=20)).replace(microsecond=0)  # the marker's recorded_at, whole seconds
+    w.now = start + timedelta(hours=30)
+    _paused(w, on=False)
+    (w.cfg.paths.bulava_state / "instances" / "acme" / "pause-last.json").write_text(json.dumps(
+        {"attempts": 0, "cleared_at": int(w.now.timestamp()), "verdict": "cleared-fresh"}))
+    for h in (31, 33):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w)
+        w.tick()
+        assert w.store.task("ACME-1").state == "dispatched", f"stopped at {h} h"
+    w.now = start + timedelta(hours=35)
+    _heartbeat(w)
+    w.tick()
+    assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")
+
+
 def test_hung_attempt_fails_after_the_timeout(w):
     take(w)
     w.now = datetime.now(UTC) + timedelta(hours=9)
     w.tick()
     task = w.store.task("ACME-1")
     assert task.state == "failed" and task.reason.startswith("the agent hung")
+
+
+def _heartbeat(w: World, did: str = "d-1", stage: str = "gate.verify", state: str = "running", **extra) -> None:
+    """The engine's record of the attempt the runner watches, and one line of its journal at w.now: a step, or the
+    gate repeating it while a long check runs."""
+    inst = w.cfg.paths.bulava_state / "instances" / "acme"
+    inst.mkdir(parents=True, exist_ok=True)
+    rec = w.cfg.paths.bulava_state / "tasks" / task_key("ACME-1")
+    rec.mkdir(parents=True, exist_ok=True)
+    (rec / "task.json").write_text(json.dumps({"task_id": "ACME-1", "state": "running", "attempts": [
+        {"n": 1, "dispatch_id": "d-1", "instance": str(inst)}]}))
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["attempts"][-1].update(dispatch_id="d-1"))
+    with (inst / "run-events.jsonl").open("a") as f:
+        f.write(json.dumps({"dispatch_id": did, "stage": stage, "state": state,
+                            "ms": int(w.now.timestamp() * 1000), **extra}) + "\n")
+
+
+def _paused(w: World, did: str = "d-1", on: bool = True, reason: str = "usage limit seen in the worker pane") -> None:
+    """Bulava's own record that an attempt waits for a usage window (supervisor-lib.sh pause_record, as its watchdog
+    and review gate write it, Bulava 1.20.9); removed when the attempt goes on."""
+    f = w.cfg.paths.bulava_state / "instances" / "acme" / "paused-for-limit.json"
+    if not on:
+        f.unlink(missing_ok=True)
+        return
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"provider": "claude", "resume_after": int(w.now.timestamp()) + 3600,
+                             "reason": reason, "recorded_at": int(w.now.timestamp()), "prior_attempts": 0,
+                             "run_id": "r-1", "dispatch_id": did, "session_id": "sess-1"}))
+
+
+def test_an_attempt_at_work_is_timed_from_its_newest_sign_of_life_and_stopped_at_the_ceiling(w):
+    """An attempt in a long back-and-forth with its review was failed as hung after 8 h while it was working.
+    Silence counts from the attempt's newest engine line (the gate repeats it every minute during a long check);
+    `attempt_ceiling` still bounds the attempt however busy it is."""
+    take(w)
+    w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for _ in range(4):  # 20 h in all, a sign of life every 5 h
+        w.now += timedelta(hours=5)
+        _heartbeat(w)
+        w.tick()
+        assert w.store.task("ACME-1").state == "dispatched"
+    w.now += timedelta(hours=4, minutes=30)  # 24.5 h since the start
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed"
+    assert task.reason == ("the attempt ran out of time: no verdict in 24 h, still working "
+                           "(last step: gate.verify (running))")
+    assert [c["argv"][0] for c in w.calls("night-shift")][-1] == "stop"
+
+
+def _ledger(w: World, **items) -> None:
+    """The task's review list as Bulava keeps it: id → open."""
+    (w.cfg.paths.bulava_state / f"review-ledger-{task_key('ACME-1')}").write_text(json.dumps(
+        {"items": [{"id": i, "text": "…", "open": o} for i, o in items.items()], "stall": 0, "churn": 0}))
+
+
+def test_a_long_check_that_keeps_saying_it_runs_is_work_until_its_heartbeat_stops(w):
+    """From PR #22: a final check that runs for hours repeats one step with a heartbeat. While it beats the attempt is
+    not hung, though the step never changes; when the beat stops, silence counts from the last beat."""
+    take(w)
+    start = w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for h in range(1, 12):
+        w.now = start + timedelta(hours=h)
+        _heartbeat(w, heartbeat=True, note=f"Фінальні перевірки: {h * 60} хв")
+        w.tick()
+        assert w.store.task("ACME-1").state == "dispatched", f"failed at {h} h while the check was beating"
+    w.now = start + timedelta(hours=18)  # the beat stopped at 11 h: 7 h of silence
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"
+    w.now = start + timedelta(hours=19, minutes=30)
+    w.tick()
+    assert w.store.task("ACME-1").reason == "the agent hung: no sign of activity for 8 h (last step: gate.verify (running))"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_silence_is_counted_from_the_last_sign_of_life_and_names_where_the_attempt_was(w, restart):
+    take(w)
+    w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    w.now += timedelta(hours=3)
+    _heartbeat(w, stage="gate.review", state="retrying", round=3, max=5)
+    _ledger(w, T1=False, T2=True, N1=True)
+    w.tick()
+    if restart:  # a new process reads the round again from the journal
+        w.restart()
+        w.tick()
+    w.now += timedelta(hours=8, minutes=1)
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed"
+    assert task.reason == ("the agent hung: no sign of activity for 8 h (last step: gate.review (retrying); "
+                           "review round 3; open review items: T2, N1)")
+
+
+def test_a_restarted_runner_reads_the_attempt_before_it_counts_its_silence(w):
+    take(w)
+    w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    w.restart()
+    w.now += timedelta(hours=9)
+    _heartbeat(w)  # it went on working while the runner was down
+    w.tick()  # the new process reads the attempt's files before it decides
+    assert w.store.task("ACME-1").state == "dispatched"
+
+
+def test_a_sign_of_life_between_two_looks_is_read_before_the_attempt_is_stopped(w):
+    take(w)
+    w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    w.now += timedelta(hours=7)
+    _heartbeat(w)  # written after the last look
+    w.now += timedelta(hours=1, minutes=1)  # 8 h 1 min since the look before it
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"
+
+
+def test_the_ceiling_on_the_first_pass_after_a_restart_still_says_where_the_attempt_was(w):
+    take(w)
+    w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    w.now += timedelta(hours=20)
+    _heartbeat(w, stage="gate.review", state="retrying", round=4, max=5)
+    _ledger(w, T2=True)
+    w.tick()
+    w.restart()
+    w.now += timedelta(hours=4, minutes=30)
+    w.tick()
+    assert w.store.task("ACME-1").reason == (
+        "the attempt ran out of time: no verdict in 24 h, still working "
+        "(last step: gate.review (retrying); review round 4; open review items: T2)")
+
+
+def test_an_earlier_attempt_s_journal_does_not_keep_this_one_alive(w):
+    take(w)
+    w.now = datetime.now(UTC)
+    _heartbeat(w, did="d-0")  # another dispatch's line in the same folder
+    w.tick()
+    w.now += timedelta(hours=8, minutes=1)
+    _heartbeat(w, did="d-0")
+    w.tick()
+    assert w.store.task("ACME-1").reason == "the agent hung: no sign of activity for 8 h"
     assert [c["argv"][0] for c in w.calls("night-shift")][-1] == "stop"
 
 
@@ -1090,20 +1368,63 @@ def test_unanswered_question_gets_a_reminder_then_fails(w):
 
 
 def test_a_usage_limit_pause_is_not_a_hang(w):
+    """Bulava's watchdog records the pause (paused-for-limit.json) and writes no step: the last one stays `running`."""
     take(w)
     w.cfg.paths.bulava_state.mkdir(parents=True, exist_ok=True)
     usage = w.cfg.paths.bulava_state / "usage.json"
     usage.write_text(json.dumps({"seven_day": {"used_percentage": 100}}))
-    w.now = datetime.now(UTC) + timedelta(hours=30)
+    w.now = datetime.now(UTC) + timedelta(minutes=10)
+    _heartbeat(w, stage="agent", state="running")
+    _paused(w)
     w.tick()
     assert w.store.task("ACME-1").state == "dispatched" and w.events_named("attempt_paused_for_limit")
+    w.now += timedelta(hours=30)
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"
     usage.write_text(json.dumps({"seven_day": {"used_percentage": 3}}))
+    _paused(w, on=False)
     w.now += timedelta(hours=1)
     w.tick()
     assert w.store.task("ACME-1").state == "dispatched"  # the clock restarted when the limit was out
     w.now += timedelta(hours=9)
     w.tick()
     assert w.store.task("ACME-1").reason.startswith("the agent hung")
+
+
+def test_a_usage_limit_pause_neither_counts_toward_the_ceiling_nor_restarts_it(w):
+    """`attempt_ceiling` counts the time an attempt could work: 20 h of work, a 30 h pause, then 5 h more is 25 h."""
+    take(w)
+    w.cfg.paths.bulava_state.mkdir(parents=True, exist_ok=True)
+    usage = w.cfg.paths.bulava_state / "usage.json"
+    w.now = datetime.now(UTC)
+    _heartbeat(w)
+    w.tick()
+    for _ in range(4):
+        w.now += timedelta(hours=5)
+        _heartbeat(w)
+        w.tick()
+    usage.write_text(json.dumps({"seven_day": {"used_percentage": 100}}))
+    _heartbeat(w, stage="agent", state="waiting", note="Вікно Claude вичерпано — продовжить, коли повернеться")
+    _paused(w)
+    w.tick()
+    w.now += timedelta(hours=30)
+    w.tick()
+    w.restart()  # the pause so far is kept with the task
+    w.tick()
+    usage.write_text(json.dumps({"seven_day": {"used_percentage": 3}}))
+    _paused(w, on=False)
+    w.now += timedelta(minutes=1)
+    _heartbeat(w)
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"  # 20 h of work: the pause did not count
+    w.now += timedelta(hours=3)
+    _heartbeat(w)
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"  # 23 h of work
+    w.now += timedelta(hours=2)
+    _heartbeat(w)
+    w.tick()
+    assert w.store.task("ACME-1").reason.startswith("the attempt ran out of time: no verdict in 24 h")  # nor restarted it
 
 
 def test_tag_from_outside_the_allowlist_is_answered_once_on_the_ticket(w):
@@ -1646,6 +1967,10 @@ T2: [acceptance_failure] Codex: the test does not check the status code
      ["The review's findings still open:", "- health.txt: no version in the answer"], ["README", "T2:"]),
     ("declared 'succeeded_no_change' 3 times while the diff against base is non-empty", "", GATE_STOPPED, [],
      ["declared"]),
+    ("STATE: COMPLETE\nVERDICT: PASS\n\n[FINAL CHECKS] Registered with add-check --final and not passed in this run; "
+     "nothing is accepted without them.", STALLED,
+     "the review accepted the work, but its final checks did not pass or left no readable result, so nothing was "
+     "published", [], ["[FINAL CHECKS]", "add-check", "VERDICT"]),
 ])
 def test_each_stop_of_the_review_gate_says_what_it_was(w, review_why, note, reason, shown, hidden):
     """`needs-user` is many different stops of Bulava's gate; the ticket names the one the receipt names, with only
@@ -1661,6 +1986,75 @@ def test_each_stop_of_the_review_gate_says_what_it_was(w, review_why, note, reas
     assert all(x in text for x in shown), text
     assert not any(x in text for x in hidden), text
     assert "agent-failed" in w.yt.issue_tags["2-1"] and w.gl.mrs == []
+
+
+@pytest.mark.parametrize("ledger,churned", [
+    ({"stall": 2, "churn": 2}, True),
+    ({"stall": 2, "churn": 1}, False),   # one round without progress brought nothing new: the same problems
+    ({"stall": 2, "churn": 0}, False),
+])
+def test_a_review_parked_because_every_fix_brought_a_new_blocker_says_so(w, ledger, churned):
+    """Bulava 1.20.5 parks a review whose open count does not fall because each fix opens a new blocker. Its gate note
+    reads like any stall (blocked.md "(stalled: …)"); the task's review list says which, and the ticket says it too."""
+    _review_stopped(w, STALLED)
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(review_why=STALLED_WHY))
+    (w.cfg.paths.bulava_state / f"review-ledger-{task_key('ACME-1')}").write_text(json.dumps({"items": [], **ledger}))
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed"
+    assert task.reason == ("the review stopped because every fix brought a new blocking problem, so a person has to "
+                           "decide how to go on" if churned else
+                           "the review kept finding the same problems, with no progress between rounds")
+    text = "\n".join(w.bot_comments())
+    assert "- health.txt: no version in the answer" in text and "[repeat]" not in text and "README" not in text
+
+
+def test_a_churn_count_left_in_the_review_list_does_not_rename_another_stop(w):
+    _review_stopped(w, "")
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(
+        review_why="declared 'succeeded_no_change' 3 times while the diff against base is non-empty"))
+    (w.cfg.paths.bulava_state / f"review-ledger-{task_key('ACME-1')}").write_text(
+        json.dumps({"items": [], "stall": 2, "churn": 2}))
+    w.tick()
+    assert w.store.task("ACME-1").reason == GATE_STOPPED
+
+
+def test_a_review_that_disputes_the_task_s_own_decision_asks_its_author(w):
+    """[spec_conflict]: Bulava parks the run as needs_input with its own question, quoting the reviewer's line, which
+    goes through the same redaction as any review text."""
+    take(w)
+    question = {"id": "spec-1a2b3c", "options": ["Keep the task as written", "Change it as the review suggests"],
+                "text": "The review disputes a decision the task states explicitly. The agent has not changed it. "
+                        "Which way should it go?\nQUOTE: \"compute_sudo=True\" — the token " + GL_TOKEN
+                        + " leaks the iteration name"}
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
+        state="needs_input", state_reason="spec_conflict", attempt_live=False, question=question))
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert (task.state, task.question_id) == ("needs_input", "spec-1a2b3c")
+    [q] = [t for t in w.bot_comments() if "[arceus:question:spec-1a2b3c:1]" in t]
+    assert "QUOTE: \"compute_sudo=True\"" in q and GL_TOKEN not in q
+    assert "1. Keep the task as written" in q and "2. Change it as the review suggests" in q
+    assert "agent-needs-input" in w.yt.issue_tags["2-1"] and "agent-failed" not in w.yt.issue_tags["2-1"]
+    w.yt.comment("2-1", "a.smith", "1")
+    w.tick()
+    [send] = w.calls("worker-send")
+    assert send["argv"][send["argv"].index("--answers") + 1] == "spec-1a2b3c"
+    assert send["argv"][-1] == "1. Keep the task as written"
+
+    # The next attempt disputes the same words: Bulava gives the question the same id. It is asked again, once, in a
+    # comment of its own, and the answer to the first one does not answer it.
+    w.set_engine(lambda s: s["tasks"]["ACME-1"].update(state="needs_input", attempt_live=False,
+                                                       state_reason="spec_conflict", question=question))
+    w.tick()
+    w.tick()
+    assert len([t for t in w.bot_comments() if "[arceus:question:spec-1a2b3c:" in t]) == 2
+    assert w.store.task("ACME-1").state == "needs_input" and len(w.calls("worker-send")) == 1
+    w.yt.comment("2-1", "a.smith", "2")
+    w.tick()
+    sends = w.calls("worker-send")
+    assert len(sends) == 2 and sends[-1]["argv"][-1] == "2. Change it as the review suggests"
+    assert sends[-1]["argv"][sends[-1]["argv"].index("--answers") + 1] == "spec-1a2b3c"
 
 
 def test_a_blocker_the_agent_filed_is_a_question_not_a_failure(w):
@@ -1895,7 +2289,7 @@ def test_a_long_question_goes_as_parts_in_order_and_is_answered_as_one(w):
     w.yt.comment("2-1", "a.smith", "1")
     w.tick()
     [send] = w.calls("worker-send")
-    assert send["argv"][send["argv"].index("--answers") + 1] == "q-2" and send["argv"][-1] == "1"
+    assert send["argv"][send["argv"].index("--answers") + 1] == "q-2" and send["argv"][-1] == "1. Keep"
 
 
 def test_long_failure_details_survive_an_outage_whole_in_order_and_keep_the_numbering(w):

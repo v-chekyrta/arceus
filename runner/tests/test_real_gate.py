@@ -25,8 +25,8 @@ from .test_real_engine import ENGINE, _world, no_real_tools, pytestmark, wait_st
 
 # Stands in for the Codex CLI wherever the engine calls it: the review gate (a team of reviewers, then a fix check
 # by one) and the question hook. It answers what the test last set. In a fix check a PASS answers every open id as
-# FIXED and a FAIL leaves them open (or closes them too, `close`: the old findings fixed, new ones found), as the gate
-# asks; the ids come from the prompt itself.
+# FIXED and a FAIL leaves them open (or closes them too, `close`: the old findings fixed, new ones found; or only the
+# first, `close="first"`), as the gate asks; the ids come from the prompt itself.
 CODEX = r'''#!/bin/bash
 if [ "${1:-}" = login ]; then echo "Logged in using ChatGPT"; exit 0; fi
 if [ "${@: -1}" = - ]; then _p="$(cat)"; else _p="${@: -1}"; fi
@@ -36,7 +36,9 @@ echo x >> "$FAKE_CODEX_DIR/calls"
 if printf '%s' "$_p" | grep -q '^FIX CHECK'; then
   echo "STATE: $STATE"; echo "VERDICT: $VERDICT"; echo "DUPLICATES: NONE"
   printf '%s\n' "$_p" | awk '/^OPEN ITEMS/{f=1; next} f && /^[[:space:]]*$/{exit} f' | grep -oE '^[A-Z][0-9]+' \
-    | while read -r id; do [ "$VERDICT" = PASS ] || [ "$CLOSE" = 1 ] && echo "$id: FIXED" || echo "$id: OPEN — not fixed"; done
+    | { n=0; while read -r id; do n=$((n + 1))
+        if [ "$VERDICT" = PASS ] || [ "$CLOSE" = 1 ] || { [ "$CLOSE" = first ] && [ "$n" = 1 ]; }; then echo "$id: FIXED"
+        else echo "$id: OPEN — not fixed"; fi; done; }
 else
   echo "STATE: $STATE"; echo "VERDICT: $VERDICT"
 fi
@@ -70,12 +72,12 @@ class Agent:
         return Path(out.stdout.strip())
 
     def codex(self, verdict: str, body: str = "", state: str = "COMPLETE", rc: int = 0, raw: str | None = None,
-              close: bool = False) -> None:
+              close: bool | str = False) -> None:
         """What Codex answers from now on: a review's header and body, or `raw` as it is (the question hook)."""
         if raw is not None:
             (self.dir / "answer").write_text(f"cat <<'EOF'\n{raw}\nEOF\nexit {rc}\n")
             return
-        (self.dir / "answer").write_text(f"STATE={state}\nVERDICT={verdict!r}\nRC={rc}\nCLOSE={int(close)}\n"
+        (self.dir / "answer").write_text(f"STATE={state}\nVERDICT={verdict!r}\nRC={rc}\nCLOSE={close if isinstance(close, str) else int(close)}\n"
                                          f"BODY={json.dumps(body)}\n")
 
     def env(self, task_id: str = "ACME-1") -> dict:
@@ -92,8 +94,9 @@ class Agent:
                            env=self.env(task_id), capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
 
-    def add_check(self, what: str, *argv: str, task_id: str = "ACME-1") -> None:
-        r = subprocess.run([str(self.idir(task_id) / "add-check"), what, "--", *argv], cwd=self._cwd(task_id),
+    def add_check(self, what: str, *argv: str, task_id: str = "ACME-1", final: bool = False) -> None:
+        r = subprocess.run([str(self.idir(task_id) / "add-check"), *(["--final"] if final else []), what, "--", *argv],
+                           cwd=self._cwd(task_id),
                            env=self.env(task_id), capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
 
@@ -297,7 +300,7 @@ def test_findings_that_keep_coming_back_end_the_task_with_them_on_the_ticket(wa)
     w.agent_commits("health.txt")
     for i in range(10):
         a.declare("succeeded_changes", f"Attempt {i} at the version")
-        a.codex("FAIL", FINDING + (" [repeat]" if i else ""))
+        a.codex("FAIL", FINDING if i == 0 else "")              # later rounds: "T1: OPEN", nothing new
         if a.stop() is None:
             break
         w.agent_commits(f"try-{i}.txt")
@@ -315,9 +318,10 @@ def test_findings_that_keep_coming_back_end_the_task_with_them_on_the_ticket(wa)
 def test_the_hard_round_limit_with_findings_still_open_ends_the_task_with_them(wa):
     w, a = wa
     w.agent_commits("health.txt")
-    for i in range(6):                                        # every round fixes the last findings and finds a new one
+    first = "\n".join(f"{n}. [acceptance_failure] health.txt: defect number {n} in the version check" for n in range(1, 6))
+    for i in range(6):                                        # every round closes one finding of five: progress, not done
         a.declare("succeeded_changes", f"Round {i}")
-        a.codex("FAIL", f"1. [acceptance_failure] health.txt: defect number {i} in the version check", close=True)
+        a.codex("FAIL", first if i == 0 else "", close="first")
         if a.stop() is None:
             break
         w.agent_commits(f"round-{i}.txt")
@@ -328,7 +332,128 @@ def test_the_hard_round_limit_with_findings_still_open_ends_the_task_with_them(w
     assert task.state == "failed" and "agent-failed" in tags(w) and "agent-needs-input" not in tags(w)
     assert questions(w) == []
     assert task.reason == "the review still found problems when its rounds ran out"
+    assert "defect number 5 in the version check" in "\n".join(w.bot_comments())   # the last of them still open
+    nothing_published(w)
+
+
+def test_a_fix_that_keeps_bringing_new_blockers_stops_for_a_person_and_says_so(wa):
+    """Bulava 1.20.5: the open count, not a closed id, is progress. Each round here closes the last finding and finds a
+    new one, so the count never falls, and the gate parks the run long before its round ceiling."""
+    w, a = wa
+    w.agent_commits("health.txt")
+    for i in range(10):
+        a.declare("succeeded_changes", f"Round {i}")
+        a.codex("FAIL", f"1. [acceptance_failure] health.txt: defect number {i} in the version check "
+                        "REACH: ordinary", close=True)
+        if a.stop() is None:
+            break
+        w.agent_commits(f"round-{i}.txt")
+    else:
+        raise AssertionError("the gate never stopped a fix that kept bringing new blockers")
+    assert i < 6
+    settled(w, a, "failed")
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "agent-failed" in tags(w) and questions(w) == []
+    assert task.reason == ("the review stopped because every fix brought a new blocking problem, so a person has to "
+                           "decide how to go on")
     assert f"defect number {i} in the version check" in "\n".join(w.bot_comments())
+    nothing_published(w)
+
+
+def test_a_rare_case_does_not_hold_the_work_back(wa):
+    w, a = wa
+    w.agent_commits("health.txt")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", "1. [acceptance_failure] health.txt: a caller that catches the error and goes on could see a "
+                    "stale value REACH: rare")
+    assert a.stop() is None
+    settled(w, a, "waiting_review")
+    assert w.store.task("ACME-1").state == "code_review" and len(w.gl.mrs) == 1
+
+
+def test_a_review_that_disputes_the_task_s_own_decision_asks_its_author_and_the_answer_goes_on(wa):
+    w, a = wa
+    w.agent_commits("health.txt")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", '1. [spec_conflict] QUOTE: "no migration" — the seed needs one on existing databases '
+                    "REACH: ordinary")
+    assert a.stop() is None                                   # no FAIL goes back to the worker
+    show = settled(w, a, "needs_input")
+    assert show["state_reason"] == "spec_conflict"
+    task = w.store.task("ACME-1")
+    assert task.state == "needs_input" and "agent-needs-input" in tags(w) and "agent-failed" not in tags(w)
+    [q] = questions(w)
+    assert 'QUOTE: "no migration"' in q and "1. Keep the task as written" in q
+    nothing_published(w)
+    w.yt.comment("2-1", "a.smith", "1")
+    w.tick()
+    wait_state(w, "ACME-1", "running")
+    assert w.store.task("ACME-1").state == "dispatched"
+    # The brief the agent gets has the question's text, not its options: the number goes on with the option's words.
+    briefs = sorted(a.idir().glob("messages/*/*.txt"), key=lambda f: f.stat().st_mtime)
+    assert briefs and "1. Keep the task as written" in briefs[-1].read_text()
+    a.declare("succeeded_changes", "Kept it as the ticket says")
+    a.codex("PASS")
+    assert a.stop() is None
+    settled(w, a, "waiting_review")
+    assert w.store.task("ACME-1").state == "code_review" and len(w.gl.mrs) == 1
+
+
+def test_the_other_answer_to_a_disputed_decision_reaches_the_agent_in_words(wa):
+    w, a = wa
+    w.agent_commits("health.txt")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", '1. [spec_conflict] QUOTE: "no migration" — the seed needs one on existing databases '
+                    "REACH: ordinary")
+    assert a.stop() is None
+    settled(w, a, "needs_input")
+    w.yt.comment("2-1", "a.smith", "2")
+    w.tick()
+    wait_state(w, "ACME-1", "running")
+    briefs = sorted(a.idir().glob("messages/*/*.txt"), key=lambda f: f.stat().st_mtime)
+    assert briefs and "2. Change it as the review suggests" in briefs[-1].read_text()
+
+
+def test_a_final_check_runs_once_after_the_review_and_holds_the_work_until_it_passes(wa, tmp_path):
+    w, a = wa
+    w.agent_commits("health.txt")
+    runs, flag = tmp_path / "final-runs", tmp_path / "final-passes"
+    a.add_check("the full suite passes", "sh", "-c",
+                f'echo x >> "{runs}"; [ -f "{flag}" ] || {{ echo "FAILED test_version"; exit 4; }}', final=True)
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", "1. [acceptance_failure] health.txt: no version in the answer REACH: ordinary")
+    assert a.stop()                                           # a FAIL round: the final check does not run
+    assert not runs.exists()
+    a.declare("succeeded_changes", "Added the version")
+    a.codex("PASS")
+    back = a.stop()                                           # accepted by the review: now it runs, and fails
+    assert back and "FINAL CHECKS" in back and runs.read_text().count("x") == 1
+    nothing_published(w)
+    flag.write_text("ok")
+    a.declare("succeeded_changes", "Fixed the suite")
+    assert a.stop() is None
+    settled(w, a, "waiting_review")
+    assert w.store.task("ACME-1").state == "code_review" and len(w.gl.mrs) == 1
+
+
+def test_a_final_check_that_cannot_run_parks_the_work_and_says_it_was_the_final_check(wa):
+    """A `--final` check whose tool is missing exits 127: the verifier records a `fail`, and Bulava parks the run for a
+    person. The ticket names the final check, not "the project's checks kept failing"."""
+    w, a = wa
+    w.agent_commits("health.txt")
+    a.add_check("the full suite passes", "sh", "-c", "arceus-test-no-such-suite-runner", final=True)
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("PASS")
+    for _ in range(4):
+        if a.stop() is None:
+            break
+        a.declare("succeeded_changes", "Added the health endpoint")
+    settled(w, a, "failed")
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "agent-failed" in tags(w) and questions(w) == []
+    assert task.reason == ("the review accepted the work, but its final checks did not pass or left no readable "
+                           "result, so nothing was published")
+    assert "kept failing" not in "\n".join(w.bot_comments())
     nothing_published(w)
 
 

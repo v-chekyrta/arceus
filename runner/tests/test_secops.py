@@ -766,5 +766,5 @@ def test_runs_recorded_before_advisory_triage_survive_the_migration(tmp_path, mo
     finally:
         store.close()
     monkeypatch.setattr(db, "MIGRATIONS", MIGRATIONS[:25])
-    with pytest.raises(RuntimeError, match="schema v26, this runner knows only v25"):
+    with pytest.raises(RuntimeError, match=f"schema v{len(MIGRATIONS)}, this runner knows only v25"):
         ReviewStore(path)  # a runner from before advisory triage

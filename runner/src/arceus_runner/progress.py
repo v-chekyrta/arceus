@@ -59,7 +59,7 @@ def _when(stamp: object) -> float | None:
         return None
 
 
-def _jsonl(data: bytes) -> list[dict]:
+def jsonl_lines(data: bytes) -> list[dict]:
     """Whole lines only: the last one may still be being written."""
     out = []
     for raw in data.split(b"\n")[:-1]:
@@ -80,6 +80,17 @@ class Step:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class Liveness:
+    """The newest sign of life of one attempt, for its timeout (delivery._check_timeout)."""
+    at: float    # epoch seconds: the newest engine line of the attempt or the agent writing its transcript; 0: unknown
+    step: str    # where the attempt is, "gate.review (retrying)"; empty when no step was read
+    round: int | None = None  # the review round the engine last named for it
+    paused: bool = False      # the engine's own record that this attempt waits for a usage window
+    pause_cleared_at: float | None = None  # when the engine last cleared a pause in its folder (pause-last.json)
+    pause_recorded_at: float | None = None  # when the engine recorded the pause now running (its marker's recorded_at)
+
+
 @dataclass
 class TaskProgress:
     """The picture of one task, kept between looks; the metrics read it."""
@@ -96,6 +107,8 @@ class TaskProgress:
     tools: Counter = field(default_factory=Counter)
     tool_errors: int = 0      # tool calls whose result came back as an error: a call is not a success
     last_tool: str = ""
+    review_round: int | None = None  # the round the engine's last review line named (gate.review … round)
+    instance: Path | None = None     # the attempt's folder in the engine, as its record names it
     last_target: str = ""
     activity_emitted_at: float = 0.0
     quiet_reported: bool = False
@@ -190,6 +203,7 @@ class ProgressWatcher:
             self.tasks[p.task_id] = p = fresh
         instance = Path(last.get("instance") or "")
         if last.get("instance") and instance.is_dir():
+            p.instance = instance
             self._read_steps(p, instance)
             self._read_transcript(p, instance)
             p.observed_at = self.now().timestamp()
@@ -226,11 +240,13 @@ class ProgressWatcher:
             return
         lines: list[dict] = []
         for f in files:  # the rotated half first: its lines are older
-            lines += [x for x in _jsonl(f.read_bytes()) if x.get("dispatch_id") == p.dispatch_id]
+            lines += [x for x in jsonl_lines(f.read_bytes()) if x.get("dispatch_id") == p.dispatch_id]
         lines.sort(key=lambda x: x.get("ms") or 0)  # stable: lines of one millisecond keep their order
         written = 0
         seen_at_ms = 0
         for x in lines:
+            if isinstance(x.get("round"), int) and x["round"] > 0:
+                p.review_round = x["round"]  # also from lines written before a restart: the round goes on
             ms = x.get("ms") or 0
             if ms == p.last_ms:
                 seen_at_ms += 1
@@ -248,6 +264,12 @@ class ProgressWatcher:
         p.journal_sig = sig
 
     def _step(self, p: TaskProgress, x: dict) -> None:
+        stage, state, note = str(x.get("stage") or "?"), str(x.get("state") or "?"), _clip(str(x.get("note") or ""))
+        if p.step and (p.step.stage, p.step.state) == (stage, state) and (x.get("heartbeat") is True or p.step.note == note):
+            # The engine repeats a step while a long check runs (`heartbeat: true`, every minute, its note counting the
+            # minutes): it moves the attempt's newest line (last_ms, its sign of life) and says nothing new, so it is
+            # not written out again.
+            return
         extra = {k: x.get(k) for k in ("node", "reason", "ms_taken", "resume_at", "result", "disposition", "exit")
                  if x.get(k) not in (None, "")}
         self.events.emit("engine_step", task_id=p.task_id, attempt=p.attempt, stage=str(x.get("stage") or "?"),
@@ -303,7 +325,7 @@ class ProgressWatcher:
             data = f.read()
         whole = data[:data.rfind(b"\n") + 1]
         p.transcript_offset += len(whole)
-        for entry in _jsonl(whole):
+        for entry in jsonl_lines(whole):
             if entry.get("type") == "user":
                 content = (entry.get("message") or {}).get("content")
                 p.tool_errors += sum(1 for part in content if isinstance(part, dict)
@@ -357,6 +379,53 @@ class ProgressWatcher:
         if p.agent_active_at is None or not self._agent_turn(p):
             return None
         return max(0.0, self.now().timestamp() - max(p.agent_active_at, p.step.since if p.step else 0))
+
+    def liveness(self, task_id: str, dispatch_id: str) -> Liveness:
+        """The newest sign of life of the attempt `dispatch_id`: a line the engine wrote for it (a step, or the
+        heartbeat it repeats while a long check runs) or the agent writing its transcript. The attempt's files are
+        read now, so a decision about it never rests on an older look (a runner that has just started has none).
+        `at` is 0 when nothing of this attempt could be read (its record or folder unreadable, another attempt's
+        dispatch): then the attempt counts from its start, and what an earlier attempt did never counts for it."""
+        try:
+            self._look(self.tasks.setdefault(task_id, TaskProgress(task_id)))
+        except OSError as e:
+            self.events.emit("progress_unreadable", task_id=task_id, reason=str(e))
+        p = self.tasks[task_id]
+        if not dispatch_id or p.dispatch_id != dispatch_id or not p.observed_at:
+            return Liveness(0.0, "")
+        at = max(p.last_ms / 1000 if p.last_ms else 0.0, p.agent_active_at or 0.0)
+        marker = self._limit_pause(p)
+        recorded = marker.get("recorded_at") if marker else None
+        return Liveness(at, f"{p.step.stage} ({p.step.state})" if p.step else "", p.review_round,
+                        marker is not None, self._pause_cleared_at(p),
+                        float(recorded) if isinstance(recorded, (int, float)) and recorded > 0 else None)
+
+    @staticmethod
+    def _pause_cleared_at(p: TaskProgress) -> float | None:
+        """When Bulava last took a pause off the attempt's folder (supervisor-lib.sh _pause_drop: pause-last.json)."""
+        if not p.instance:
+            return None
+        try:
+            at = json.loads((p.instance / "pause-last.json").read_text()).get("cleared_at")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return float(at) if isinstance(at, (int, float)) and at > 0 else None
+
+    def _limit_pause(self, p: TaskProgress) -> dict | None:
+        """The record of this attempt standing paused for a usage window, or None: `paused-for-limit.json` in its
+        folder, which Bulava's watchdog and review gate write (pause_record) stamped with the dispatch it belongs to
+        and when (recorded_at). A marker left by another attempt, or none, is no pause of this one."""
+        if not p.instance or not p.dispatch_id:
+            return None
+        try:
+            rec = json.loads((p.instance / "paused-for-limit.json").read_text())
+        except (OSError, ValueError):
+            return None
+        # The same marker parks a run whose reviewer cannot be reached ("reviewer unreachable"): that is no wait for a
+        # usage window. Bulava's own reasons for one: "usage limit seen in the worker pane", "usage guard",
+        # "codex usage guard".
+        ok = isinstance(rec, dict) and rec.get("dispatch_id") == p.dispatch_id and "usage" in str(rec.get("reason") or "")
+        return rec if ok else None
 
     # -- for the metrics --------------------------------------------------------------------------
 

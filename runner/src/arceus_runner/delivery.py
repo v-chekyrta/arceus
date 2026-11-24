@@ -27,7 +27,7 @@ from arceus_runner.db import REVIEW_UNDER_WAY, TaskStore, Task, TriggerDecision
 from arceus_runner.engine import Engine, EngineError, Reply
 from arceus_runner.events import EventLog
 from arceus_runner.gitops import HOME_BRANCH, Git, GitError
-from arceus_runner.progress import task_key
+from arceus_runner.progress import Liveness, task_key
 from arceus_runner.http import BadRequest, NotFound, ServiceError
 from arceus_runner.integrations import (
     CodeHost,
@@ -93,6 +93,18 @@ ACTION_CLIENTS = {"reply": "code_host", "mr_react": "reactions", "merge": "code_
 TAKEN = "eyes"  # the reaction on a command the runner took: the person sees it was seen and will be done
 
 
+# The review gate's block in its findings for the heavy checks registered with `add-check --final`
+# (engine/hooks/review-gate.sh).
+GATE_FINAL = "[FINAL CHECKS]"
+STALL_LIMIT = 2  # the gate's SUPERVISOR_STALL_LIMIT by default: rounds without progress before it parks the run
+
+
+def _hours(d) -> str:
+    """A limit as the ticket says it: "8 h", "90 min"."""
+    s = d.total_seconds()
+    return f"{s / 3600:.0f} h" if s >= 3600 and s % 3600 == 0 else f"{s / 60:.0f} min"
+
+
 FETCHED_KEPT = 4  # deliveries whose fetched files are kept in memory while they wait (Delivery._fetched): at most
                   # 4 × materials.MAX_TOTAL_BYTES
 class Delivery:
@@ -118,6 +130,9 @@ class Delivery:
                                    comment_with_media=self.comment_with_media, hold_back=self.platforms_missing,
                                    journal_merges=self.journal_merges, arm_merges=self.arm_merges)
         self.reviewer = None  # code_review.ReviewAgent, set by the loop: told of MRs and merges (review.py)
+        # progress.ProgressWatcher.liveness, set by the loop: an attempt's newest sign of life, for its timeout.
+        # Without it an attempt is timed from its start.
+        self.liveness: Callable[[str, str], Liveness | None] | None = None
 
     @property
     def review(self):
@@ -881,6 +896,31 @@ class Delivery:
         except OSError:
             return ""
 
+    @staticmethod
+    def _spelled_option(task: Task, text: str) -> str:
+        """An answer that is only an option's number, as the question on the ticket asks for, goes on with the option's
+        words: the brief the agent gets has the question's text, not its options."""
+        m = re.fullmatch(r"\s*(\d{1,2})\s*[.)]?\s*", text)
+        try:
+            options = (json.loads(task.question or "{}") or {}).get("options") or []
+        except (ValueError, AttributeError):
+            options = []
+        if m and 1 <= int(m[1]) <= len(options):
+            return f"{m[1]}. {options[int(m[1]) - 1]}"
+        return text
+
+    def _review_churned(self, task_id: str) -> bool:
+        """Whether the review stopped because every fix brought a new blocker: the task's review list
+        (`review-ledger-<task key>` under bulava_state, kept across attempts) counts such rounds as `churn` beside the
+        rounds without progress (`stall`), and when all of those were churn the gate said so (review-gate.sh,
+        stall_why). Its words are only in the run's journal, which goes with the session."""
+        try:
+            d = json.loads((self.cfg.paths.bulava_state / f"review-ledger-{task_key(task_id)}").read_text())
+            churn, stall = int(d.get("churn") or 0), int(d.get("stall") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+        return churn >= STALL_LIMIT and churn >= stall
+
     def _review_asked(self, receipt: dict, attempts: list[dict]) -> str:
         """What the reviewers asked a person when they stopped this attempt (`texts.review_stop`), from the review
         gate's note; empty for any other `needs-user`."""
@@ -894,6 +934,13 @@ class Delivery:
         summary = outcome.get("summary") or ""
         said = receipt.get("review_why") or ""
         # Names and exit codes only: what a check printed stays in the run's own logs on the server.
+        if why == "needs-user" and GATE_FINAL in said:
+            # The heavy checks registered with `add-check --final` run once the review accepts the work; they did not
+            # pass in this attempt or left nothing readable, and nothing is accepted without them. Their evidence is
+            # the verifier's too (a check that could not start is a `fail` there): this, not that, is why it stopped.
+            self._log_verifier_gaps(task, receipt)
+            return ("the review accepted the work, but its final checks did not pass or left no readable result, "
+                    "so nothing was published"), summary
         failed, unproven = self._verifier_gaps(receipt, causes=False) if why in ("debt", "needs-user") else ([], [])
         if failed or GATE_VERIFIER in said:
             self._log_verifier_gaps(task, receipt)
@@ -923,6 +970,12 @@ class Delivery:
             if said.startswith(GATE_WORKER_FAILED):
                 return "the agent reported that it could not finish the task", summary
             last = re.split(r"(?m)^(?=## )", self._gate_note(receipt, attempts).strip())[-1].partition("\n")[0]
+            if (GATE_STALLED in last or GATE_FAIL in said) and self._review_churned(task.task_id):
+                found = review_findings(said)
+                listed = ["The review's findings still open:", *(f"- {self.events.redact(f)}" for f in found)]
+                return ("the review stopped because every fix brought a new blocking problem, so a person has to "
+                        "decide how to go on",
+                        "\n\n".join(x for x in ("\n".join(listed) if found else "", summary) if x))
             if GATE_STALLED in last:
                 found = review_findings(said)
                 listed = ["The review's findings that kept coming back:",
@@ -1009,20 +1062,90 @@ class Delivery:
         return out
 
     def _check_timeout(self, task: Task, attempts: list[dict]) -> None:
-        # A usage-limit pause is not a hang: the clock stops while a limit is out.
+        # A usage-limit pause is not a hang: the clock stops while the attempt waits for a usage window, as the engine
+        # records it for this very attempt (paused-for-limit.json). One that goes on working while a limit is out (a
+        # final check beating, background agents) is not paused. Without the progress watcher a used-up limit is
+        # all there is to go by.
         out = self._limits_exhausted()
-        if out:
-            if task.attempt_started != "paused":
-                self.events.emit("attempt_paused_for_limit", task_id=task.task_id, limits=out)
-            self.store.update_task(task.task_id, attempt_started=self.now().isoformat())
+        last_attempt = attempts[-1] if attempts else {}
+        did = last_attempt.get("dispatch_id") or ""
+        lim, now = self.cfg.limits, self.now()
+        alive = self.liveness(task.task_id, did) if self.liveness else None
+        waits = alive.paused if self.liveness and alive else bool(out)
+        paused, resumed = self._pause(task, did, now, waits, out, alive.pause_cleared_at if alive else None,
+                                      alive.pause_recorded_at if alive else None)
+        if waits:
             return
-        times = [t for t in (parse_ts((attempts[-1] if attempts else {}).get("started_at")),
-                             parse_ts(task.attempt_started)) if t]
+        began = parse_ts(last_attempt.get("started_at"))
+        times = [t for t in (began, parse_ts(task.attempt_started)) if t]
         started = max(times) if times else None
-        limit = self.cfg.limits.attempt_timeout
-        if started and self.now() - started > limit:
+        if not started:
+            return
+        # Silence is measured from the attempt's newest sign of life: a review that keeps going back and forth for
+        # hours is working, not hung. The ceiling bounds the attempt however busy it is, counted from its start in the
+        # engine without its pauses for a usage limit (a pause neither counts nor starts the count again).
+        if (now - (began or started)).total_seconds() - paused > lim.attempt_ceiling.total_seconds():
             self.engine.stop(Path(task.repo_path))
-            self.fail(task, f"the agent hung: no result in {limit.total_seconds() / 3600:.0f} h", attempt=len(attempts))
+            self.fail(task, f"the attempt ran out of time: no verdict in {_hours(lim.attempt_ceiling)}, still working"
+                            f"{self._where(task, alive)}", attempt=len(attempts))
+            return
+        # A pause that ended is a fresh start for the silence: the attempt could not have shown life while it waited.
+        last = max([started, *([datetime.fromtimestamp(alive.at, UTC)] if alive and alive.at else []),
+                    *([resumed] if resumed else [])])
+        if now - last > lim.attempt_timeout:
+            self.engine.stop(Path(task.repo_path))
+            self.fail(task, f"the agent hung: no sign of activity for {_hours(lim.attempt_timeout)}"
+                            f"{self._where(task, alive)}", attempt=len(attempts))
+
+    def _pause(self, task: Task, dispatch_id: str, now: datetime, waits: bool, limits: list[str],
+               cleared_at: float | None, recorded_at: float | None = None) -> tuple[float, datetime | None]:
+        """The seconds attempt `dispatch_id` has stood paused for a usage window, the pause now running included, and
+        when its last pause ended. Kept with the task (attempt_pause: {dispatch, since, total, ended}), so a restart
+        neither loses nor restarts them; another attempt's is dropped, and so on disk too. A pause begins when the engine
+        recorded it (its marker's recorded_at, not before the last one ended), else when the runner first sees it; it
+        ends when the engine cleared it (`pause-last.json` cleared_at, after it began), else when the runner sees it
+        over. So a runner that was down counts the pause the engine kept, no more and no less."""
+        try:
+            p = json.loads(task.attempt_pause or "{}")
+        except ValueError:
+            p = {}
+        changed = not isinstance(p, dict) or p.get("dispatch") != dispatch_id
+        if changed:
+            p = {"dispatch": dispatch_id, "since": None, "total": 0.0}
+        since = parse_ts(p.get("since"))
+        if waits and not since:
+            floor = parse_ts(p.get("ended"))
+            rec = datetime.fromtimestamp(recorded_at, UTC) if recorded_at else None
+            since = rec if rec and rec <= now and not (floor and rec < floor) else now
+            p["since"], changed = since.isoformat(), True
+            self.events.emit("attempt_paused_for_limit", task_id=task.task_id, limits=limits)
+        elif not waits and since:
+            cleared = datetime.fromtimestamp(cleared_at, UTC) if cleared_at else None
+            end = cleared if cleared and since < cleared <= now else now
+            p["total"] = float(p.get("total") or 0) + (end - since).total_seconds()
+            p["since"], p["ended"], since, changed = None, end.isoformat(), None, True
+        if changed:
+            self.store.update_task(task.task_id, attempt_pause=json.dumps(p))
+        return (float(p.get("total") or 0) + ((now - since).total_seconds() if since else 0.0),
+                parse_ts(p.get("ended")))
+
+    def _where(self, task: Task, alive: Liveness | None) -> str:
+        """Where a stopped attempt was, for its reason: the step, the review round, the review's open items."""
+        parts = [*([f"last step: {alive.step}"] if alive and alive.step else []),
+                 *([f"review round {alive.round}"] if alive and alive.round else [])]
+        open_ids = self._open_review_ids(task.task_id)
+        if open_ids:
+            parts.append("open review items: " + ", ".join(open_ids))
+        return f" ({'; '.join(parts)})" if parts else ""
+
+    def _open_review_ids(self, task_id: str) -> list[str]:
+        """The ids still open in the task's review list (`review-ledger-<task key>`, kept across attempts)."""
+        try:
+            d = json.loads((self.cfg.paths.bulava_state / f"review-ledger-{task_key(task_id)}").read_text())
+            return [str(i["id"]) for i in d.get("items") or []
+                    if isinstance(i, dict) and i.get("open") and not i.get("same_as") and i.get("id")]
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            return []
 
     def _resume(self, task: Task, attempt: int) -> None:
         if not self.workspace.followup_ready(task):
@@ -1327,6 +1450,10 @@ class Delivery:
         elif review_asked:
             q = {}
             text = review_question(review_asked, report, mrs)
+        elif q.get("text") and show.get("state_reason") == "spec_conflict":
+            # The review gate's question (spec_conflict): the reviewer's own line, quoting the task, through the same
+            # redaction as any other review text that reaches the ticket.
+            text = self.events.redact(q["text"])
         elif q.get("text"):
             text = q["text"]
         else:
@@ -1344,7 +1471,11 @@ class Delivery:
             foot = no_change_foot()
         ask_head = "the agent found nothing to change and needs your decision:" if no_change else \
             "the agent needs an answer to continue:"
-        posted = self.post_whole(task, f"question:{q.get('id') or attempt}",
+        # Bulava names a review's spec_conflict question by its words, so the same dispute in a later attempt has the
+        # same id: its comment, and the time answers are read from, are that attempt's own. The id stays Bulava's.
+        kind = f"question:{q.get('id')}:{attempt}" if show.get("state_reason") == "spec_conflict" and q.get("id") \
+            else f"question:{q.get('id') or attempt}"
+        posted = self.post_whole(task, kind,
                                  f"{self.tracker.mention(task.tag_author)}, {ask_head}",
                                  text, foot, visuals=self.publisher.task_media(task))[0]
         self.tracker.add_tag(task.issue_db_id, self.cfg.tracker.tags.needs_input)
@@ -1402,7 +1533,8 @@ class Delivery:
                 if self.workspace.waits(task):
                     continue  # the answer is read again on a later tick; the task stays in needs_input
                 files = self.ticket_files(task, {str(answer.id)}, [answer])
-                text = answer.text if answer.text.strip() else f"{answer.author} answered with files only."
+                text = self._spelled_option(task, answer.text) if answer.text.strip() \
+                    else f"{answer.author} answered with files only."
                 tags, new_tags = self._changed_tags(task)
                 if tags:
                     text += f"\n\n{tags}"

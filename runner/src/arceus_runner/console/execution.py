@@ -89,6 +89,7 @@ class Facts:
     no_change: bool = False          # it waits on the agent's conclusion that nothing needs changing
     turn: str = ""                   # live()["turn"]
     used_up: list[str] = field(default_factory=list)
+    limit_paused: bool = False       # the runner holds the attempt's clock: the engine records it waiting for a window
     holder: str = ""                 # what has the shared workspace now, in words; "" when it is free
     can_take: bool | None = None     # health lets new work in (None: not known)
     mode: str = "live"
@@ -130,14 +131,17 @@ def reason(f: Facts) -> dict:
         return r("next_pass", "busy", "Queued", f"{what} starts on the runner's next pass.")
 
     if state in ("dispatched", "review:running", "run:running"):
-        if f.used_up and state == "dispatched":
-            # The runner pauses a task's attempt while any window is used up (delivery._check_timeout).
+        if f.limit_paused and state == "dispatched":
+            # The same signal the attempt's clock stops on (delivery._check_timeout, the task's attempt_pause): the
+            # engine records this attempt waiting for a window. A used-up limit alone does not make it wait.
             return r("subscription", "wait", "Paused: a subscription limit is used up",
-                     f"Used up: {'; '.join(f.used_up)}. The limit is shared by all the factory's work, not spent by "
-                     "this one alone. It goes on by itself when the window resets, and the attempt's clock stands "
-                     "still meanwhile. Nothing to answer.")
-        if f.used_up and f.turn == "paused":
-            # A code review or a run has no such pause of its own: only the engine's step says it waits.
+                     f"Used up: {'; '.join(f.used_up) or 'a subscription window'}. The limit is shared by all the "
+                     "factory's work, not spent by this one alone. It goes on by itself when the window resets, and "
+                     "the attempt's clock stands still meanwhile. Nothing to answer.")
+        if f.used_up and f.turn == "paused" and state != "dispatched":
+            # A code review or a run has no such pause of its own: only the engine's step says it waits. A development
+            # attempt the engine has not recorded as waiting for a window (it waits on background agents, say) is
+            # paused by the engine, not for a subscription, and its clock runs: the next reason says so.
             return r("subscription", "wait", "Paused: a subscription limit is used up",
                      f"The engine waits, and {'; '.join(f.used_up)} is used up: shared by all the factory's work, "
                      "not spent by this one alone. It goes on by itself; its time limit keeps running. Nothing to "
@@ -293,3 +297,13 @@ def duration(seconds: float) -> str:
     days, hours = s // 86400, s % 86400 // 3600
     return f"{days} d {hours} h" if hours else f"{days} d"
 
+
+def limit_paused(task) -> bool:
+    """Whether the runner holds the task's attempt clock for a usage window now (delivery._pause: a pause running),
+    for the attempt now running: a pause that began before this attempt started is an earlier attempt's."""
+    try:
+        since = (json.loads(task.attempt_pause or "{}") or {}).get("since")
+        started = task.attempt_started
+        return bool(since) and (not started or datetime.fromisoformat(since) >= datetime.fromisoformat(started))
+    except (ValueError, AttributeError, TypeError):
+        return False

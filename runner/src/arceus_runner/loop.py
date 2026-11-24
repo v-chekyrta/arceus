@@ -156,6 +156,8 @@ class Runner:
                                         quiet_after=cfg.limits.agent_quiet_after,
                                         others=(cfg.qa.workspace,) if cfg.qa.workspace else ()) if self.delivery else None
         self.ticket_progress = TicketProgress(self.delivery, self.progress, now) if self.progress else None
+        if self.progress:
+            self.delivery.liveness = self.progress.liveness  # an attempt's timeout counts from its newest sign of life
         self.last_tick: float | None = None  # wall clock of the last finished tick, for the metrics
         self.cleanup = cleanup
         self.engine = engine

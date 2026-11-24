@@ -870,10 +870,19 @@ MIGRATIONS.append(
 )
 
 
+MIGRATIONS.append(
+    # 27: an attempt's pauses for a used-up usage limit, so its ceiling (limits.attempt_ceiling) counts only the time
+    # it could work: JSON {dispatch, since, total}, the attempt it is about, when the pause now running began (null
+    # when none runs) and the seconds of the pauses that ended. Another attempt's is no pause of this one.
+    """
+    ALTER TABLE tasks ADD COLUMN attempt_pause TEXT;
+    """
+)
+
 TASK_FIELDS = ("task_id", "issue_db_id", "state", "summary", "tag_author", "repo", "repo_path", "branch",
                "base_branch", "question_id", "question_at_ms", "reason", "mr_urls", "attempt_started",
                "extra_repos", "review_rounds", "ci_attempts", "published_at_ms", "failed_at_ms",
-               "review_answers", "kind", "question")
+               "review_answers", "kind", "question", "attempt_pause")
 TASK_COLUMNS = (*TASK_FIELDS, "updated_at")  # read: the last change is set by the store itself, never written
 
 
@@ -903,6 +912,7 @@ class Task:
     kind: str = "code"       # code: merge requests; research: an answer on the ticket, nothing published;
                              # review: people's merge requests, which the runner only reviews (code_review.py)
     question: str | None = None  # JSON {id, text, options, blocked[, review, no_change]}: the last question asked
+    attempt_pause: str | None = None  # JSON {dispatch, since, total}: the attempt's pauses for a usage limit
     updated_at: str = ""     # when the record last changed: for a task that is over, when it ended
 
     @property

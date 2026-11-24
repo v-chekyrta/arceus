@@ -141,8 +141,10 @@ included (before the runner has a record of the task), and shows:
   review queued or running; failed (with the runner's reason, and until when a `/continue` on the ticket resumes it),
   stopped, done. Only a wait for an answer asks for a comment on the ticket. A used-up subscription window is said
   to be the whole factory's, never this task's spend, and usage that is high but not used up does not make a task
-  wait. Only a development attempt is said to stop its clock while a window is used up; a code review or a run is
-  said to wait for one only when the engine's step waits, and its time limit keeps running.
+  wait. Only a development attempt is said to stop its clock, and only while the runner holds it: when the engine
+  records the attempt waiting for a window (as its timeout does). An attempt that works on while a window is used up
+  (a final check running) shows what it does, and its time counts; a code review or a run is said to wait for a
+  window only when the engine's step waits, and its time limit keeps running.
 - **The agent's question**, whole, with its options, beside a link to the ticket where it is answered. The runner
   keeps the question as the ticket got it; a question kept before it did so (its first 1500 characters) says the
   ticket has the rest. Only the question the task waits on now is shown, never an earlier one's words.
