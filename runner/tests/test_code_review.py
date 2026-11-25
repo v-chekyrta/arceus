@@ -914,7 +914,7 @@ def test_existing_code_in_a_file_without_an_extension_backs_a_finding_of_fit(w):
     seed(w)
     publish(w)
     ask(w)
-    write_verdict(w, findings=[{**FIT, "evidence": "Makefile:12 target5 already runs the same gate"}])
+    write_verdict(w, findings=[{**FIT, "evidence": "Makefile:11 target5 already runs the same gate"}])
     finish(w)
     later(w)
     assert len(sends(w)) == 1
@@ -972,6 +972,9 @@ def test_only_a_finding_of_fit_already_sent_for_the_same_code_is_held_back(w):
     {**FIT, "basis": "rule", "evidence": f'CLAUDE.md: "{RULE} Every file also needs a licence header."'},  # made up
     {**FIT, "evidence": "Makefile:3 build_name"},                       # a real line, but not the code it names
     {**FIT, "evidence": "logo.png:1 logo"},                             # a binary file has no lines to point at
+    {**FIT, "evidence": "app/validators.py:8 validate_2"},              # the name is on the line above, not this one
+    {**FIT, "basis": "rule", "evidence": f'web/CLAUDE.md: "{NESTED}"'},  # names a source that is not there
+    {**FIT, "basis": "rule", "evidence": f'app/CLAUDE.md: "{NESTED}"'},  # a rule of app/, for a file outside it
 ])
 def test_a_finding_of_fit_the_code_does_not_bear_out_sends_nothing(w, finding):
     seed(w)
@@ -1073,22 +1076,50 @@ def test_changed_lines_follow_renames_spaces_quotes_and_deleted_files(tmp_path):
     assert set(lines) == set(files)
 
 
-@pytest.mark.parametrize("scope, findings, sent", [
-    (NOBODY, [{**FIT, "file": "Makefile", "basis": "unasked", "text": "A `verify` target nobody asked for",
-               "evidence": "the `verify` target the ticket does not ask for"}], 1),
-    ([{"what": "a `verify` target", "asked_by": "o.lead 11-20: keep the verify target"}], [], 0),
+MAKEFILE_FIT = {**FIT, "file": "Makefile", "line": 22, "basis": "unasked", "text": "A `verify` target nobody asked for",
+                "evidence": "the `verify` target the ticket does not ask for"}
+
+
+@pytest.mark.parametrize("asked_by, sent, approved", [
+    ("nobody", 1, False),
+    ("o.lead on the MR: keep the `verify` target in this MR", 0, True),
 ])
-def test_a_makefile_target_nobody_asked_for_goes_back_once_and_an_agreed_one_does_not(w, scope, findings, sent):
-    """The same green CI, the same change to the Makefile: ruled out, it goes to the author once; agreed, nothing goes.
-    What people see was not looked at, so neither is approved."""
+def test_a_makefile_target_ruled_out_goes_back_once_and_an_agreed_one_is_approved(w, monkeypatch, asked_by, sent,
+                                                                                   approved):
+    """The same change (a `verify` target added to the Makefile), the same finding, the same green CI. When the scope
+    says nobody asked for it, it goes to the author once and nothing is approved; when a person agreed to it, nothing
+    goes and the merge request is approved."""
+    def commits(name="feature.txt"):
+        with open(w.repo / "Makefile", "a") as f:
+            f.write(".PHONY: verify\nverify:\n\tdocker build -t ci .\n")
+        git(w.repo, "add", "Makefile")
+        git(w.repo, "commit", "-q", "-m", "add verify")
+        return git(w.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(w, "agent_commits", commits)
     seed(w)
     publish(w, "Makefile")
+    if asked_by != "nobody":
+        w.gl.note(1, "o.lead", "Keep the verify target in this MR.")
+        w.tick()
     ask(w)
-    write_verdict(w, ui="not_run", ui_checked="no browser here", scope=scope, findings=findings)
+    write_verdict(w, scope=[{"what": "the `verify` target in the Makefile", "asked_by": asked_by}],
+                  findings=[MAKEFILE_FIT])
     finish(w)
     later(w)
     later(w)
-    assert len(sends(w)) == sent and approve_calls(w) == []
+    assert len(sends(w)) == sent and (approve_calls(w) != []) is approved
+
+
+def test_unasked_work_is_matched_to_its_own_entry_of_scope_not_a_longer_name(w):
+    seed(w)
+    publish(w)
+    ask(w)
+    write_verdict(w, scope=[{"what": "the `verify_docs` target", "asked_by": "nobody"},
+                            {"what": "the `verify` target in the Makefile", "asked_by": "o.lead: keep it"}],
+                  findings=[{**FIT, "basis": "unasked", "evidence": "the `verify` target the ticket does not ask for"}])
+    finish(w)
+    later(w)
+    assert sends(w) == []
 
 
 def test_two_findings_of_fit_in_one_file_are_two_findings(w, monkeypatch):

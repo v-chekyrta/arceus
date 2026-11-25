@@ -414,6 +414,15 @@ def _backed(basis: str, evidence: str) -> bool:
 _QUOTED = re.compile(r'"([^"]+)"|“([^”]+)”|«([^»]+)»|`([^`]+)`')
 
 
+def _ticks(text: str) -> list[str]:
+    """The `quoted` names of a text, lower case."""
+    return [t.strip().lower() for t in re.findall(r"`([^`]+)`", text)]
+
+
+def _paths(text: str) -> set[str]:
+    return {p.lower() for p in re.findall(r"[\w-]+(?:/[\w.-]+)*\.\w+|\bMakefile\b|\bDockerfile\b", text)}
+
+
 def _plain(text: str) -> str:
     """Text as a rule is compared: markdown marks and line breaks gone, one space between words, lower case."""
     return " ".join(re.sub(r"[*_#>`]", " ", text).split()).lower()
@@ -1417,37 +1426,52 @@ class ReviewAgent:
         path = self.cfg.paths.workspace / mr["repo"]
         target = mr.get("target_sha") or f"origin/{mr['target']}"
         if f["basis"] == "rule":
-            # The whole quote, in the project's notes or in a file of rules of the target branch (not the change's).
+            # The whole quote, in the project's notes or in a file of rules of the target branch that applies to the
+            # changed file (one at the root or in a folder above it); a file the evidence names has to be such a file
+            # and to be there. The change's own rules never count.
             quote = _quoted(f["evidence"])
             if not quote:
                 return False
+            folder = f["file"].rsplit("/", 1)[0] + "/" if "/" in f["file"] else ""
+            applies = [r for r in self.git.rule_files(path, target)
+                       if folder.startswith(r.rsplit("/", 1)[0] + "/" if "/" in r else "")]
+            named = list(dict.fromkeys(re.findall(r"[\w./-]+\.md\b", f["evidence"])))
+            texts = []
             try:
-                texts = [self.d.workspace.task_notes(task)]
+                notes = self.d.workspace.task_notes(task)
             except OSError:
-                texts = []
-            named = [x for x in re.findall(r"[\w./-]+\.md\b", f["evidence"])]
-            for name in dict.fromkeys([*self.git.rule_files(path, target), *named]):
-                texts.append("\n".join(self.git.text_lines(path, target, name) or []))
+                notes = ""
+            home = str(self.cfg.paths.workspace.resolve() / "AGENTS.md")
+            for n in named or applies:
+                if n in (home, "AGENTS.md") and n not in applies:
+                    texts.append(notes)  # the project's notes, in the workspace's AGENTS.md
+                    continue
+                lines = self.git.text_lines(path, target, n)
+                is_rules = n.rsplit("/", 1)[-1] in ("CLAUDE.md", "AGENTS.md")
+                if lines is None or is_rules and n not in applies:
+                    return False  # a source it names is not on the target branch, or not one for this file
+                texts.append("\n".join(lines))
+            if not named:
+                texts.append(notes)
             return any(quote in _plain(t) for t in texts)
         if f["basis"] == "existing":
-            # A line that exists, in a text file, holding a name the evidence gives for the code doing that job.
+            # The line exists in a text file and holds a name the evidence gives for the code doing that job.
             place = _PLACE.search(f["evidence"])
             if not place:
                 return False
             where, line = place.group(0).rsplit(":", 1)
-            names = {w for w in re.findall(r"[A-Za-z_][\w]{2,}", f["evidence"].replace(place.group(0), " "))}
+            names = set(re.findall(r"[A-Za-z_]\w{2,}", f["evidence"].replace(place.group(0), " ")))
             for ref in (mr["sha"], target):
                 lines = self.git.text_lines(path, ref, where)
-                if lines and int(line) <= len(lines):
-                    near = " ".join(lines[max(int(line) - 4, 0):int(line) + 3])
-                    if any(re.search(rf"\b{re.escape(n)}\b", near) for n in names):
-                        return True
+                if lines and int(line) <= len(lines) and any(
+                        re.search(rf"\b{re.escape(n)}\b", lines[int(line) - 1]) for n in names):
+                    return True
             return False
         if f["basis"] == "unasked":
-            # The entry of `scope` it is about says nobody asked for it, and no other entry says somebody did.
-            marks = [t.lower() for t in re.findall(r"`([^`]+)`", f["evidence"])] or \
-                [f["file"].rsplit("/", 1)[-1].lower()]
-            about = [x for x in v.get("scope", []) if any(t in x["what"].lower() for t in marks)]
+            # The entries of `scope` about the same thing (the same `name`, or the same file when the evidence names
+            # none) all say nobody asked for it.
+            marks = set(_ticks(f["evidence"])) or {f["file"].lower()}
+            about = [x for x in v.get("scope", []) if marks & (set(_ticks(x["what"])) | _paths(x["what"]))]
             return bool(about) and all(x["asked_by"].lower().startswith("nobody") for x in about)
         return True
 
