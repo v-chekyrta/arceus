@@ -346,6 +346,9 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
                 continue
             deploy.append({"file": _clean(a.get("file"), 300), "what": what})
         met = e.get("requirements_met")
+        scope = [{"what": _clean(x.get("what"), 400), "asked_by": _clean(x.get("asked_by"), 400),
+                  "existing": _clean(x.get("existing"), 400)}
+                 for x in (e.get("scope") if isinstance(e.get("scope"), list) else []) if isinstance(x, dict)]
         ui = e.get("ui") if e.get("ui") in UI else None
         if ui is None:
             doubts.append(NO_UI)
@@ -361,6 +364,7 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             "unsure_because": _clean(e.get("unsure_because"), 800),
             "ui": ui or "not_run",
             "ui_checked": _clean(e.get("ui_checked"), 1500),
+            "scope": scope[:MAX_ITEMS * 2],
             "findings": findings[:MAX_ITEMS],
             "attention": attention[:MAX_ITEMS],
             "deploy": deploy[:MAX_ITEMS],
@@ -379,17 +383,18 @@ def _in_change(f: dict, mr: dict, near: int = 3) -> bool:
     return f["line"] is not None and any(a - near <= f["line"] <= b + near for a, b in mr["lines"].get(f["file"], []))
 
 
-def _fit_key(f: dict) -> tuple:
-    return f.get("file"), f.get("basis"), f.get("evidence")
+def _fit_key(repo: str, f: dict) -> tuple:
+    """A finding of fit as the same one in a later review: where it is and what kind, not how it is worded."""
+    return repo, f.get("file"), f.get("line"), f.get("basis")
 
 
 def _judged(snap: dict) -> tuple:
     """What a review judged: the commits, and the ticket and people's comments it read them against."""
-    return ({(m["repo"], m["sha"]) for m in snap.get("mrs", [])}, snap.get("ticket", {}).get("context"),
-            snap.get("mr_comments"))
+    return ({(m["repo"], m["sha"], m.get("target_sha")) for m in snap.get("mrs", [])},
+            snap.get("ticket", {}).get("context"), snap.get("mr_comments"))
 
 
-_PLACE = re.compile(r"[\w./-]*\w:\d+")
+_PLACE = re.compile(r"[\w./-]*\w:[1-9]\d*\b")
 _QUOTE = re.compile(r"[\"“”'`«»]")
 # Something in the code named: a `quoted` name, a path, a call, a snake_case or dotted name.
 _CODE = re.compile(r"`[^`]+`|[\w-]+/[\w./-]+|\w+\(|\b\w+_\w+\b|\b\w+\.\w+\b")
@@ -399,10 +404,23 @@ def _backed(basis: str, evidence: str) -> bool:
     """Whether a finding of fit's evidence has the shape its basis needs: a rule quoted with the file it is in, the
     place of the existing code, or the plain form or the change beyond the ticket in words."""
     if basis == "rule":
-        return bool(_QUOTE.search(evidence)) and bool(re.search(r"[\w-]+\.(md|txt|rst|toml|ya?ml|cfg)\b|/", evidence))
+        return bool(_quoted(evidence)) and bool(re.search(r"[\w-]+\.(md|txt|rst|toml|ya?ml|cfg)\b|/", evidence))
     if basis == "existing":
         return bool(_PLACE.search(evidence))
-    return bool(_CODE.search(evidence))
+    return bool(_CODE.search(evidence)) and len(evidence.split()) >= 3
+
+
+_QUOTED = re.compile(r'"([^"]+)"|“([^”]+)”|«([^»]+)»|`([^`]+)`')
+
+
+def _quoted(evidence: str) -> str:
+    """The words a rule is quoted by, five of them at most (a quote that runs over lines still matches one line of the
+    file), or "" when no quote of four words or more is there."""
+    for m in _QUOTED.finditer(evidence):
+        words = re.sub(r"[*_#>]", " ", next(g for g in m.groups() if g)).split()
+        if len(words) >= 4:
+            return " ".join(words[:5])
+    return ""
 
 
 def _fit_only(mr: dict) -> bool:
@@ -846,6 +864,7 @@ class ReviewAgent:
                         "sha": sha, "target": target, "source": source,
                         "files": self.git.changed_files(path, f"origin/{target}", sha),
                         "lines": self.git.changed_lines(path, f"origin/{target}", sha),
+                        "target_sha": self.git.ref_sha(path, f"origin/{target}"),
                         "prev": current if current != branch else None, "prev_head": self.git.head(path)})
         home = ws
         if (home / ".git").exists() and self.git.current_branch(home) != branch and not self.git.is_clean(home):
@@ -857,7 +876,7 @@ class ReviewAgent:
         context = self._context(task, issue)
         mr_comments = self._mr_comments(mrs)
         said = _said(mr_comments)
-        reviewed = ({(m["repo"], m["sha"], m["target"]) for m in mrs}, context, said)
+        reviewed = ({(m["repo"], m["sha"], m["target"], m["target_sha"]) for m in mrs}, context, said)
         for earlier in self.store.reviews("done", task_id=task.task_id):
             then = json.loads(earlier.snapshot)
             # Findings of fit alone stand only while they can still go back: asked again for the same commits, the
@@ -865,7 +884,7 @@ class ReviewAgent:
             fit_only = earlier.outcome == "changes" and all(
                 _fit_only(m) for m in json.loads(earlier.result or "{}").get("mrs", []) if m["kind"] == "changes")
             if earlier.outcome in FINAL and not fit_only and then.get("rules", 1) == RULES and (
-                    {(m["repo"], m["sha"], m["target"]) for m in then.get("mrs", [])},
+                    {(m["repo"], m["sha"], m["target"], m.get("target_sha")) for m in then.get("mrs", [])},
                     then.get("ticket", {}).get("context"), then.get("mr_comments")) == reviewed:
                 self._refuse(row, task, "already_reviewed", f"these commits were already reviewed (see the review "
                                                             f"{earlier.id} above); nothing changed since, so it "
@@ -1091,9 +1110,10 @@ class ReviewAgent:
 
     def _publish(self, row: ReviewRequest) -> None:
         task = self.store.task(row.task_id)
-        if row.result:
-            result = json.loads(row.result)
-        else:
+        result = json.loads(row.result) if row.result else None
+        if result is None or result.get("rules") != RULES:
+            # Decided by an older runner (a publication cut off by the upgrade): decided again by today's rules before
+            # anything is approved or posted.
             result = self._decide(row, task)
             if result is None:
                 return  # CI is still running on the reviewed commit: decided on a later tick
@@ -1158,7 +1178,7 @@ class ReviewAgent:
             items += [f"To fit the project: {self._finding(f)} Remove it or bring it in line with what it names; add "
                       "nothing. If a person on the ticket or the merge request decided it this way, keep it and say "
                       "so in your result." for f in v.get("findings", [])
-                      if f.get("severity") == "fit" and _fit_key(f) not in sent]
+                      if f.get("severity") == "fit" and _fit_key(mr["repo"], f) not in sent]
             items += [f"Note: {r}." for r in mr["reasons"]]
             if v.get("verdict") == "unsure" and v.get("unsure_because"):
                 items.append(f"Left open for people, not for you to decide in code: {v['unsure_because']} Keep the "
@@ -1265,10 +1285,12 @@ class ReviewAgent:
             unseen = UNSEEN + (f" ({v['ui_checked']})" if v["ui_checked"] else "") \
                 if v is not None and v["ui"] == "not_run" and not v.get("doubts") else ""
             if v is not None:
-                # A finding of fit points at a file the change touches, or it is the reviewer's idea about other code.
-                v = {**v, "findings": [f if f["severity"] != "fit" or _in_change(f, m)
+                # A finding of fit goes to the author only when the runner finds what it stands on: a line the change
+                # touches, and the rule, the existing code or the entry of `scope` it names. Otherwise it is the
+                # reviewer's idea, and a suggestion.
+                v = {**v, "findings": [f if f["severity"] != "fit" or self._fit_holds(task, m, v, f)
                                        else {**f, "severity": "suggestion"} for f in v["findings"]]}
-            fits = [f for f in v["findings"] if f["severity"] == "fit"] if v is not None else []
+            fits = [(m["repo"], f) for f in v["findings"] if f["severity"] == "fit"] if v is not None else []
             build = "passed" if "build" in in_ci else v and v["build"]
             tests = "passed" if "tests" in in_ci else v and v["tests"]
             # What the repository's rules do not ask for stops nothing when it was not run; seen failing, it still does.
@@ -1365,7 +1387,7 @@ class ReviewAgent:
                 "kind": kind, "approve": kind == "ready" and not reasons and self.enabled, "reasons": reasons,
                 "stale": bool(changed) and kind != "closed",
                 "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci, "not_needed": not_needed})
-        return {"off": not self.enabled, "mrs": mrs, "summary": verdict.get("summary") or "",
+        return {"off": not self.enabled, "rules": RULES, "mrs": mrs, "summary": verdict.get("summary") or "",
                 "problems": verdict.get("problems") or [], "stale": changed or ""}
 
     def _fit_goes_back(self, task: Task, snap: dict | None = None, fits: list[dict] | None = None) -> bool:
@@ -1381,7 +1403,34 @@ class ReviewAgent:
         if self._ticket_problem(task, snap):
             return False
         sent = self._sent_fits(task, snap)
-        return any(_fit_key(f) not in sent for f in fits or [])
+        return any(_fit_key(repo, f) not in sent for repo, f in fits or [])
+
+    def _fit_holds(self, task: Task, mr: dict, v: dict, f: dict) -> bool:
+        """Whether a finding of fit stands on what it names, checked in the code: the place in the change, then by its
+        basis the rule quoted from the project's notes or from a file of the target branch (not the change's own),
+        the line of existing code, or the entry of `scope` that nobody asked for."""
+        if not _in_change(f, mr):
+            return False
+        path = self.cfg.paths.workspace / mr["repo"]
+        target = mr.get("target_sha") or f"origin/{mr['target']}"
+        if f["basis"] == "rule":
+            quote = _quoted(f["evidence"])
+            if not quote:
+                return False
+            try:
+                notes = " ".join(self.d.workspace.task_notes(task).split()).lower()
+            except OSError:
+                notes = ""
+            return quote.lower() in notes or self.git.has_text(path, target, quote)
+        if f["basis"] == "existing":
+            place = _PLACE.search(f["evidence"])
+            if not place:
+                return False
+            where, line = place.group(0).rsplit(":", 1)
+            return any(self.git.has_line(path, ref, where, int(line)) for ref in (mr["sha"], target))
+        if f["basis"] == "unasked":
+            return any(x["asked_by"].lower().startswith("nobody") for x in v.get("scope", []))
+        return True
 
     def _sent_fits(self, task: Task, snap: dict) -> set:
         """The findings of fit earlier reviews of the same code, read against the same ticket and comments, sent to
@@ -1392,7 +1441,7 @@ class ReviewAgent:
                 continue
             for mr in json.loads(r.result or "{}").get("mrs", []):
                 if mr["kind"] == "changes":
-                    sent |= {_fit_key(f) for f in (mr.get("verdict") or {}).get("findings", [])
+                    sent |= {_fit_key(mr["repo"], f) for f in (mr.get("verdict") or {}).get("findings", [])
                              if f.get("severity") == "fit"}
         return sent
 
@@ -1725,8 +1774,9 @@ class ReviewAgent:
             lines += [f"- Requirements of the ticket: {met}",
                       f"- Build: {ran.get('build') or v['build'].replace('_', ' ')}",
                       f"- Tests: {ran.get('tests') or TEST_WORDS.get(v['tests'], v['tests'].replace('_', ' '))}"]
-            lines.append(f"- What people see: {UI_WORDS[v['ui']]}" + (f" ({v['ui_checked']})" if v["ui_checked"]
-                                                                       and v["ui"] != "none" else ""))
+            if v.get("ui"):
+                lines.append(f"- What people see: {UI_WORDS[v['ui']]}" + (f" ({v['ui_checked']})" if v["ui_checked"]
+                                                                           and v["ui"] != "none" else ""))
             if v["checked"]:
                 lines.append(f"- What was run: {v['checked']}")
         lines += [f"- CI: {self._ci_words(mr['ci'])}", ""]

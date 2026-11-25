@@ -741,6 +741,7 @@ def test_only_the_backed_blocker_of_a_mixed_verdict_reaches_the_agent(w):
 
 
 def test_the_reviewer_is_told_not_to_add_requirements_and_to_back_each_blocker(w):
+    seed(w)
     publish(w)
     ask(w)
     [review] = reviews(w)
@@ -753,8 +754,25 @@ def test_the_reviewer_is_told_not_to_add_requirements_and_to_back_each_blocker(w
     assert "only made-up input reaches, is grounds for FAIL" in brief
 
 
+RULE = "Tooling changes go in their own merge request, never beside a feature."
+NOBODY = [{"what": "a `verify` target in the Makefile", "asked_by": "nobody"}]
+
+
+def seed(w: World, repo: str = "acme-platform") -> None:
+    """The target branch with the project's rule, a Makefile and a module of validators, as findings of fit name them."""
+    s = w.tmp / "seed" / repo
+    (s / "CLAUDE.md").write_text(f"# Rules\n\n- {RULE}\n")
+    (s / "Makefile").write_text("".join(f"target{i}:\n\techo {i}\n" for i in range(10)))
+    (s / "app").mkdir(exist_ok=True)
+    (s / "app" / "validators.py").write_text("".join(f"def validate_{i}(value):\n    return value\n\n"
+                                                    for i in range(6)))
+    git(s, "add", "-A")
+    git(s, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "rules")
+    git(s, "push", "-q", str(w.origins[repo]), "main")
+
+
 FIT = {"severity": "fit", "file": "feature.txt", "line": 1, "text": "A name check of its own",
-       "basis": "existing", "evidence": "app/validators.py:12 validate_postcode"}
+       "basis": "existing", "evidence": "app/validators.py:7 validate_2"}
 
 
 def test_the_reviewer_judges_by_the_projects_written_rules_and_looks_at_what_people_see(w):
@@ -775,6 +793,7 @@ def test_the_reviewer_judges_by_the_projects_written_rules_and_looks_at_what_peo
 def test_a_finding_of_fit_goes_back_to_the_author_though_nothing_is_broken(w):
     """The change works, but does a job its module already does another way: people send that back, so the
     author brings it in line in a fix round before anyone is asked to approve it."""
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[FIT, {"severity": "suggestion", "text": "Name it clearer"}])
@@ -783,7 +802,7 @@ def test_a_finding_of_fit_goes_back_to_the_author_though_nothing_is_broken(w):
     assert "changes are needed" in note and "What has to change:" not in note
     assert ("To bring in line with the project (nothing is broken; once the fix rounds are used up this no longer "
             "holds up the merge):\n- `feature.txt:1`: A name check of its own (already done by: "
-            "app/validators.py:12 validate_postcode)") in note
+            "app/validators.py:7 validate_2)") in note
     assert "Sent to the agent to fix (round 1 of 3)" in note and approve_calls(w) == []
     later(w)
     [send] = sends(w)
@@ -794,6 +813,7 @@ def test_a_finding_of_fit_goes_back_to_the_author_though_nothing_is_broken(w):
 
 
 def test_a_finding_of_fit_that_names_nothing_it_stands_on_is_a_suggestion(w):
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[{**FIT, "basis": "taste"}, {**FIT, "text": "No evidence", "evidence": " "}])
@@ -829,21 +849,24 @@ def test_a_finding_of_fit_without_the_evidence_its_basis_needs_sends_nothing(w, 
 
 
 def test_a_rule_quoted_with_its_file_is_a_finding_of_fit(w):
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[{**FIT, "basis": "rule", "text": "A make target nobody asked for",
-                                "evidence": 'CLAUDE.md: "Tooling changes go in their own merge request."'}])
+                                "evidence": f'CLAUDE.md: "{RULE}"'}])
     finish(w)
     later(w)
     [send] = sends(w)
-    assert "the project's rule: CLAUDE.md: \"Tooling changes go in their own merge request.\"" in send["argv"][-1]
+    assert f"the project's rule: CLAUDE.md: \"{RULE}\"" in send["argv"][-1]
 
 
 def test_a_finding_of_fit_still_reaches_the_author_while_what_people_see_waits_for_a_person(w):
     """The screens could not be looked at, so nothing is approved; the Makefile nobody asked for still goes back."""
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, ui="not_run", ui_checked="no browser here",
+                  scope=NOBODY,
                   findings=[{**FIT, "basis": "unasked", "evidence": "the `verify` target the ticket does not ask for"}])
     finish(w)
     [note] = review_notes(w)
@@ -856,6 +879,7 @@ def test_a_finding_of_fit_still_reaches_the_author_while_what_people_see_waits_f
 def test_findings_of_fit_go_back_again_for_the_same_commits_once_people_said_more(w):
     """The author kept a finding of fit and pushed nothing. Asked again for the same code, the review does not send
     the same thing twice; once a person has commented since, what it finds goes back again."""
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[FIT])
@@ -874,7 +898,7 @@ def test_findings_of_fit_go_back_again_for_the_same_commits_once_people_said_mor
     w.gl.note(1, "o.lead", "The scope is only the login form: no build tooling in this MR.")
     w.tick()
     ask(w)
-    write_verdict(w, rid="ACME-1.review-3", findings=[{**FIT, "basis": "unasked", "text": "The Makefile target",
+    write_verdict(w, rid="ACME-1.review-3", scope=NOBODY, findings=[{**FIT, "basis": "unasked", "text": "The Makefile target",
                                                      "evidence": "the `verify` target o.lead ruled out"}])
     finish(w, rid="ACME-1.review-3")
     assert "changes are needed" in review_notes(w)[-1]
@@ -883,9 +907,10 @@ def test_findings_of_fit_go_back_again_for_the_same_commits_once_people_said_mor
 
 
 def test_existing_code_in_a_file_without_an_extension_backs_a_finding_of_fit(w):
+    seed(w)
     publish(w)
     ask(w)
-    write_verdict(w, findings=[{**FIT, "evidence": "Makefile:12 check-backend already runs the same gate"}])
+    write_verdict(w, findings=[{**FIT, "evidence": "Makefile:12 target5 already runs the same gate"}])
     finish(w)
     later(w)
     assert len(sends(w)) == 1
@@ -895,6 +920,7 @@ def test_existing_code_in_a_file_without_an_extension_backs_a_finding_of_fit(w):
 def test_a_finding_of_fit_goes_back_beside_a_question_for_people_and_nothing_is_approved(w, fits, sent):
     """Unsure about a product question, and a Makefile target nobody asked for: the question stays with people, the
     target goes to the author. Without the finding nothing goes."""
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, verdict="unsure", unsure_because="whether existing rows should start ON", findings=fits)
@@ -912,6 +938,7 @@ def test_a_finding_of_fit_goes_back_beside_a_question_for_people_and_nothing_is_
 def test_only_a_finding_of_fit_already_sent_for_the_same_code_is_held_back(w):
     """The author kept the first finding and pushed nothing. Asked again for the same code, the review finds it once
     more and a second one: the second goes to the author, the first is not sent twice."""
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[FIT])
@@ -931,8 +958,139 @@ def test_only_a_finding_of_fit_already_sent_for_the_same_code_is_held_back(w):
     assert len(sends(w)) == 2 and "The name is checked twice" in text and "A name check of its own" not in text
 
 
+@pytest.mark.parametrize("finding", [
+    {**FIT, "basis": "rule", "evidence": "CLAUDE.md:9 it's different"},                     # no rule quoted
+    {**FIT, "basis": "rule", "evidence": 'CLAUDE.md: "Every helper lives in app/helpers.py, always."'},  # not there
+    {**FIT, "evidence": "Makefile:0 target0"},                                              # no such line
+    {**FIT, "evidence": "Makefile:99 target0"},                                             # past the file's end
+    {**FIT, "evidence": "app/helpers.py:3 build_name"},                                     # no such file
+    {**FIT, "basis": "unasked", "evidence": "`verify`"},                                    # names, does not say
+])
+def test_a_finding_of_fit_the_code_does_not_bear_out_sends_nothing(w, finding):
+    seed(w)
+    publish(w)
+    ask(w)
+    write_verdict(w, scope=NOBODY, findings=[finding])
+    finish(w)
+    later(w)
+    assert sends(w) == [] and "Suggestions (not blocking):" in review_notes(w)[0]
+
+
+def test_a_finding_of_unasked_work_needs_an_entry_of_scope_nobody_asked_for(w):
+    seed(w)
+    publish(w)
+    ask(w)
+    write_verdict(w, scope=[{"what": "a `verify` target", "asked_by": "o.lead 11-20: keep the verify target"}],
+                  findings=[{**FIT, "basis": "unasked", "evidence": "the `verify` target the ticket does not ask for"}])
+    finish(w)
+    later(w)
+    assert sends(w) == []
+
+
+def test_a_rule_the_merge_request_writes_itself_is_not_one_to_judge_it_by(w, monkeypatch):
+    """The change adds a rule to a nested CLAUDE.md and the reviewer quotes it: the target branch does not have it,
+    so nothing goes back. The rule the target branch has, quoted, goes back once."""
+    def commits(name="feature.txt"):
+        (w.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (w.repo / name).write_text("- Every module ships its own tests folder.\n" if name.endswith("CLAUDE.md")
+                                   else "work\n")
+        git(w.repo, "add", name)
+        git(w.repo, "commit", "-q", "-m", f"add {name}")
+        return git(w.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(w, "agent_commits", commits)
+    seed(w)
+    publish(w, "app/CLAUDE.md", "feature.txt")
+    ask(w)
+    wrote = {**FIT, "basis": "rule", "evidence": 'app/CLAUDE.md: "Every module ships its own tests folder."'}
+    write_verdict(w, findings=[wrote])
+    finish(w)
+    later(w)
+    assert sends(w) == []
+    w.gl.note(1, "o.lead", "Please look again.")
+    w.tick()
+    ask(w)
+    write_verdict(w, rid="ACME-1.review-2", findings=[{**FIT, "basis": "rule", "evidence": f'CLAUDE.md: "{RULE}"'}])
+    finish(w, rid="ACME-1.review-2")
+    later(w)
+    assert len(sends(w)) == 1
+
+
+@pytest.mark.parametrize("scope, findings, sent", [
+    (NOBODY, [{**FIT, "file": "Makefile", "basis": "unasked", "text": "A `verify` target nobody asked for",
+               "evidence": "the `verify` target the ticket does not ask for"}], 1),
+    ([{"what": "a `verify` target", "asked_by": "o.lead 11-20: keep the verify target"}], [], 0),
+])
+def test_a_makefile_target_nobody_asked_for_goes_back_once_and_an_agreed_one_does_not(w, scope, findings, sent):
+    """The same green CI, the same change to the Makefile: ruled out, it goes to the author once; agreed, nothing goes.
+    What people see was not looked at, so neither is approved."""
+    seed(w)
+    publish(w, "Makefile")
+    ask(w)
+    write_verdict(w, ui="not_run", ui_checked="no browser here", scope=scope, findings=findings)
+    finish(w)
+    later(w)
+    later(w)
+    assert len(sends(w)) == sent and approve_calls(w) == []
+
+
+def test_two_findings_of_fit_in_one_file_are_two_findings(w, monkeypatch):
+    """The author kept the one on line 4. Asked again for the same code, the one on line 40 still goes, and the one on
+    line 4, worded anew, does not."""
+    def commits(name="feature.txt"):
+        (w.repo / name).write_text("".join(f"line {i}\n" for i in range(1, 61)))
+        git(w.repo, "add", name)
+        git(w.repo, "commit", "-q", "-m", f"add {name}")
+        return git(w.repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(w, "agent_commits", commits)
+    seed(w)
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[{**FIT, "line": 4}])
+    finish(w)
+    later(w)
+    assert len(sends(w)) == 1
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Kept: a person decided so"})
+    w.tick()
+    w.tick()
+    ask(w)
+    write_verdict(w, rid="ACME-1.review-2", findings=[{**FIT, "line": 4, "text": "Worded anew"},
+                                                     {**FIT, "line": 40, "text": "Another one"}])
+    finish(w, rid="ACME-1.review-2")
+    later(w)
+    text = sends(w)[1]["argv"][-1]
+    assert len(sends(w)) == 2 and "Another one" in text and "Worded anew" not in text
+
+
+def test_a_result_an_older_runner_decided_is_decided_again_before_anything_is_approved(w, monkeypatch):
+    """The upgrade cut a publication off: the stored result has no rules version and its verdict no `ui`. It is
+    decided again by today's rules, so it is not approved, and its note is posted without an error."""
+    from arceus_runner.code_review import ReviewAgent
+    publish(w)
+    ask(w)
+    write_verdict(w)
+    real = ReviewAgent._act
+    monkeypatch.setattr(ReviewAgent, "_act", lambda *a, **k: (_ for _ in ()).throw(ServiceError("GitLab", "cut off")))
+    finish(w)
+    row = w.store.review(RID)
+    assert row.state == "publishing"
+    old = json.loads(row.result)
+    old.pop("rules")
+    for mr in old["mrs"]:
+        mr["verdict"].pop("ui")
+    verdict = json.loads(row.verdict)
+    for v in verdict["mrs"].values():
+        v.pop("ui")
+    w.store.update_review(RID, result=json.dumps(old), verdict=json.dumps(verdict))
+    monkeypatch.setattr(ReviewAgent, "_act", real)
+    w.tick()
+    [note] = review_notes(w)
+    assert approve_calls(w) == [] and "could not be confirmed" in note
+    assert "did not say whether it changes what people see" in note
+
+
 def test_findings_of_fit_no_longer_hold_up_the_merge_once_the_fix_rounds_are_used_up(tmp_path):
     w = world(tmp_path, fix_rounds=1)
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[FIT])
@@ -956,6 +1114,7 @@ def test_findings_of_fit_no_longer_hold_up_the_merge_once_the_fix_rounds_are_use
 
 def test_with_no_fix_rounds_a_finding_of_fit_is_a_note_and_the_merge_request_is_approved(tmp_path):
     w = world(tmp_path, fix_rounds=0)
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[FIT])
@@ -968,6 +1127,7 @@ def test_with_no_fix_rounds_a_finding_of_fit_is_a_note_and_the_merge_request_is_
 
 
 def test_a_merge_over_findings_of_fit_alone_is_not_reported(w):
+    seed(w)
     publish(w)
     ask(w)
     write_verdict(w, findings=[FIT])
@@ -2184,6 +2344,7 @@ def _blocked_people_mr(w: World) -> tuple[str, str, str]:
 
 
 def test_findings_of_fit_on_a_merge_request_people_wrote_are_notes_for_its_author(w):
+    seed(w)
     url, sha = people_mr(w)
     db_id = people_ticket(w, url)
     w.yt.comment(db_id, "j.doe", "/review")

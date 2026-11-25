@@ -63,6 +63,19 @@ def base_env() -> dict[str, str]:
 HOME_BRANCH = "main"
 
 
+def _diff_path(text: str, prefix: str) -> str | None:
+    """A path from a `---`/`+++` line of `git diff`: None for /dev/null; quoted names unquoted; the tab git adds after
+    a name with a space dropped."""
+    if text.endswith("\t"):
+        text = text[:-1]
+    if text == "/dev/null":
+        return None
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1").decode(
+            "utf-8", "replace")
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
 class Git:
     def __init__(self, auth: GitAuth | None, author_name: str, author_email: str):
         self.auth = auth
@@ -300,20 +313,41 @@ class Git:
         return [f for f in out.split("\0") if f]
 
     def changed_lines(self, repo: Path, default: str, sha: str) -> dict[str, list[list[int]]]:
-        """Per file `sha` changes compared with where it left `default`, the line ranges of the new version it adds
-        or changes ([first, last]; a deletion counts as the line where it happened)."""
-        out = self._run(["diff", "-U0", "--no-color", "--no-ext-diff", f"{default}...{sha}"], repo).stdout
+        """Per file `sha` changes compared with where it left `default`, the line ranges ([first, last]) it adds or
+        changes in the new version; a file it deletes, the lines it had. A deletion inside a file counts as the line
+        where it happened. Paths are spelled as `changed_files` gives them."""
+        out = self._run(["-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames",
+                         f"{default}...{sha}"], repo).stdout
         lines: dict[str, list[list[int]]] = {}
-        current = None
+        old = new = None
         for row in out.splitlines():
-            if row.startswith("+++ "):
-                current = row[6:] if row.startswith("+++ b/") else None
-            elif row.startswith("@@") and current is not None:
-                m = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", row)
-                if m:
-                    start, count = int(m.group(1)), int(m.group(2) or 1)
-                    lines.setdefault(current, []).append([max(start, 1), max(start + count - 1, start, 1)])
+            if row.startswith("--- "):
+                old = _diff_path(row[4:], "a/")
+            elif row.startswith("+++ "):
+                new = _diff_path(row[4:], "b/")
+            elif row.startswith("@@") and (new or old):
+                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", row)
+                if not m:
+                    continue
+                if new is None:  # the file is deleted: the lines it had
+                    start, count, path = int(m.group(1)), int(m.group(2) or 1), old
+                else:
+                    start, count, path = int(m.group(3)), int(m.group(4) or 1), new
+                lines.setdefault(path, []).append([max(start, 1), max(start + count - 1, start, 1)])
         return lines
+
+    def ref_sha(self, repo: Path, ref: str) -> str | None:
+        res = self._run(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo, check=False)
+        return res.stdout.strip() or None
+
+    def has_text(self, repo: Path, ref: str, text: str) -> bool:
+        """Whether some file of `ref` holds `text` (on one line, case ignored)."""
+        return self._run(["grep", "-F", "-i", "-q", "-e", text, ref, "--"], repo, check=False).returncode == 0
+
+    def has_line(self, repo: Path, ref: str, path: str, line: int) -> bool:
+        """Whether `path` exists at `ref` and has at least `line` lines."""
+        res = self._run(["cat-file", "-p", f"{ref}:{path}"], repo, check=False)
+        return res.returncode == 0 and 1 <= line <= len(res.stdout.splitlines())
 
     def commit_before(self, repo: Path, ref: str, when: str) -> str | None:
         """The newest commit of `ref` made before `when` (ISO time, by commit date); None when it has none that old."""
