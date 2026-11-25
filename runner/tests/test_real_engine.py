@@ -241,7 +241,7 @@ def test_a_code_review_runs_as_its_own_engine_task(tmp_path):
         verdict = w.cfg.paths.workspace / ".arceus" / "reviews" / "ACME-1" / f"{rid}.json"
         verdict.write_text(json.dumps({"summary": "Fine.", "mrs": [{
             "mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "none",
-            "checked": "nothing to build", "findings": [], "attention": []}]}))
+            "checked": "nothing to build", "ui": "none", "findings": [], "attention": []}]}))
         settle(w, rid, "passed", {"schema": 1, "result": "succeeded_research", "summary": "Fine.", "task_id": rid})
         deadline = time.time() + 30
         while w.store.review(rid).state != "done" and time.time() < deadline:

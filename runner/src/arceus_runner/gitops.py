@@ -10,6 +10,7 @@ never in a URL, on a command line or in a repository's .git/config.
 
 from __future__ import annotations
 
+import re
 import base64
 import os
 import shutil
@@ -297,6 +298,22 @@ class Git:
         """The files `sha` changes compared with where it left `default`, as a merge request shows them."""
         out = self._run(["diff", "--name-only", "-z", f"{default}...{sha}"], repo).stdout
         return [f for f in out.split("\0") if f]
+
+    def changed_lines(self, repo: Path, default: str, sha: str) -> dict[str, list[list[int]]]:
+        """Per file `sha` changes compared with where it left `default`, the line ranges of the new version it adds
+        or changes ([first, last]; a deletion counts as the line where it happened)."""
+        out = self._run(["diff", "-U0", "--no-color", "--no-ext-diff", f"{default}...{sha}"], repo).stdout
+        lines: dict[str, list[list[int]]] = {}
+        current = None
+        for row in out.splitlines():
+            if row.startswith("+++ "):
+                current = row[6:] if row.startswith("+++ b/") else None
+            elif row.startswith("@@") and current is not None:
+                m = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", row)
+                if m:
+                    start, count = int(m.group(1)), int(m.group(2) or 1)
+                    lines.setdefault(current, []).append([max(start, 1), max(start + count - 1, start, 1)])
+        return lines
 
     def commit_before(self, repo: Path, ref: str, when: str) -> str | None:
         """The newest commit of `ref` made before `when` (ISO time, by commit date); None when it has none that old."""

@@ -31,7 +31,8 @@ people wrote:
   crash at any point resumes from the stored state.
 - **The runner decides, the model advises.** An MR is approved only when the reviewer found it ready
   (requirements met, build passed, tests passed or fail only as they did on the target branch without the
-  change, no blocker), the code host's CI passed on the reviewed
+  change, no blocker, what people see looked at or unchanged, and no finding of fit while the ticket has fix
+  rounds left), the code host's CI passed on the reviewed
   commit (`require_green_ci`), the MR still points at that commit and the same target, the ticket is
   still in Code Review with the text the review read, and the feature is still on. The approver account
   then approves exactly that commit, and the MR gets a note that the review found nothing that has to
@@ -96,11 +97,16 @@ that verdict in words. The review changed no code. Judge the report by these poi
    tests run and passing; a requirement not met, a failing test or a defect found rules it out. A verdict that the
    code or the reviewer's logs contradict is grounds for FAIL.
 2. Every claim that something was run, passed or failed names the command and what it showed, or the file and line.
-   A check that could not be run is said to be so, never called passed.
+   A check that could not be run is said to be so, never called passed. What people see counts as looked at only
+   when the report names the suites or the screens and states it looked at; otherwise it was not looked at.
 3. A finding points to the place in the code it is about and says what is wrong there. A blocker also names the
    requirement or the working behaviour it breaks and how ordinary use reaches it; one that asks for more than the
-   ticket and the people's comments do, or that only made-up input reaches, is grounds for FAIL. A suggestion is not
-   grounds for FAIL.
+   ticket and the people's comments do, or that only made-up input reaches, is grounds for FAIL. A "fit" finding
+   names what it stands on: a rule quoted from the project's notes or a repository's CLAUDE.md or AGENTS.md, the
+   existing code that already does the same job, the code in the change that does nothing or goes the long way
+   round, or the change no line of the ticket or the people's comments asks for. It asks to remove the change or
+   bring it in line with what is there, never to add to it; one that stands on nothing it names, or that asks for
+   more than the ticket, is grounds for FAIL. A suggestion is not grounds for FAIL.
 4. The report claims no more than the checks show, and the numbers it gives agree with what it lists.
 5. Data and state the checks made in throwaway places (a test database, a temporary file, a container started for
    the tests) are expected: naming where they ran is enough. Counting the records or tables they made, recovering
@@ -131,6 +137,17 @@ MAX_FILE_BYTES = 512 * 1024
 MAX_TEXT = 3000
 MAX_ITEMS = 30
 VERDICTS = ("ready", "changes", "unsure")
+# Whether the reviewer looked at what people see: "none" when the change alters nothing a person sees or operates.
+UI = ("checked", "not_run", "none")
+# What a "fit" finding stands on, so that it is the project's way and not the reviewer's taste: a rule written in the
+# project's notes or a repository's CLAUDE.md / AGENTS.md, existing code that already does the same job, code in the
+# change that does nothing or goes the long way round, a change nobody asked for.
+FIT_BASES = ("rule", "existing", "needless", "unasked")
+UNSEEN = "it changes what people see, and the reviewer could not look at it"
+NO_UI = "the reviewer did not say whether it changes what people see and whether it looked"
+FIT_WORDS = {"rule": "the project's rule", "existing": "already done by", "needless": "plainly",
+             "unasked": "asked for by nobody"}
+UI_WORDS = {"checked": "looked at", "not_run": "not looked at", "none": "nothing changed"}
 TEST_WORDS = {"none": "none in the repository",
               "failed_before": "some fail, the same ones as on the target branch without this change, so not because "
                                "of it (see what was run)"}
@@ -139,8 +156,9 @@ BUILD = ("passed", "failed", "not_run")
 TESTS = ("passed", "failed", "failed_before", "not_run", "none")
 # How the runner judges a verdict. A final review stands for its commits only under the rules it was judged by: after
 # a change of them (2: tests that failed before the change no longer stop it; 3: each repository's build and tests are
-# judged by its own review_agent.repos), the same commits may be reviewed again.
-RULES = 4
+# judged by its own review_agent.repos; 5: a change people see is not approved unseen, and "fit" findings go back to
+# the author), the same commits may be reviewed again.
+RULES = 5
 _MARKER = re.compile(r"<!--\s*arceus", re.IGNORECASE)
 _TRACKER_MARK = re.compile(r"\s*\[arceus:[^\]]*\]\s*$")
 _WORD = re.compile(r"[\w-]")
@@ -151,9 +169,12 @@ _MR_LINK = re.compile(r"https?://[^\s<>()\[\]{}\"'`|]+?/(?:merge_requests|pull|p
 SCHEMA_EXAMPLE = """\
 {"summary": "Two or three sentences for the ticket.",
  "mrs": [{"mr": "M1", "verdict": "ready", "requirements_met": true, "build": "passed", "tests": "passed",
-          "checked": "make verify: 132 tests passed",
+          "checked": "make verify: 132 tests passed", "ui": "checked", "ui_checked": "…",
+          "scope": [{"what": "…", "asked_by": "AC2: …"}, {"what": "…", "existing": "app/validators.py:12"}],
           "findings": [{"severity": "blocker", "file": "app/login.py", "line": 40, "text": "…",
                         "breaks": "…", "reached_by": "…"},
+                       {"severity": "fit", "file": "app/forms.py", "line": 30, "text": "…",
+                        "basis": "existing", "evidence": "app/validators.py:12 validate_postcode"},
                        {"severity": "suggestion", "file": "app/forms.py", "line": 12, "text": "…"}],
           "attention": [{"file": "app/accounts.py", "why": "…"}],
           "deploy": [{"file": "Dockerfile", "what": "…"}]}]}"""
@@ -288,11 +309,20 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             # A blocker counts only with what it breaks and how ordinary use reaches it. Without both, or with an
             # unknown severity, it is "unsupported": not a pass, and not a fix for the agent either.
             breaks, reached_by = _clean(f.get("breaks"), 800), _clean(f.get("reached_by"), 800)
-            if f.get("severity") == "suggestion":
+            # A "fit" finding goes to the author only with what it stands on; without it, it is the reviewer's taste
+            # and reads as a suggestion.
+            basis = f.get("basis") if f.get("basis") in FIT_BASES else ""
+            evidence = _clean(f.get("evidence"), 800) if basis else ""
+            at = f.get("line")
+            fit = f.get("severity") == "fit" and bool(_clean(f.get("file"), 300)) and _backed(basis, evidence) \
+                and isinstance(at, int) and not isinstance(at, bool) and at > 0
+            if f.get("severity") == "suggestion" or f.get("severity") == "fit" and not fit:
                 severity = "suggestion"
                 suggestions += 1
                 if suggestions > max_suggestions:
                     continue
+            elif fit:
+                severity = "fit"
             elif f.get("severity") == "blocker" and breaks and reached_by:
                 severity = "blocker"
             else:
@@ -300,7 +330,8 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             line = f.get("line") if isinstance(f.get("line"), int) and not isinstance(f.get("line"), bool) else None
             findings.append({"severity": severity, "text": _clean(f.get("text"), 1500),
                              "file": _clean(f.get("file"), 300), "line": line,
-                             "breaks": breaks, "reached_by": reached_by})
+                             "breaks": breaks, "reached_by": reached_by} |
+                            ({"basis": basis, "evidence": evidence} if severity == "fit" else {}))
         attention = []
         for a in e.get("attention") if isinstance(e.get("attention"), list) else []:
             if not isinstance(a, dict) or not (_clean(a.get("file")) or _clean(a.get("why"))):
@@ -315,6 +346,11 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
                 continue
             deploy.append({"file": _clean(a.get("file"), 300), "what": what})
         met = e.get("requirements_met")
+        ui = e.get("ui") if e.get("ui") in UI else None
+        if ui is None:
+            doubts.append(NO_UI)
+        elif ui == "checked" and not _clean(e.get("ui_checked")):
+            doubts.append("the reviewer says it looked at what people see, but not at what")
         out[label] = {
             "verdict": e.get("verdict") if e.get("verdict") in VERDICTS else "unsure",
             "requirements_met": met if isinstance(met, bool) else None,
@@ -323,12 +359,57 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             # The commands and what they showed: a careful review lists many, and a note has room for them.
             "checked": _clean(e.get("checked")),
             "unsure_because": _clean(e.get("unsure_because"), 800),
+            "ui": ui or "not_run",
+            "ui_checked": _clean(e.get("ui_checked"), 1500),
             "findings": findings[:MAX_ITEMS],
             "attention": attention[:MAX_ITEMS],
             "deploy": deploy[:MAX_ITEMS],
             "doubts": list(dict.fromkeys(doubts)),
         }
     return out, _clean(data.get("summary")), problems
+
+
+def _in_change(f: dict, mr: dict, near: int = 3) -> bool:
+    """Whether a finding points at a line the change adds or changes (or a few lines from it), in a file it touches.
+    A review read before the changed lines were kept is judged by the file alone."""
+    if f["file"] not in mr["files"]:
+        return False
+    if "lines" not in mr:
+        return True
+    return f["line"] is not None and any(a - near <= f["line"] <= b + near for a, b in mr["lines"].get(f["file"], []))
+
+
+def _fit_key(f: dict) -> tuple:
+    return f.get("file"), f.get("basis"), f.get("evidence")
+
+
+def _judged(snap: dict) -> tuple:
+    """What a review judged: the commits, and the ticket and people's comments it read them against."""
+    return ({(m["repo"], m["sha"]) for m in snap.get("mrs", [])}, snap.get("ticket", {}).get("context"),
+            snap.get("mr_comments"))
+
+
+_PLACE = re.compile(r"[\w./-]*\w:\d+")
+_QUOTE = re.compile(r"[\"“”'`«»]")
+# Something in the code named: a `quoted` name, a path, a call, a snake_case or dotted name.
+_CODE = re.compile(r"`[^`]+`|[\w-]+/[\w./-]+|\w+\(|\b\w+_\w+\b|\b\w+\.\w+\b")
+
+
+def _backed(basis: str, evidence: str) -> bool:
+    """Whether a finding of fit's evidence has the shape its basis needs: a rule quoted with the file it is in, the
+    place of the existing code, or the plain form or the change beyond the ticket in words."""
+    if basis == "rule":
+        return bool(_QUOTE.search(evidence)) and bool(re.search(r"[\w-]+\.(md|txt|rst|toml|ya?ml|cfg)\b|/", evidence))
+    if basis == "existing":
+        return bool(_PLACE.search(evidence))
+    return bool(_CODE.search(evidence))
+
+
+def _fit_only(mr: dict) -> bool:
+    """A call for changes made only of findings of fit: nothing is broken, nothing failed."""
+    v = mr.get("verdict") or {}
+    return "failed" not in (v.get("build"), v.get("tests")) \
+        and not any(f.get("severity") == "blocker" for f in v.get("findings", []))
 
 
 def _said(mr_comments: list[tuple[str, Note]]) -> str:
@@ -764,6 +845,7 @@ class ReviewAgent:
             mrs.append({"label": f"M{i}", "repo": m.repo, "project_id": m.project_id, "iid": m.iid, "url": m.url,
                         "sha": sha, "target": target, "source": source,
                         "files": self.git.changed_files(path, f"origin/{target}", sha),
+                        "lines": self.git.changed_lines(path, f"origin/{target}", sha),
                         "prev": current if current != branch else None, "prev_head": self.git.head(path)})
         home = ws
         if (home / ".git").exists() and self.git.current_branch(home) != branch and not self.git.is_clean(home):
@@ -778,7 +860,11 @@ class ReviewAgent:
         reviewed = ({(m["repo"], m["sha"], m["target"]) for m in mrs}, context, said)
         for earlier in self.store.reviews("done", task_id=task.task_id):
             then = json.loads(earlier.snapshot)
-            if earlier.outcome in FINAL and then.get("rules", 1) == RULES and (
+            # Findings of fit alone stand only while they can still go back: asked again for the same commits, the
+            # review is run again and judges them by where the fix rounds are now.
+            fit_only = earlier.outcome == "changes" and all(
+                _fit_only(m) for m in json.loads(earlier.result or "{}").get("mrs", []) if m["kind"] == "changes")
+            if earlier.outcome in FINAL and not fit_only and then.get("rules", 1) == RULES and (
                     {(m["repo"], m["sha"], m["target"]) for m in then.get("mrs", [])},
                     then.get("ticket", {}).get("context"), then.get("mr_comments")) == reviewed:
                 self._refuse(row, task, "already_reviewed", f"these commits were already reviewed (see the review "
@@ -1059,6 +1145,7 @@ class ReviewAgent:
                              of=self.rc.fix_rounds)
 
     def _fix_text(self, row: ReviewRequest, result: dict) -> str:
+        sent = self._sent_fits(self.store.task(row.task_id), json.loads(row.snapshot))
         parts = []
         for mr in result["mrs"]:
             if mr["kind"] != "changes":
@@ -1068,6 +1155,10 @@ class ReviewAgent:
             for what in ("build", "tests"):
                 if v.get(what) == "failed":
                     items.append(f"The {what} failed when the reviewer ran them.")
+            items += [f"To fit the project: {self._finding(f)} Remove it or bring it in line with what it names; add "
+                      "nothing. If a person on the ticket or the merge request decided it this way, keep it and say "
+                      "so in your result." for f in v.get("findings", [])
+                      if f.get("severity") == "fit" and _fit_key(f) not in sent]
             items += [f"Note: {r}." for r in mr["reasons"]]
             if v.get("verdict") == "unsure" and v.get("unsure_because"):
                 items.append(f"Left open for people, not for you to decide in code: {v['unsure_because']} Keep the "
@@ -1154,6 +1245,9 @@ class ReviewAgent:
         for m in snap["mrs"]:
             st = self.host.mr_status(m["project_id"], m["iid"])
             v = found.get(m["label"])
+            if v is not None and "ui" not in v:
+                # Read before the review had to say whether it looked at what people see: not a pass.
+                v = {**v, "ui": "not_run", "ui_checked": "", "doubts": [*v.get("doubts", []), NO_UI]}
             risky = self._always_attention(m["files"])
             reasons: list[str] = []
             checks = self.rc.checks(m["repo"])
@@ -1168,6 +1262,13 @@ class ReviewAgent:
                         return None  # those jobs are still running on the reviewed commit: decided on a later tick
                     if jobs:
                         in_ci[what] = jobs
+            unseen = UNSEEN + (f" ({v['ui_checked']})" if v["ui_checked"] else "") \
+                if v is not None and v["ui"] == "not_run" and not v.get("doubts") else ""
+            if v is not None:
+                # A finding of fit points at a file the change touches, or it is the reviewer's idea about other code.
+                v = {**v, "findings": [f if f["severity"] != "fit" or _in_change(f, m)
+                                       else {**f, "severity": "suggestion"} for f in v["findings"]]}
+            fits = [f for f in v["findings"] if f["severity"] == "fit"] if v is not None else []
             build = "passed" if "build" in in_ci else v and v["build"]
             tests = "passed" if "tests" in in_ci else v and v["tests"]
             # What the repository's rules do not ask for stops nothing when it was not run; seen failing, it still does.
@@ -1212,10 +1313,31 @@ class ReviewAgent:
                     reasons.append(self._not_run("build", checks.ci_build_jobs))
                 if not tests_ok:
                     reasons.append(self._not_run("tests", checks.ci_test_jobs))
+                if unseen:
+                    reasons.append(unseen)
+                if fits and not unbacked and build_ok and tests_ok and not v.get("doubts") \
+                        and v["requirements_met"] is not None and self._fit_goes_back(task, snap, fits):
+                    # The open question stays with people and nothing is approved, but what does not fit the
+                    # project is not theirs to decide: it goes to the author now, the question marked as theirs.
+                    kind = "changes"
+                    reasons = [r for r in reasons if r != v["unsure_because"]]
             elif v.get("doubts"):
                 # A verdict the runner could not read whole is not a pass.
                 kind = "unverified"
                 reasons += v.get("doubts", [])
+            elif fits and self._fit_goes_back(task, snap, fits):
+                # Nothing is broken, but the change does not fit the project (a rule it breaks, a job the code
+                # already does another way, code that does nothing, work nobody asked for): the author brings it in
+                # line in a round of its own. Once the rounds are used up it no longer holds up the merge. What
+                # people see still waits for someone to look at it.
+                kind = "changes"
+                if unseen:
+                    reasons.append(unseen)
+            elif unseen:
+                # Tests and a reading of the code do not show a column squeezed off the screen or a label a screen
+                # reader no longer matches: a change people see is approved only once someone saw it.
+                kind = "unverified"
+                reasons.append(unseen)
             else:
                 kind = "ready"
             if changed and kind != "closed":
@@ -1245,6 +1367,34 @@ class ReviewAgent:
                 "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci, "not_needed": not_needed})
         return {"off": not self.enabled, "mrs": mrs, "summary": verdict.get("summary") or "",
                 "problems": verdict.get("problems") or [], "stale": changed or ""}
+
+    def _fit_goes_back(self, task: Task, snap: dict | None = None, fits: list[dict] | None = None) -> bool:
+        """Whether findings of fit alone send the change back: only to an agent waiting in Code Review, while the
+        ticket has fix rounds left, and once per set of commits: an author that kept them (a person decided so, or
+        they were wrong) is not asked again for the same code. Otherwise they are notes, and the approval goes by
+        its usual checks."""
+        if task.people_work or not self.rc.fix_rounds or task.state != "code_review" \
+                or len(self.store.signals_of_kind(task.task_id, FIX_KIND)) >= self.rc.fix_rounds:
+            return False
+        if snap is None:
+            return True
+        if self._ticket_problem(task, snap):
+            return False
+        sent = self._sent_fits(task, snap)
+        return any(_fit_key(f) not in sent for f in fits or [])
+
+    def _sent_fits(self, task: Task, snap: dict) -> set:
+        """The findings of fit earlier reviews of the same code, read against the same ticket and comments, sent to
+        the author."""
+        sent = set()
+        for r in self.store.reviews("done", task_id=task.task_id):
+            if self.store.signal(_fix_signal(r)) is None or _judged(json.loads(r.snapshot or "{}")) != _judged(snap):
+                continue
+            for mr in json.loads(r.result or "{}").get("mrs", []):
+                if mr["kind"] == "changes":
+                    sent |= {_fit_key(f) for f in (mr.get("verdict") or {}).get("findings", [])
+                             if f.get("severity") == "fit"}
+        return sent
 
     def _ci_jobs(self, st: MRStatus, m: dict, patterns: list[str]) -> list[str] | None:
         """The jobs of the reviewed commit's CI run that match `patterns`, when there is one and all of them
@@ -1491,14 +1641,16 @@ class ReviewAgent:
     def _merged_unchecked(self, row: ReviewRequest, mr: dict, project_id, iid, st: MRStatus) -> str:
         """Why the merge is not what the review let through, in words for the ticket, or "" when it is."""
         then = f"commit `{mr['sha'][:12]}`"
+        # Findings of fit alone do not hold up a merge: merged as they stood, the people decided.
+        asked = mr["kind"] == "changes" and not _fit_only(mr)
         if not st.sha:  # the host does not say what was merged: only a review that asked for changes is news
-            return f"although the code review asked for changes at {then}" if mr["kind"] == "changes" else ""
+            return f"although the code review asked for changes at {then}" if asked else ""
         moved = st.sha != mr["sha"]
         if moved:
             same = getattr(self.host, "same_change", None)
             if same is not None and same(project_id, iid, mr["sha"], st.sha) is True:
                 moved = False  # rebased: the source diff the review read is the one that was merged
-        if mr["kind"] == "changes":
+        if asked:
             if moved:
                 return (f"after the code review asked for changes at {then}; the commits pushed since (merged at "
                         f"`{st.sha[:12]}`) were never reviewed")
@@ -1573,13 +1725,18 @@ class ReviewAgent:
             lines += [f"- Requirements of the ticket: {met}",
                       f"- Build: {ran.get('build') or v['build'].replace('_', ' ')}",
                       f"- Tests: {ran.get('tests') or TEST_WORDS.get(v['tests'], v['tests'].replace('_', ' '))}"]
+            lines.append(f"- What people see: {UI_WORDS[v['ui']]}" + (f" ({v['ui_checked']})" if v["ui_checked"]
+                                                                       and v["ui"] != "none" else ""))
             if v["checked"]:
                 lines.append(f"- What was run: {v['checked']}")
         lines += [f"- CI: {self._ci_words(mr['ci'])}", ""]
         blockers = [f for f in v.get("findings", []) if f["severity"] == "blocker"]
         suggestions = [f for f in v.get("findings", []) if f["severity"] == "suggestion"]
+        fits = [f for f in v.get("findings", []) if f["severity"] == "fit"]
         attention = self._attention(mr)
-        if outcome == "approved":
+        if outcome == "approved" and fits:
+            lines.append("Approved: nothing has to change for it to work. What does not fit the project is below.")
+        elif outcome == "approved":
             lines.append("Approved: the review found nothing that has to change before merge.")
         elif outcome == "ready":
             why = list(mr["reasons"])
@@ -1591,9 +1748,16 @@ class ReviewAgent:
                       "on or act on these:",
                       *(f"- `{f}`" + (f": {why}" if why else "") for f, why in attention)]
         elif outcome == "changes":
-            lines += ["What has to change:", *(f"- {self._finding(f)}" for f in blockers)]
-            if v and "failed" in (v["build"], v["tests"]):
+            failed = v and "failed" in (v["build"], v["tests"])
+            if blockers or failed:
+                lines += ["What has to change:", *(f"- {self._finding(f)}" for f in blockers)]
+            if failed:
                 lines.append(f"- The {'build' if v['build'] == 'failed' else 'tests'} failed.")
+            if fits and (blockers or failed):
+                lines += ["", "Also to bring in line with the project:", *(f"- {self._finding(f)}" for f in fits)]
+            elif fits:
+                lines += ["To bring in line with the project (nothing is broken; once the fix rounds are used up "
+                          "this no longer holds up the merge):", *(f"- {self._finding(f)}" for f in fits)]
             if v and v["verdict"] == "unsure" and v["unsure_because"]:
                 lines += ["", f"Left open for a person to decide: {v['unsure_because']}"]
             lines += ["", "Not approved. " + self._sent_back_words(row, task)]
@@ -1609,6 +1773,9 @@ class ReviewAgent:
         if deploy:
             lines += ["", "For whoever deploys it (no decision needed before merge):",
                       *(f"- `{f}`: {what}" if f else f"- {what}" for f, what in deploy)]
+        if fits and outcome != "changes":
+            lines += ["", "Does not fit the project, not sent to the agent (" + self._fit_kept(task, outcome) + "):",
+                      *(f"- {self._finding(f)}" for f in fits)]
         unsupported = [f for f in v.get("findings", []) if f["severity"] == "unsupported"]
         if unsupported:
             lines += ["", "Asked for without the requirement it breaks or an ordinary way to reach it, so not sent to "
@@ -1617,12 +1784,28 @@ class ReviewAgent:
             lines += ["", "Suggestions (not blocking):", *(f"- {self._finding(f)}" for f in suggestions)]
         return "\n".join(lines)[:60000]
 
+    def _fit_kept(self, task: Task, outcome: str) -> str:
+        """Why findings of fit stayed on the note instead of going to the agent."""
+        if task.people_work:
+            return "people wrote this code: its author decides"
+        if not self.rc.fix_rounds:
+            return "findings go back only when a person passes them on"
+        if len(self.store.signals_of_kind(task.task_id, FIX_KIND)) >= self.rc.fix_rounds:
+            return f"the {self.rc.fix_rounds} automatic fix rounds of this ticket are used up"
+        if outcome == "unverified":
+            return "the review did not confirm the merge request, so a person decides first"
+        if task.state != "code_review":
+            return "the task is not waiting in Code Review"
+        return "they already went to the agent once for these commits, and it kept them"
+
     @staticmethod
     def _finding(f: dict) -> str:
         where = f["file"] + (f":{f['line']}" if f["file"] and f["line"] else "")
         text = (f"`{where}`: " if where else "") + f["text"].replace("\n", " ")
         if f.get("severity") == "blocker" and f.get("breaks") and f.get("reached_by"):
             text += f" (breaks: {f['breaks']}; reached by: {f['reached_by']})".replace("\n", " ")
+        if f.get("severity") == "fit" and f.get("evidence"):
+            text += f" ({FIT_WORDS[f['basis']]}: {f['evidence']})".replace("\n", " ")
         return text
 
     def _ticket_text(self, row: ReviewRequest, task: Task, result: dict, overall: str) -> str:
@@ -1721,17 +1904,28 @@ class ReviewAgent:
                           "or `deploy` only by the rules of point 3: " + ", ".join(f"`{f}`" for f in hints) + ".", ""]
         if not task.people_work:
             lines += [f"Why the author chose what it did, if it wrote it down: {decisions_file(ws, task.task_id)}.", ""]
-        lines += ["## What to check in each merge request", "",
+        lines += ["## The project's own rules", "",
+                  f"Before the code, read the rules the project wrote down: its notes in `{ws / 'AGENTS.md'}` (under "
+                  "\"Project notes\"), and in each repository under review its CLAUDE.md and AGENTS.md, at the root "
+                  "and in the folders of the changed files, with the files they point to. They say how this project "
+                  "wants its code, its tests and its merge requests; you judge by them, not by your own taste. Where "
+                  "a merge request edits one of them, judge by the version on its target branch "
+                  "(`git show origin/<target>:<path>`), and an edit of a rule nobody asked for is itself a finding "
+                  "of fit. Where a rule and the ticket or a person's decision disagree, the ticket and the decision "
+                  "win.", "",
+                  "## What to check in each merge request", "",
                   "1. Requirements. Does the change do what the ticket asks, all of it? The requirements are the "
                   "ticket's description, acceptance criteria and design notes, as people's comments on the ticket or "
                   "the merge requests later changed or narrowed them. Read each criterion as it is written. A "
                   "decision a person wrote down is a requirement even where you would have chosen otherwise: never "
                   "ask to undo it, and do not raise it again as a suggestion from another angle. Where a criterion reads two ways and the answer changes the code, that is a "
-                  "question for people (\"unsure\"), not a blocker. Missing or wrong behaviour is a blocker.",
+                  "question for people (\"unsure\"), not a blocker; where the change took the wider reading and "
+                  "the narrower one would do, it is a finding of fit by point 5. Missing or wrong behaviour is a "
+                  "blocker.",
                   "   Do not add requirements. Validation, hardening, retries, fallbacks, ordering or concurrency "
                   "guarantees, logging, tooling and refactors that neither the ticket nor a person asked for are not "
                   "requirements, however sensible: never a blocker. What the change adds that the ticket did not ask "
-                  "for is a suggestion that names it as outside the ticket.",
+                  "for is a finding of fit by point 5.",
                   "2. Build and tests. Build the project and run its tests the way the repository does it (README, "
                   "Makefile, verify.sh, CI config). Say what you ran. A repository without tests is \"none\", not "
                   "\"passed\". If something cannot run here (a service, a secret, the network), say so and use "
@@ -1777,14 +1971,66 @@ class ReviewAgent:
                   "finding. Most merge requests have no "
                   "`attention` at all: when in doubt between the two lists, it is `deploy`.",
                   f"4. Improvements. Only what matters: bugs, missing tests for new behaviour, a clear maintainability "
-                  f"problem. Style preferences are not findings. At most {self.rc.max_suggestions} suggestions per "
-                  "merge request.",
-                  "   Fit with the code around it is not style. Read the code next to the change and say when it "
-                  "solves a job its module already solves another way (a validator, helper, type or error format of "
-                  "its own beside the existing ones), changes one of two places that do the same job (two forms, two "
-                  "endpoints) and leaves the other behind, or changes what is shown or returned while the tests' mocks, "
-                  "fixtures or screenshot baselines still hold the old version. Name the existing code to follow. Each "
-                  "is a suggestion, and a blocker only by the rules below.", "",
+                  f"problem. A preference neither the project's rules nor the code around it share is not a finding. "
+                  f"At most {self.rc.max_suggestions} suggestions per merge request.",
+                  "5. Fit with the project. Fit with the code around it is not style: it is what the people who keep "
+                  "this code send back most. Before any finding of fit, take stock of the change and write it into "
+                  "`scope` (see the verdict):",
+                  "   - what the change does, group by group: a mechanism or behaviour, a new file, endpoint, "
+                  "parameter, setting, dependency, script or build target, a change to shared code or defaults, a "
+                  "test or fixture set. For each, `asked_by` is the line of the ticket or of a person's comment that "
+                  "asks for it, quoted, or the asked-for change that cannot work without it (\"needed for AC2: ...\"), "
+                  "or \"nobody\". A change that settles a question people left open, reads a criterion more widely "
+                  "than its words, or guards against what the ticket does not mention is \"nobody\" too: if the "
+                  "quote needs \"read as\" or \"assumed\" beside it, it is \"nobody\";",
+                  "   - each new definition (function, class, type, enum, constant, validator, error format, "
+                  "component, hook, endpoint): `existing` is how the code around it already does that kind of thing, "
+                  "found by opening the module's files of that kind (its validators, helpers, constants, errors, "
+                  "components): the closest definition doing the same job, or else the established shape for that "
+                  "kind (validators that raise the framework's validation error with a code, one error format, one "
+                  "way to build a query), as `file:line`, or \"none\".",
+                  "   The findings of fit follow from that list, the largest first: a mechanism nobody asked for "
+                  "outweighs any comment or constant out of place, so never report the small ones and leave the large "
+                  "one out. A finding of fit (`severity` \"fit\") is one of these, and `basis` says which, with "
+                  "`evidence` to back it:",
+                  "   - \"rule\": it breaks a rule the project wrote down (above); `evidence` quotes the rule and "
+                  "names the file it is in;",
+                  "   - \"existing\": it solves a job its module already solves another way, or in a shape of its "
+                  "own where the module has an established shape for that kind of thing (a validator, helper, type, "
+                  "enum or error format of its own beside the existing ones), changes one of two places that do "
+                  "the same job (two forms, two endpoints) and leaves the other behind, or changes what is shown or "
+                  "returned while the tests' mocks, fixtures or screenshot baselines still hold the old version; "
+                  "`evidence` is the existing code to follow, `file:line`. Name the existing code to follow;",
+                  "   - \"needless\": code in the change that does nothing (a guard nothing reaches, a check made "
+                  "twice, a default that is never used) or takes the long way round where the plain form does the "
+                  "same (a generic helper, comprehension or layer for two fixed cases); `evidence` is the plain form;",
+                  "   - \"unasked\": a group your `scope` marks \"nobody\" that is more than a line or two (a "
+                  "mechanism, tooling, a refactor, a setting, a change to shared code or defaults wider than the "
+                  "ticket needs); `evidence` is what it changes beyond the ticket and what the smaller change that "
+                  "meets the ticket leaves out. Where the change took the wider of two readings nobody settled, the "
+                  "extra is this finding, not a question: the smaller change is the default, and people widen it if "
+                  "they want. \"unsure\" is for what even the smaller change leaves open.",
+                  "   A finding of fit asks to remove the change or bring it in line with what is there, never to add "
+                  "to it. Only what a careful maintainer of this project would send back, one finding per thing. "
+                  "What the rules leave open and the code around it does both ways is taste, not a finding. A "
+                  "person's decision on the ticket or the merge requests settles a thing: never a finding against "
+                  "it. " + ("Findings of fit are notes for the people who wrote the code" if task.people_work else
+                            "A reason in the author's decisions file is not a person's decision, but say it in the "
+                            "finding. Findings of fit go back to the author before approval")
+                  + "; they are not blockers unless they also break something by the rules below.",
+                  "6. What people see. When the change alters anything a person sees or operates (a page, a "
+                  "component, a dialog, a message, copy, layout, keyboard or screen-reader use, an email), look at it, "
+                  "not only at its code. Run the repository's own suites that drive it (end-to-end, visual, "
+                  "accessibility) for what changed, and open the changed screens yourself in a browser (the "
+                  "repository's Playwright or a headless Chromium in a throwaway container) in the states the ticket "
+                  "names: the empty, the error and the filled state, at a phone and a desktop width or at the widths "
+                  "the project's rules or test config use. Where the look is not meant to change, compare with the "
+                  "target branch. Screenshot baselines that pass only within a tolerance while showing the old text "
+                  "are a finding. What is wrong on screen is a blocker when it breaks a requirement or what worked on "
+                  "the target branch (a column pushed off the screen, a control a screen reader no longer finds by "
+                  "its visible label, an error the form no longer shows). Say in `ui_checked` what you ran and looked "
+                  "at, or why you could not. An API, a job or a script that no person operates directly is not this "
+                  "point.", "",
                   "A blocker is something that must change before merge, and you can say both of these about it:",
                   "- what it breaks: a requirement by point 1 (quote the ticket or the comment) or behaviour that works "
                   "on the target branch;",
@@ -1801,8 +2047,8 @@ class ReviewAgent:
                   f"Write it to {self._verdict_file(row)} as JSON, one entry per merge request:", "", "```json",
                   SCHEMA_EXAMPLE, "```", "",
                   "- `verdict`: \"ready\" (meets the ticket, no blocker, and the build and tests you could run "
-                  "passed or fail only as they did before), \"changes\" (at least one "
-                  "blocker), or \"unsure\" (reading the code, you could not tell whether it is right). A question "
+                  "passed or fail only as they did before; findings of fit and suggestions leave it ready), \"changes\" "
+                  "(at least one blocker), or \"unsure\" (reading the code, you could not tell whether it is right). A question "
                   "only people can answer, such as a product decision the ticket leaves open, makes it \"unsure\", "
                   "not a blocker: the runner then asks people instead of sending it to the agent.",
                   "- `unsure_because`: with \"unsure\", what you could not tell and why, in a sentence a person can "
@@ -1811,9 +2057,16 @@ class ReviewAgent:
                   "- `requirements_met`: true or false. `build` (passed, failed, not_run) and `tests` (passed, failed, "
                   "failed_before, not_run, none): what you saw yourself.",
                   "- `checked`: the commands you ran and what they showed, in a line or two.",
-                  "- `findings`: `severity` is \"blocker\" or \"suggestion\"; `file` and `line` when it is about a "
-                  "place in the code. A blocker also has `breaks` (what it breaks) and `reached_by` (how ordinary use "
-                  "reaches it).",
+                  "- `ui`: by point 6, \"checked\" (the change alters what people see and you looked at it), "
+                  "\"not_run\" (it does and you could not; the runner then does not approve until a person looks, "
+                  "so judge the rest as usual) or \"none\" (nothing a person sees changed). `ui_checked`: what you "
+                  "ran and looked at, or why you could not.",
+                  "- `scope`: by point 5, one entry per group of the change (`what`, `asked_by`) and per new "
+                  "definition (`what`, `existing`).",
+                  "- `findings`: `severity` is \"blocker\", \"fit\" or \"suggestion\"; `file` and `line` when it is "
+                  "about a place in the code. A blocker also has `breaks` (what it breaks) and `reached_by` (how "
+                  "ordinary use reaches it); a finding of fit has `basis` (rule, existing, needless or unasked) and "
+                  "`evidence` by point 5, and without them counts as a suggestion.",
                   "- `attention`: what a person has to decide before merge, by point 3, each `why` the question they "
                   "must answer; an empty list when there is nothing.",
                   "- `deploy`: what whoever deploys it should know or do, by point 3; an empty list when there is "

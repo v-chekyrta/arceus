@@ -79,7 +79,7 @@ def reviews(w: World) -> list[dict]:
 
 def write_verdict(w: World, rid: str = RID, summary: str = "It does what the ticket asks.", entries=None, **fields):
     entry = {"mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed",
-             "checked": "make verify: 12 tests passed", "findings": [], "attention": []} | fields
+             "checked": "make verify: 12 tests passed", "ui": "none", "findings": [], "attention": []} | fields
     path = w.cfg.paths.workspace / ".arceus" / "reviews" / "ACME-1" / f"{rid}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"summary": summary, "mrs": entries or [entry]}))
@@ -747,10 +747,260 @@ def test_the_reviewer_is_told_not_to_add_requirements_and_to_back_each_blocker(w
     brief = review["argv"][-1]
     assert "Do not add requirements." in brief and "never ask to undo it" in brief
     assert "do not raise it again as a suggestion from another angle" in brief
-    assert "Fit with the code around it is not style." in brief and "Name the existing code to follow." in brief
+    assert "Fit with the code around it is not style:" in brief and "Name the existing code to follow;" in brief
     assert "`breaks` (what it breaks) and `reached_by` (how ordinary use reaches it)" in brief
     assert "a race that needs several unlikely things to happen at once, is a suggestion" in brief
     assert "only made-up input reaches, is grounds for FAIL" in brief
+
+
+FIT = {"severity": "fit", "file": "feature.txt", "line": 1, "text": "A name check of its own",
+       "basis": "existing", "evidence": "app/validators.py:12 validate_postcode"}
+
+
+def test_the_reviewer_judges_by_the_projects_written_rules_and_looks_at_what_people_see(w):
+    publish(w)
+    ask(w)
+    [review] = reviews(w)
+    brief = review["argv"][-1]
+    assert "## The project's own rules" in brief and "CLAUDE.md and AGENTS.md" in brief
+    assert "judge by the version on its target branch" in brief
+    assert all(f"\"{b}\"" in brief for b in ("rule", "existing", "needless", "unasked"))
+    assert "never to add to it" in brief and "A reason in the author's decisions file is not a person's decision" in brief
+    assert "take stock of the change and write it into `scope`" in brief and '"asked_by": "AC2: …"' in brief
+    assert "reads a criterion more widely than its words" in brief and "the largest first" in brief
+    assert "6. What people see." in brief and "at a phone and a desktop width" in brief
+    assert "`ui`: by point 6" in brief and '"ui": "checked"' in brief
+
+
+def test_a_finding_of_fit_goes_back_to_the_author_though_nothing_is_broken(w):
+    """The change works, but does a job its module already does another way: people send that back, so the
+    author brings it in line in a fix round before anyone is asked to approve it."""
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[FIT, {"severity": "suggestion", "text": "Name it clearer"}])
+    finish(w)
+    [note] = review_notes(w)
+    assert "changes are needed" in note and "What has to change:" not in note
+    assert ("To bring in line with the project (nothing is broken; once the fix rounds are used up this no longer "
+            "holds up the merge):\n- `feature.txt:1`: A name check of its own (already done by: "
+            "app/validators.py:12 validate_postcode)") in note
+    assert "Sent to the agent to fix (round 1 of 3)" in note and approve_calls(w) == []
+    later(w)
+    [send] = sends(w)
+    text = send["argv"][-1]
+    assert "To fit the project: `feature.txt:1`: A name check of its own (already done by: " in text
+    assert "Remove it or bring it in line with what it names; add nothing." in text
+    assert "keep it and say so in your result" in text and "Name it clearer" not in text
+
+
+def test_a_finding_of_fit_that_names_nothing_it_stands_on_is_a_suggestion(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[{**FIT, "basis": "taste"}, {**FIT, "text": "No evidence", "evidence": " "}])
+    finish(w)
+    [note] = review_notes(w)
+    assert "ready to merge" in note and w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
+    assert "- `feature.txt:1`: A name check of its own" in note.split("Suggestions (not blocking):")[1]
+    assert "already done by" not in note
+    later(w)
+    assert sends(w) == []
+
+
+@pytest.mark.parametrize("finding", [
+    {**FIT, "basis": "rule", "evidence": "Project style."},                       # no rule quoted, no file named
+    {**FIT, "basis": "existing", "evidence": "the validators module"},            # no place of the existing code
+    {**FIT, "basis": "needless", "evidence": "simpler"},                          # no plain form
+    {**FIT, "basis": "unasked", "evidence": "this looks excessive"},              # names nothing in the code
+    {**FIT, "file": "app/other.py"},                                              # not a file the change touches
+    {**FIT, "file": ""},
+    {**FIT, "line": None},
+    {**FIT, "line": -5},
+    {**FIT, "line": 40},                                                          # far from what the change touches
+])
+def test_a_finding_of_fit_without_the_evidence_its_basis_needs_sends_nothing(w, finding):
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[finding])
+    finish(w)
+    [note] = review_notes(w)
+    assert "ready to merge" in note and "Suggestions (not blocking):" in note and "To fit the project" not in note
+    later(w)
+    assert sends(w) == []
+
+
+def test_a_rule_quoted_with_its_file_is_a_finding_of_fit(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[{**FIT, "basis": "rule", "text": "A make target nobody asked for",
+                                "evidence": 'CLAUDE.md: "Tooling changes go in their own merge request."'}])
+    finish(w)
+    later(w)
+    [send] = sends(w)
+    assert "the project's rule: CLAUDE.md: \"Tooling changes go in their own merge request.\"" in send["argv"][-1]
+
+
+def test_a_finding_of_fit_still_reaches_the_author_while_what_people_see_waits_for_a_person(w):
+    """The screens could not be looked at, so nothing is approved; the Makefile nobody asked for still goes back."""
+    publish(w)
+    ask(w)
+    write_verdict(w, ui="not_run", ui_checked="no browser here",
+                  findings=[{**FIT, "basis": "unasked", "evidence": "the `verify` target the ticket does not ask for"}])
+    finish(w)
+    [note] = review_notes(w)
+    assert "changes are needed" in note and approve_calls(w) == []
+    assert "Note: it changes what people see, and the reviewer could not look at it (no browser here)." in note
+    later(w)
+    assert len(sends(w)) == 1
+
+
+def test_findings_of_fit_go_back_again_for_the_same_commits_once_people_said_more(w):
+    """The author kept a finding of fit and pushed nothing. Asked again for the same code, the review does not send
+    the same thing twice; once a person has commented since, what it finds goes back again."""
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[FIT])
+    finish(w)
+    later(w)
+    assert len(sends(w)) == 1
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Kept: a person decided so"})
+    w.tick()
+    w.tick()
+    ask(w)                                                    # same commits, nothing said since
+    write_verdict(w, rid="ACME-1.review-2", findings=[FIT])
+    finish(w, rid="ACME-1.review-2")
+    assert "they already went to the agent once for these commits, and it kept them" in review_notes(w)[-1]
+    later(w)
+    assert len(sends(w)) == 1
+    w.gl.note(1, "o.lead", "The scope is only the login form: no build tooling in this MR.")
+    w.tick()
+    ask(w)
+    write_verdict(w, rid="ACME-1.review-3", findings=[{**FIT, "basis": "unasked", "text": "The Makefile target",
+                                                     "evidence": "the `verify` target o.lead ruled out"}])
+    finish(w, rid="ACME-1.review-3")
+    assert "changes are needed" in review_notes(w)[-1]
+    later(w)
+    assert len(sends(w)) == 2
+
+
+def test_existing_code_in_a_file_without_an_extension_backs_a_finding_of_fit(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[{**FIT, "evidence": "Makefile:12 check-backend already runs the same gate"}])
+    finish(w)
+    later(w)
+    assert len(sends(w)) == 1
+
+
+@pytest.mark.parametrize("fits, sent", [([FIT], 1), ([], 0)])
+def test_a_finding_of_fit_goes_back_beside_a_question_for_people_and_nothing_is_approved(w, fits, sent):
+    """Unsure about a product question, and a Makefile target nobody asked for: the question stays with people, the
+    target goes to the author. Without the finding nothing goes."""
+    publish(w)
+    ask(w)
+    write_verdict(w, verdict="unsure", unsure_because="whether existing rows should start ON", findings=fits)
+    finish(w)
+    [note] = review_notes(w)
+    assert approve_calls(w) == [] and "whether existing rows should start ON" in note
+    later(w)
+    assert len(sends(w)) == sent
+    if sent:
+        text = sends(w)[0]["argv"][-1]
+        assert "Left open for people, not for you to decide in code: whether existing rows" in text
+        assert "To fit the project: `feature.txt:1`" in text
+
+
+def test_only_a_finding_of_fit_already_sent_for_the_same_code_is_held_back(w):
+    """The author kept the first finding and pushed nothing. Asked again for the same code, the review finds it once
+    more and a second one: the second goes to the author, the first is not sent twice."""
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[FIT])
+    finish(w)
+    later(w)
+    assert len(sends(w)) == 1
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Kept: a person decided so"})
+    w.tick()
+    w.tick()
+    ask(w)
+    second = {**FIT, "basis": "needless", "text": "The name is checked twice", "evidence": "one plain `if`"}
+    write_verdict(w, rid="ACME-1.review-2", findings=[FIT, second])
+    finish(w, rid="ACME-1.review-2")
+    assert "changes are needed" in review_notes(w)[-1]
+    later(w)
+    text = sends(w)[1]["argv"][-1]
+    assert len(sends(w)) == 2 and "The name is checked twice" in text and "A name check of its own" not in text
+
+
+def test_findings_of_fit_no_longer_hold_up_the_merge_once_the_fix_rounds_are_used_up(tmp_path):
+    w = world(tmp_path, fix_rounds=1)
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[FIT])
+    finish(w)
+    later(w)
+    sha = fix_and_settle(w)
+    w.gl.mrs[0].update(sha=sha, head_pipeline={"id": 91, "status": "success", "sha": sha, "web_url": "https://gl/p/91"})
+    w.tick()
+    w.tick()
+    write_verdict(w, rid="ACME-1.review-2", findings=[{**FIT, "basis": "needless", "evidence": "one plain `if`",
+                                                      "text": "The name is checked twice"}])
+    finish(w, rid="ACME-1.review-2")
+    note = review_notes(w)[-1]
+    assert "Approved: nothing has to change for it to work. What does not fit the project is below." in note
+    assert ("Does not fit the project, not sent to the agent (the 1 automatic fix rounds of this ticket are used "
+            "up):\n- `feature.txt:1`: The name is checked twice (plainly: one plain `if`)") in note
+    assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
+    later(w)
+    assert len(sends(w)) == 1
+
+
+def test_with_no_fix_rounds_a_finding_of_fit_is_a_note_and_the_merge_request_is_approved(tmp_path):
+    w = world(tmp_path, fix_rounds=0)
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[FIT])
+    finish(w)
+    [note] = review_notes(w)
+    assert "ready to merge" in note and w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
+    assert "not sent to the agent (findings go back only when a person passes them on)" in note
+    later(w)
+    assert sends(w) == []
+
+
+def test_a_merge_over_findings_of_fit_alone_is_not_reported(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, findings=[FIT])
+    finish(w)
+    assert w.store.review(RID).outcome == "changes"
+    w.gl.mrs[0]["state"] = "merged"
+    w.tick()
+    later(w)
+    assert not [t for t in w.bot_comments() if "Merged without a passing code review" in t]
+    assert not w.events_named("review_merged_unchecked")
+
+
+@pytest.mark.parametrize("ui, approved, said", [
+    ("checked", True, "- What people see: looked at (make test-visual: 33 passed; the form at 390 and 1280 px)"),
+    ("none", True, "- What people see: nothing changed"),
+    ("not_run", False, "- it changes what people see, and the reviewer could not look at it (no browser in the "
+                       "container)"),
+    (None, False, "- the reviewer did not say whether it changes what people see and whether it looked"),
+])
+def test_a_change_people_see_is_approved_only_once_someone_looked_at_it(w, ui, approved, said):
+    publish(w)
+    ask(w)
+    looked = {"checked": "make test-visual: 33 passed; the form at 390 and 1280 px",
+              "not_run": "no browser in the container"}.get(ui, "")
+    write_verdict(w, ui=ui, ui_checked=looked)
+    finish(w)
+    [note] = review_notes(w)
+    assert said in note
+    assert ("ready to merge" in note) is approved and (approve_calls(w) != []) is approved
+    if not approved:
+        assert "could not be confirmed" in note
+    later(w)
+    assert sends(w) == []
 
 
 def test_a_decision_made_only_on_the_merge_request_reaches_the_reviewer(w):
@@ -1166,7 +1416,7 @@ def test_two_merge_requests_get_a_verdict_each(w):
         mr.update(sha=sha, head_pipeline={"id": mr["iid"] + 90, "status": "success", "sha": sha})
     ask(w)
     write_verdict(w, entries=[
-        {"mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed"},
+        {"mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed", "ui": "none"},
         {"mr": "M2", "verdict": "changes", "requirements_met": True, "build": "passed", "tests": "passed",
          "findings": [{"severity": "blocker", **BACKED, "file": "s.css", "text": "Breaks the dark theme"}]}])
     finish(w)
@@ -1504,7 +1754,7 @@ def test_switched_off_between_a_failed_publication_and_its_retry_touches_no_merg
     assert "Approved before that" in summary and w.gl.mrs[0]["web_url"] in summary
 
 
-ENTRY = {"verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed"}
+ENTRY = {"verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed", "ui": "none"}
 
 
 @pytest.mark.parametrize("entries, why", [
@@ -1679,7 +1929,7 @@ def people_ticket(w: World, description: str, n: int = 5) -> str:
 
 def people_verdict(w: World, rid: str = PEOPLE_RID, **fields) -> None:
     entry = {"mr": "M1", "verdict": "ready", "requirements_met": True, "build": "passed", "tests": "passed",
-             "checked": "make test: 40 passed", "findings": [], "attention": []} | fields
+             "checked": "make test: 40 passed", "ui": "none", "findings": [], "attention": []} | fields
     path = w.cfg.paths.workspace / ".arceus" / "reviews" / PEOPLE / f"{rid}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"summary": "The translations are complete.", "mrs": [entry]}))
@@ -1931,6 +2181,20 @@ def _blocked_people_mr(w: World) -> tuple[str, str, str]:
     finish(w, PEOPLE_RID)
     assert w.store.review(PEOPLE_RID).outcome == "changes"
     return url, sha, db_id
+
+
+def test_findings_of_fit_on_a_merge_request_people_wrote_are_notes_for_its_author(w):
+    url, sha = people_mr(w)
+    db_id = people_ticket(w, url)
+    w.yt.comment(db_id, "j.doe", "/review")
+    w.tick()
+    [review] = reviews(w)
+    assert "Findings of fit are notes for the people who wrote the code" in review["argv"][-1]
+    people_verdict(w, findings=[{**FIT, "file": "people.txt"}])
+    finish(w, PEOPLE_RID)
+    [note] = review_notes(w, 5)
+    assert w.gl.mr(5)["approved_by"] == ["acme-review-bot"]
+    assert "Does not fit the project, not sent to the agent (people wrote this code: its author decides):" in note
 
 
 def _merged_notes(w: World, db_id: str) -> list[str]:
