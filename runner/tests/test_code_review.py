@@ -206,10 +206,11 @@ def test_a_ready_merge_request_is_approved_with_a_note_and_the_workspace_is_put_
     finish(w)
     assert w.gl.mrs[0]["approved_by"] == ["acme-review-bot"]
     [note] = review_notes(w)
-    assert "ready to merge" in note and "needs no further review" in note and sha[:12] in note
+    assert "ready to merge" in note and "found nothing that has to change before merge" in note and sha[:12] in note
+    assert "no further review" not in note
     assert "Name it clearer" in note and "Suggestions (not blocking)" in note
     [summary] = [t for t in w.bot_comments() if "code review of the merge requests" in t]
-    assert "approved; no further review is needed" in summary and "It does what the ticket asks." in summary
+    assert "approved; the review found nothing that has to change" in summary and "It does what the ticket asks." in summary
     # Back where it was: the task branch checked out, the review branch gone, nothing pushed or opened.
     assert git(w.repo, "symbolic-ref", "--short", "HEAD") == branch
     assert git(w.repo, "branch", "--list", "arceus-review/*") == ""
@@ -277,7 +278,7 @@ def test_risky_changes_are_approved_and_named_for_a_person(w):
     [note] = review_notes(w)
     assert note.startswith("**Code review: approved, but a person needs to look at some of its changes before merge.**")
     assert "`auth.py`: matches `*auth*`" in note and "`feature.txt`: changes the login flow" in note
-    assert "needs no further review" not in note and "Not approved" not in note
+    assert "found nothing that has to change before merge" not in note and "Not approved" not in note
     [summary] = [t for t in w.bot_comments() if "code review of the merge requests" in t]
     assert "approved, but a person needs to look at some of its changes before merge" in summary
     assert w.store.review(RID).outcome == "attention"
@@ -745,6 +746,8 @@ def test_the_reviewer_is_told_not_to_add_requirements_and_to_back_each_blocker(w
     [review] = reviews(w)
     brief = review["argv"][-1]
     assert "Do not add requirements." in brief and "never ask to undo it" in brief
+    assert "do not raise it again as a suggestion from another angle" in brief
+    assert "Fit with the code around it is not style." in brief and "Name the existing code to follow." in brief
     assert "`breaks` (what it breaks) and `reached_by` (how ordinary use reaches it)" in brief
     assert "a race that needs several unlikely things to happen at once, is a suggestion" in brief
     assert "only made-up input reaches, is grounds for FAIL" in brief
@@ -1212,7 +1215,7 @@ def test_an_approval_the_host_refuses_is_reported_as_refused(w):
     finish(w)
     [note] = review_notes(w)
     assert "not approved" in note and "GitLab refused the approval by acme-review-bot" in note
-    assert "needs no further review" not in note and w.store.review(RID).outcome == "ready"
+    assert "found nothing that has to change before merge" not in note and w.store.review(RID).outcome == "ready"
 
 
 def test_a_hung_review_is_stopped_and_frees_the_workspace(w):
@@ -1480,7 +1483,7 @@ def test_a_note_posted_after_a_failure_says_ready_only_while_it_still_is(w, monk
     assert "ready to merge" not in note and "not approved" in note and "new commits since the review" in note
     assert w.gl.mrs[0]["approved_by"] == [] and w.store.review(RID).outcome == "ready"
     [summary] = [t for t in w.bot_comments() if "code review of the merge requests" in t]
-    assert "approved; no further review" not in summary
+    assert "approved; the review found nothing" not in summary
 
 
 def test_switched_off_between_a_failed_publication_and_its_retry_touches_no_merge_request(w, monkeypatch):
@@ -1521,7 +1524,7 @@ def test_a_verdict_the_runner_cannot_read_whole_is_never_approved(w, entries, wh
     assert "could not be confirmed" in note and why in note and "ready to merge" not in note
     assert approve_calls(w) == [] and w.store.review(RID).outcome == "unverified"
     [summary] = [t for t in w.bot_comments() if "code review of the merge requests" in t]
-    assert "approved; no further review" not in summary
+    assert "approved; the review found nothing" not in summary
 
 
 def test_contradicting_verdicts_with_changes_first_stay_changes_and_say_so(w):

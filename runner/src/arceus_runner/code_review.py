@@ -34,8 +34,8 @@ people wrote:
   change, no blocker), the code host's CI passed on the reviewed
   commit (`require_green_ci`), the MR still points at that commit and the same target, the ticket is
   still in Code Review with the text the review read, and the feature is still on. The approver account
-  then approves exactly that commit, and the MR gets a note that it is ready to merge and needs no
-  further review. When a changed file matches `attention_paths` (the security boundary, secrets) or the
+  then approves exactly that commit, and the MR gets a note that the review found nothing that has to
+  change before merge. When a changed file matches `attention_paths` (the security boundary, secrets) or the
   reviewer named something a person has to decide (its prompt, point 3), it is approved all the
   same, and the note says instead which changes a person has to look at before merge. What only whoever
   deploys it has to know (an environment variable, a runtime upgrade the ticket asked for) is listed in the
@@ -1580,7 +1580,7 @@ class ReviewAgent:
         suggestions = [f for f in v.get("findings", []) if f["severity"] == "suggestion"]
         attention = self._attention(mr)
         if outcome == "approved":
-            lines.append("Approved. This merge request is ready to merge and needs no further review.")
+            lines.append("Approved: the review found nothing that has to change before merge.")
         elif outcome == "ready":
             why = list(mr["reasons"])
             if approval and not approval["done"]:
@@ -1634,7 +1634,7 @@ class ReviewAgent:
                         "the merge requests. Approved before that: " + ", ".join(given) + ".")
             return (f"{who}, the code review was switched off while it ran; nothing was posted on the merge "
                     "requests and nothing was approved.")
-        words = {"approved": "ready to merge, approved; no further review is needed",
+        words = {"approved": "ready to merge, approved; the review found nothing that has to change",
                  "ready": "no problems found, but not approved (the merge request says why)",
                  "attention": "approved, but a person needs to look at some of its changes before merge "
                               "(the merge request lists them)",
@@ -1726,7 +1726,7 @@ class ReviewAgent:
                   "ticket's description, acceptance criteria and design notes, as people's comments on the ticket or "
                   "the merge requests later changed or narrowed them. Read each criterion as it is written. A "
                   "decision a person wrote down is a requirement even where you would have chosen otherwise: never "
-                  "ask to undo it. Where a criterion reads two ways and the answer changes the code, that is a "
+                  "ask to undo it, and do not raise it again as a suggestion from another angle. Where a criterion reads two ways and the answer changes the code, that is a "
                   "question for people (\"unsure\"), not a blocker. Missing or wrong behaviour is a blocker.",
                   "   Do not add requirements. Validation, hardening, retries, fallbacks, ordering or concurrency "
                   "guarantees, logging, tooling and refactors that neither the ticket nor a person asked for are not "
@@ -1778,7 +1778,13 @@ class ReviewAgent:
                   "`attention` at all: when in doubt between the two lists, it is `deploy`.",
                   f"4. Improvements. Only what matters: bugs, missing tests for new behaviour, a clear maintainability "
                   f"problem. Style preferences are not findings. At most {self.rc.max_suggestions} suggestions per "
-                  "merge request.", "",
+                  "merge request.",
+                  "   Fit with the code around it is not style. Read the code next to the change and say when it "
+                  "solves a job its module already solves another way (a validator, helper, type or error format of "
+                  "its own beside the existing ones), changes one of two places that do the same job (two forms, two "
+                  "endpoints) and leaves the other behind, or changes what is shown or returned while the tests' mocks, "
+                  "fixtures or screenshot baselines still hold the old version. Name the existing code to follow. Each "
+                  "is a suggestion, and a blocker only by the rules below.", "",
                   "A blocker is something that must change before merge, and you can say both of these about it:",
                   "- what it breaks: a requirement by point 1 (quote the ticket or the comment) or behaviour that works "
                   "on the target branch;",
