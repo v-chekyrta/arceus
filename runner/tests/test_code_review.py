@@ -755,6 +755,7 @@ def test_the_reviewer_is_told_not_to_add_requirements_and_to_back_each_blocker(w
 
 
 RULE = "Tooling changes go in their own merge request, never beside a feature."
+NESTED = "Every validator raises ValidationError with a code."
 NOBODY = [{"what": "a `verify` target in the Makefile", "asked_by": "nobody"}]
 
 
@@ -762,6 +763,9 @@ def seed(w: World, repo: str = "acme-platform") -> None:
     """The target branch with the project's rule, a Makefile and a module of validators, as findings of fit name them."""
     s = w.tmp / "seed" / repo
     (s / "CLAUDE.md").write_text(f"# Rules\n\n- {RULE}\n")
+    (s / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xff\xfe" * 20)
+    (s / "app").mkdir(exist_ok=True)
+    (s / "app" / "CLAUDE.md").write_text(f"- {NESTED}\n")
     (s / "Makefile").write_text("".join(f"target{i}:\n\techo {i}\n" for i in range(10)))
     (s / "app").mkdir(exist_ok=True)
     (s / "app" / "validators.py").write_text("".join(f"def validate_{i}(value):\n    return value\n\n"
@@ -965,6 +969,9 @@ def test_only_a_finding_of_fit_already_sent_for_the_same_code_is_held_back(w):
     {**FIT, "evidence": "Makefile:99 target0"},                                             # past the file's end
     {**FIT, "evidence": "app/helpers.py:3 build_name"},                                     # no such file
     {**FIT, "basis": "unasked", "evidence": "`verify`"},                                    # names, does not say
+    {**FIT, "basis": "rule", "evidence": f'CLAUDE.md: "{RULE} Every file also needs a licence header."'},  # made up
+    {**FIT, "evidence": "Makefile:3 build_name"},                       # a real line, but not the code it names
+    {**FIT, "evidence": "logo.png:1 logo"},                             # a binary file has no lines to point at
 ])
 def test_a_finding_of_fit_the_code_does_not_bear_out_sends_nothing(w, finding):
     seed(w)
@@ -987,32 +994,83 @@ def test_a_finding_of_unasked_work_needs_an_entry_of_scope_nobody_asked_for(w):
     assert sends(w) == []
 
 
-def test_a_rule_the_merge_request_writes_itself_is_not_one_to_judge_it_by(w, monkeypatch):
-    """The change adds a rule to a nested CLAUDE.md and the reviewer quotes it: the target branch does not have it,
-    so nothing goes back. The rule the target branch has, quoted, goes back once."""
+def test_a_nested_rule_the_merge_request_weakens_is_judged_by_the_target_branch(w, monkeypatch):
+    """app/CLAUDE.md on the target branch says every validator raises ValidationError with a code. The change weakens
+    that rule and breaks it in app/forms.py. A finding that quotes the weakened words sends nothing; one that quotes the
+    rule as the target branch has it goes to the author once."""
     def commits(name="feature.txt"):
         (w.repo / name).parent.mkdir(parents=True, exist_ok=True)
-        (w.repo / name).write_text("- Every module ships its own tests folder.\n" if name.endswith("CLAUDE.md")
-                                   else "work\n")
+        (w.repo / name).write_text("- Validators may return an error string when that is simpler.\n"
+                                   if name.endswith("CLAUDE.md") else "def check(v):\n    return 'bad'\n")
         git(w.repo, "add", name)
-        git(w.repo, "commit", "-q", "-m", f"add {name}")
+        git(w.repo, "commit", "-q", "-m", f"change {name}")
         return git(w.repo, "rev-parse", "HEAD")
     monkeypatch.setattr(w, "agent_commits", commits)
     seed(w)
-    publish(w, "app/CLAUDE.md", "feature.txt")
+    publish(w, "app/CLAUDE.md", "app/forms.py")
     ask(w)
-    wrote = {**FIT, "basis": "rule", "evidence": 'app/CLAUDE.md: "Every module ships its own tests folder."'}
-    write_verdict(w, findings=[wrote])
+    weakened = {**FIT, "file": "app/forms.py", "line": 2, "basis": "rule", "text": "Returns an error string",
+                "evidence": 'app/CLAUDE.md: "Validators may return an error string when that is simpler."'}
+    write_verdict(w, findings=[weakened])
     finish(w)
     later(w)
     assert sends(w) == []
     w.gl.note(1, "o.lead", "Please look again.")
     w.tick()
     ask(w)
-    write_verdict(w, rid="ACME-1.review-2", findings=[{**FIT, "basis": "rule", "evidence": f'CLAUDE.md: "{RULE}"'}])
+    write_verdict(w, rid="ACME-1.review-2",
+                  findings=[{**weakened, "evidence": f'app/CLAUDE.md on the target branch: "{NESTED}"'}])
     finish(w, rid="ACME-1.review-2")
     later(w)
-    assert len(sends(w)) == 1
+    assert len(sends(w)) == 1 and NESTED in sends(w)[0]["argv"][-1]
+
+
+def test_unasked_work_that_scope_also_says_somebody_asked_for_sends_nothing(w):
+    seed(w)
+    publish(w)
+    ask(w)
+    write_verdict(w, scope=[{"what": "the `verify` target", "asked_by": "o.lead 11-20: keep the verify target"},
+                            {"what": "the `lint` target", "asked_by": "nobody"}],
+                  findings=[{**FIT, "basis": "unasked", "evidence": "the `verify` target the ticket does not ask for"}])
+    finish(w)
+    later(w)
+    assert sends(w) == []
+
+
+def test_a_finding_of_fit_is_one_of_its_merge_request_and_target():
+    from arceus_runner.code_review import _fit_key
+    f = {"file": "Makefile", "line": 4, "basis": "unasked"}
+    base = {"repo": "acme-platform", "iid": 1, "target": "main"}
+    keys = {_fit_key(base, f), _fit_key({**base, "iid": 2}, f), _fit_key({**base, "target": "release"}, f),
+            _fit_key(base, {**f, "line": 40})}
+    assert len(keys) == 4 and _fit_key(base, f) == _fit_key(base, {**f, "evidence": "worded anew"})
+
+
+def test_changed_lines_follow_renames_spaces_quotes_and_deleted_files(tmp_path):
+    from arceus_runner.gitops import Git
+    repo = tmp_path / "r"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "moved.py").write_text("".join(f"line {i}\n" for i in range(1, 41)))
+    (repo / "old name.txt").write_text("a\nb\nc\n")
+    (repo / "gone.html").write_text("x\ny\n")
+    (repo / 'щo "так".md').write_text("q\n")
+    git(repo, "add", "-A")
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
+    git(repo, "checkout", "-q", "-b", "f")
+    git(repo, "mv", "moved.py", "renamed.py")
+    (repo / "renamed.py").write_text("".join(f"line {i}\n" if i != 20 else "changed\n" for i in range(1, 41)))
+    (repo / "old name.txt").write_text("a\nB\nc\n")
+    git(repo, "rm", "-q", "gone.html")
+    (repo / 'щo "так".md').write_text("q\nr\n")
+    git(repo, "add", "-A")
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "f")
+    g = Git.__new__(Git)
+    g.auth, g.deadline = None, None
+    lines, files = g.changed_lines(repo, "main", "f"), g.changed_files(repo, "main", "f")
+    assert lines == {"renamed.py": [[20, 20]], "old name.txt": [[2, 2]], "gone.html": [[1, 2]],
+                     'щo "так".md': [[2, 2]]}
+    assert set(lines) == set(files)
 
 
 @pytest.mark.parametrize("scope, findings, sent", [

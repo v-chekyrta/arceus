@@ -383,14 +383,15 @@ def _in_change(f: dict, mr: dict, near: int = 3) -> bool:
     return f["line"] is not None and any(a - near <= f["line"] <= b + near for a, b in mr["lines"].get(f["file"], []))
 
 
-def _fit_key(repo: str, f: dict) -> tuple:
-    """A finding of fit as the same one in a later review: where it is and what kind, not how it is worded."""
-    return repo, f.get("file"), f.get("line"), f.get("basis")
+def _fit_key(mr: dict, f: dict) -> tuple:
+    """A finding of fit as the same one in a later review: its merge request and target, where it is and what kind,
+    not how it is worded."""
+    return mr["repo"], str(mr.get("iid")), mr.get("target"), f.get("file"), f.get("line"), f.get("basis")
 
 
 def _judged(snap: dict) -> tuple:
     """What a review judged: the commits, and the ticket and people's comments it read them against."""
-    return ({(m["repo"], m["sha"], m.get("target_sha")) for m in snap.get("mrs", [])},
+    return ({(m["repo"], str(m.get("iid")), m["sha"], m.get("target"), m.get("target_sha")) for m in snap.get("mrs", [])},
             snap.get("ticket", {}).get("context"), snap.get("mr_comments"))
 
 
@@ -413,14 +414,16 @@ def _backed(basis: str, evidence: str) -> bool:
 _QUOTED = re.compile(r'"([^"]+)"|“([^”]+)”|«([^»]+)»|`([^`]+)`')
 
 
+def _plain(text: str) -> str:
+    """Text as a rule is compared: markdown marks and line breaks gone, one space between words, lower case."""
+    return " ".join(re.sub(r"[*_#>`]", " ", text).split()).lower()
+
+
 def _quoted(evidence: str) -> str:
-    """The words a rule is quoted by, five of them at most (a quote that runs over lines still matches one line of the
-    file), or "" when no quote of four words or more is there."""
-    for m in _QUOTED.finditer(evidence):
-        words = re.sub(r"[*_#>]", " ", next(g for g in m.groups() if g)).split()
-        if len(words) >= 4:
-            return " ".join(words[:5])
-    return ""
+    """The longest quote of four words or more in the evidence, as `_plain` spells it; "" when there is none."""
+    quotes = [_plain(next(g for g in m.groups() if g)) for m in _QUOTED.finditer(evidence)]
+    quotes = [q for q in quotes if len(q.split()) >= 4]
+    return max(quotes, key=len) if quotes else ""
 
 
 def _fit_only(mr: dict) -> bool:
@@ -1178,7 +1181,7 @@ class ReviewAgent:
             items += [f"To fit the project: {self._finding(f)} Remove it or bring it in line with what it names; add "
                       "nothing. If a person on the ticket or the merge request decided it this way, keep it and say "
                       "so in your result." for f in v.get("findings", [])
-                      if f.get("severity") == "fit" and _fit_key(mr["repo"], f) not in sent]
+                      if f.get("severity") == "fit" and _fit_key(mr, f) not in sent]
             items += [f"Note: {r}." for r in mr["reasons"]]
             if v.get("verdict") == "unsure" and v.get("unsure_because"):
                 items.append(f"Left open for people, not for you to decide in code: {v['unsure_because']} Keep the "
@@ -1290,7 +1293,7 @@ class ReviewAgent:
                 # reviewer's idea, and a suggestion.
                 v = {**v, "findings": [f if f["severity"] != "fit" or self._fit_holds(task, m, v, f)
                                        else {**f, "severity": "suggestion"} for f in v["findings"]]}
-            fits = [(m["repo"], f) for f in v["findings"] if f["severity"] == "fit"] if v is not None else []
+            fits = [(m, f) for f in v["findings"] if f["severity"] == "fit"] if v is not None else []
             build = "passed" if "build" in in_ci else v and v["build"]
             tests = "passed" if "tests" in in_ci else v and v["tests"]
             # What the repository's rules do not ask for stops nothing when it was not run; seen failing, it still does.
@@ -1403,7 +1406,7 @@ class ReviewAgent:
         if self._ticket_problem(task, snap):
             return False
         sent = self._sent_fits(task, snap)
-        return any(_fit_key(repo, f) not in sent for repo, f in fits or [])
+        return any(_fit_key(mr, f) not in sent for mr, f in fits or [])
 
     def _fit_holds(self, task: Task, mr: dict, v: dict, f: dict) -> bool:
         """Whether a finding of fit stands on what it names, checked in the code: the place in the change, then by its
@@ -1414,22 +1417,38 @@ class ReviewAgent:
         path = self.cfg.paths.workspace / mr["repo"]
         target = mr.get("target_sha") or f"origin/{mr['target']}"
         if f["basis"] == "rule":
+            # The whole quote, in the project's notes or in a file of rules of the target branch (not the change's).
             quote = _quoted(f["evidence"])
             if not quote:
                 return False
             try:
-                notes = " ".join(self.d.workspace.task_notes(task).split()).lower()
+                texts = [self.d.workspace.task_notes(task)]
             except OSError:
-                notes = ""
-            return quote.lower() in notes or self.git.has_text(path, target, quote)
+                texts = []
+            named = [x for x in re.findall(r"[\w./-]+\.md\b", f["evidence"])]
+            for name in dict.fromkeys([*self.git.rule_files(path, target), *named]):
+                texts.append("\n".join(self.git.text_lines(path, target, name) or []))
+            return any(quote in _plain(t) for t in texts)
         if f["basis"] == "existing":
+            # A line that exists, in a text file, holding a name the evidence gives for the code doing that job.
             place = _PLACE.search(f["evidence"])
             if not place:
                 return False
             where, line = place.group(0).rsplit(":", 1)
-            return any(self.git.has_line(path, ref, where, int(line)) for ref in (mr["sha"], target))
+            names = {w for w in re.findall(r"[A-Za-z_][\w]{2,}", f["evidence"].replace(place.group(0), " "))}
+            for ref in (mr["sha"], target):
+                lines = self.git.text_lines(path, ref, where)
+                if lines and int(line) <= len(lines):
+                    near = " ".join(lines[max(int(line) - 4, 0):int(line) + 3])
+                    if any(re.search(rf"\b{re.escape(n)}\b", near) for n in names):
+                        return True
+            return False
         if f["basis"] == "unasked":
-            return any(x["asked_by"].lower().startswith("nobody") for x in v.get("scope", []))
+            # The entry of `scope` it is about says nobody asked for it, and no other entry says somebody did.
+            marks = [t.lower() for t in re.findall(r"`([^`]+)`", f["evidence"])] or \
+                [f["file"].rsplit("/", 1)[-1].lower()]
+            about = [x for x in v.get("scope", []) if any(t in x["what"].lower() for t in marks)]
+            return bool(about) and all(x["asked_by"].lower().startswith("nobody") for x in about)
         return True
 
     def _sent_fits(self, task: Task, snap: dict) -> set:
@@ -1441,7 +1460,7 @@ class ReviewAgent:
                 continue
             for mr in json.loads(r.result or "{}").get("mrs", []):
                 if mr["kind"] == "changes":
-                    sent |= {_fit_key(mr["repo"], f) for f in (mr.get("verdict") or {}).get("findings", [])
+                    sent |= {_fit_key(mr, f) for f in (mr.get("verdict") or {}).get("findings", [])
                              if f.get("severity") == "fit"}
         return sent
 

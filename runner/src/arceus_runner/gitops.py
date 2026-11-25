@@ -71,9 +71,31 @@ def _diff_path(text: str, prefix: str) -> str | None:
     if text == "/dev/null":
         return None
     if len(text) >= 2 and text[0] == text[-1] == '"':
-        text = text[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1").decode(
-            "utf-8", "replace")
+        text = _unquote(text[1:-1])
     return text[len(prefix):] if text.startswith(prefix) else text
+
+
+_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def _unquote(text: str) -> str:
+    """A name git quoted C-style: backslash escapes and octal bytes, other characters as they are."""
+    out, i = bytearray(), 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in _ESCAPES:
+                out.append(_ESCAPES[nxt])
+                i += 2
+                continue
+            if text[i + 1:i + 4].isdigit() and len(text[i + 1:i + 4]) == 3:
+                out.append(int(text[i + 1:i + 4], 8) & 0xFF)
+                i += 4
+                continue
+        out += c.encode("utf-8")
+        i += 1
+    return out.decode("utf-8", "replace")
 
 
 class Git:
@@ -84,7 +106,7 @@ class Git:
         self.deadline: float | None = None  # time.monotonic() no command may outlive (cleanup's time budget)
 
     def _run(self, args: list[str], cwd: Path | None, network: bool = False, check: bool = True,
-             read_only: bool = False) -> subprocess.CompletedProcess:
+             read_only: bool = False, errors: str = "strict") -> subprocess.CompletedProcess:
         env = base_env()
         if read_only:
             env["GIT_OPTIONAL_LOCKS"] = "0"  # `git status` would otherwise refresh the index
@@ -96,7 +118,7 @@ class Git:
             if timeout <= 0:
                 raise GitError(f"git {args[0]}: out of time")
         try:
-            res = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True,
+            res = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, errors=errors,
                                  timeout=timeout, preexec_fn=_workspace_umask)
         except subprocess.TimeoutExpired:
             late = self.deadline is not None and time.monotonic() >= self.deadline
@@ -316,8 +338,10 @@ class Git:
         """Per file `sha` changes compared with where it left `default`, the line ranges ([first, last]) it adds or
         changes in the new version; a file it deletes, the lines it had. A deletion inside a file counts as the line
         where it happened. Paths are spelled as `changed_files` gives them."""
-        out = self._run(["-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames",
-                         f"{default}...{sha}"], repo).stdout
+        # Renames found as `changed_files` finds them, so a moved file counts by what changed in it; the lines of the
+        # code are not ours to read, so whatever bytes they hold never stop it.
+        out = self._run(["-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff",
+                         f"{default}...{sha}"], repo, errors="replace").stdout
         lines: dict[str, list[list[int]]] = {}
         old = new = None
         for row in out.splitlines():
@@ -340,14 +364,18 @@ class Git:
         res = self._run(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo, check=False)
         return res.stdout.strip() or None
 
-    def has_text(self, repo: Path, ref: str, text: str) -> bool:
-        """Whether some file of `ref` holds `text` (on one line, case ignored)."""
-        return self._run(["grep", "-F", "-i", "-q", "-e", text, ref, "--"], repo, check=False).returncode == 0
+    def text_lines(self, repo: Path, ref: str, path: str) -> list[str] | None:
+        """The lines of a text file at `ref`; None when there is no such file there or it is binary. `path` may come
+        from an agent: it only ever names an object, never a file on disk."""
+        if not self.blob_lines(repo, ref, path):
+            return None
+        res = self._run(["cat-file", "-p", f"{ref}:{path}"], repo, check=False, errors="replace")
+        return res.stdout.splitlines() if res.returncode == 0 else None
 
-    def has_line(self, repo: Path, ref: str, path: str, line: int) -> bool:
-        """Whether `path` exists at `ref` and has at least `line` lines."""
-        res = self._run(["cat-file", "-p", f"{ref}:{path}"], repo, check=False)
-        return res.returncode == 0 and 1 <= line <= len(res.stdout.splitlines())
+    def rule_files(self, repo: Path, ref: str) -> list[str]:
+        """The files of `ref` that hold a project's written rules: every CLAUDE.md and AGENTS.md, at any depth."""
+        out = self._run(["ls-tree", "-r", "--name-only", "-z", ref], repo, check=False, errors="replace").stdout
+        return [f for f in out.split("\0") if f.rsplit("/", 1)[-1] in ("CLAUDE.md", "AGENTS.md")]
 
     def commit_before(self, repo: Path, ref: str, when: str) -> str | None:
         """The newest commit of `ref` made before `when` (ISO time, by commit date); None when it has none that old."""
