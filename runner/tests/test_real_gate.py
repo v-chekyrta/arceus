@@ -14,6 +14,7 @@ branch, and how many merge requests there are.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -56,6 +57,7 @@ class Agent:
         self.dir.mkdir()
         (self.dir / "codex").write_text(CODEX)
         (self.dir / "codex").chmod(0o755)
+        self.gate_env: dict[str, str] = {}   # the gate's own test hooks, for the stops the test sets up
         self.transcript = tmp / "transcript.jsonl"
         self.transcript.write_text(json.dumps({"message": {"role": "assistant", "content": [
             {"type": "text", "text": "Done, the outcome is declared."}]}}) + "\n")
@@ -77,11 +79,13 @@ class Agent:
         if raw is not None:
             (self.dir / "answer").write_text(f"cat <<'EOF'\n{raw}\nEOF\nexit {rc}\n")
             return
+        # The body as a file of its own: a review of several numbered lines reaches the gate as several lines.
+        (self.dir / "body").write_text(body)
         (self.dir / "answer").write_text(f"STATE={state}\nVERDICT={verdict!r}\nRC={rc}\nCLOSE={close if isinstance(close, str) else int(close)}\n"
-                                         f"BODY={json.dumps(body)}\n")
+                                         'BODY="$(cat "$FAKE_CODEX_DIR/body")"\n')
 
     def env(self, task_id: str = "ACME-1") -> dict:
-        env = self.engine.env()
+        env = self.engine.env() | self.gate_env
         return {**env, "ORCHESTRATOR_RUN_ID": (self.idir(task_id) / "run-id").read_text().strip(),
                 "PATH": f"{self.dir}:{env['PATH']}", "FAKE_CODEX_DIR": str(self.dir),
                 "SUPERVISOR_CODEX_USAGE_CMD": "/usr/bin/true", "SUPERVISOR_CLAUDE_USAGE_CMD": "/usr/bin/true"}
@@ -412,6 +416,183 @@ def test_the_other_answer_to_a_disputed_decision_reaches_the_agent_in_words(wa):
     wait_state(w, "ACME-1", "running")
     briefs = sorted(a.idir().glob("messages/*/*.txt"), key=lambda f: f.stat().st_mtime)
     assert briefs and "2. Change it as the review suggests" in briefs[-1].read_text()
+
+
+def test_a_rare_dispute_of_the_task_s_decision_does_not_stop_it_and_the_round_s_defect_goes_back(wa):
+    """The server incident behind Bulava 1.20.10: one reviewer disputes the author's decision for a legacy record that
+    needs a 130-letter word, another calls it covered by that decision, and the round has an ordinary defect too. The
+    defect goes back to the agent, nobody is asked, and the fixed commit is published."""
+    w, a = wa
+    w.agent_commits("health.txt")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", "1. [acceptance_failure] health.txt: the endpoint does not return the version REACH: ordinary\n"
+                    '2. [spec_conflict] QUOTE: "each part 125 characters at most" — a legacy 150-character surname '
+                    "plus a new 125-character first name gives 276, which the LMS rejects REACH: rare\n"
+                    "3. [related_improvement] a legacy 150-character surname plus 125 gives 276; this stays under "
+                    "the task's per-field decision")
+    back = a.stop()
+    assert back and "the endpoint does not return the version" in back
+    assert a.engine.show("ACME-1")["state"] == "running"
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched" and questions(w) == []
+    fixed = w.agent_commits("version.txt")
+    a.declare("succeeded_changes", "Returned the version")
+    a.codex("PASS")
+    assert a.stop() is None
+    settled(w, a, "waiting_review")
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and w.remote_branch(task.branch) == fixed and len(w.gl.mrs) == 1
+    assert questions(w) == [] and "agent-needs-input" not in tags(w)
+
+
+def test_a_dispute_beside_an_ordinary_defect_waits_and_is_asked_once_before_anything_is_published(wa):
+    w, a = wa
+    w.agent_commits("health.txt")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", "1. [acceptance_failure] health.txt: the endpoint does not return the version REACH: ordinary\n"
+                    '2. [spec_conflict] QUOTE: "no migration" — the seed needs one on existing databases '
+                    "REACH: ordinary")
+    back = a.stop()
+    assert back and "the endpoint does not return the version" in back and "WAITS FOR THE TASK" in back
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched" and questions(w) == []
+    w.agent_commits("version.txt")
+    a.declare("succeeded_changes", "Returned the version")
+    a.codex("PASS")
+    assert a.stop() is None                                   # the round with no defect asks the question
+    show = settled(w, a, "needs_input")
+    assert show["state_reason"] == "spec_conflict"
+    task = w.store.task("ACME-1")
+    assert task.state == "needs_input" and "agent-needs-input" in tags(w) and "agent-failed" not in tags(w)
+    [q] = questions(w)
+    assert q.count('QUOTE: "no migration"') == 1             # a team's three readings of it are one question
+    nothing_published(w)
+    w.tick()
+    assert len(questions(w)) == 1
+
+
+def answered(w, a, quote_line: str, answer: str) -> None:
+    """ACME-1 parked on a disputed decision, and its author's answer on the ticket taken on as the next attempt."""
+    w.agent_commits("health.txt")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    a.codex("FAIL", quote_line)
+    assert a.stop() is None
+    settled(w, a, "needs_input")
+    w.yt.comment("2-1", "a.smith", answer)
+    w.tick()
+    wait_state(w, "ACME-1", "running")
+    assert w.store.task("ACME-1").state == "dispatched"
+
+
+NO_MIGRATION = '1. [spec_conflict] QUOTE: "no migration" — the seed needs one on existing databases REACH: ordinary'
+
+
+def test_a_new_angle_on_a_decision_its_author_answered_does_not_ask_again(wa):
+    w, a = wa
+    answered(w, a, NO_MIGRATION, "Keep no migration: old databases are rebuilt from the seed on deploy.")
+    w.agent_commits("seed.txt")
+    a.declare("succeeded_changes", "Kept it as the ticket says")
+    a.codex("FAIL", '1. [spec_conflict] QUOTE: "no migration" — a database restored from a year-old backup would '
+                    "miss the new column")
+    assert a.stop() is None
+    assert "DECISIONS THE TASK'S AUTHOR ALREADY MADE" in (a.dir / "last-prompt").read_text()
+    assert "rebuilt from the seed on deploy" in (a.dir / "last-prompt").read_text()
+    settled(w, a, "waiting_review")
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and len(w.gl.mrs) == 1 and len(questions(w)) == 1
+
+
+def test_an_answered_decision_is_asked_again_only_on_a_path_a_person_meets(wa):
+    w, a = wa
+    answered(w, a, NO_MIGRATION, "Keep no migration: old databases are rebuilt from the seed on deploy.")
+    w.agent_commits("seed.txt")
+    a.declare("succeeded_changes", "Kept it as the ticket says")
+    a.codex("FAIL", '1. [spec_conflict] QUOTE: "no migration" — every deploy to staging keeps its database, so every '
+                    "tester loses the new column REACH: ordinary")
+    assert a.stop() is None
+    show = settled(w, a, "needs_input")
+    assert show["state_reason"] == "spec_conflict"
+    assert len(questions(w)) == 2 and "every tester loses the new column" in questions(w)[-1]
+    nothing_published(w)
+
+
+def test_work_that_keeps_changing_after_each_review_stops_with_its_own_reason_and_nothing_is_published(wa):
+    """Bulava 1.20.10: a branch that moved after the review read it goes back to be read again, and the third time in a
+    row it parks the attempt. The ticket says so in its own words, and a `/continue` reviews the work again."""
+    w, a = wa
+    w.agent_commits("health.txt")
+    repo = str(w.repo)
+    # A review long enough that the gate's line falls past the 4000 bytes the receipt keeps of it.
+    notes = "\n".join(f"{i}. [related_improvement] health.txt: note number {i} about the endpoint's wording"
+                      for i in range(1, 80))
+    # Something commits after the reviewer's answer, before its verdict is acted on: each time the gate holds it.
+    hook = Path(repo).parent.parent / "move.sh"
+    hook.write_text(f'echo moved >> "{repo}/health.txt" && git -C "{repo}" -c user.email=t@t -c user.name=t '
+                    'commit -qam moved\n')
+    a.gate_env["SUPERVISOR_TEST_HOOK_BEFORE_HOLD"] = str(hook)
+    a.codex("PASS", notes)
+    a.declare("succeeded_changes", "Added the health endpoint")
+    for _ in range(3):
+        if a.stop() is None:
+            break
+        w.tick()
+        assert w.store.task("ACME-1").state == "dispatched" and "could not take" not in "\n".join(w.bot_comments())
+        nothing_published(w)
+        a.declare("succeeded_changes", "Added the health endpoint")
+    else:
+        raise AssertionError("the gate never stopped work that kept moving after its review")
+    show = settled(w, a, "failed")
+    assert len(show["receipt"]["review_why"]) <= 4000 and "[GATE]" not in show["receipt"]["review_why"]
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "agent-failed" in tags(w) and questions(w) == []
+    assert task.reason == "the work kept changing after the review read it, so nothing was published"
+    text = last_comment(w)
+    assert "3 times in a row" in text and "/continue" in text and "[GATE]" not in text and repo not in text
+    nothing_published(w)
+    w.tick()
+    assert text == last_comment(w)                            # said once
+    a.gate_env.clear()
+    a.codex("PASS")
+    w.yt.comment("2-1", "a.smith", "/continue the stray watcher is stopped")
+    w.tick()
+    w.now += timedelta(minutes=6)
+    w.tick()
+    wait_state(w, "ACME-1", "running")
+    assert w.store.task("ACME-1").state == "dispatched" and "agent-failed" not in tags(w)
+    a.declare("succeeded_changes", "Stopped the watcher")
+    assert a.stop() is None
+    settled(w, a, "waiting_review")
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and w.remote_branch(task.branch) == git(Path(repo), "rev-parse", "HEAD")
+
+
+def test_a_state_that_cannot_be_read_after_the_review_stops_once_with_its_own_reason(wa):
+    """Bulava 1.20.10: after a PASS the gate reads the work again before accepting it; a repository it cannot read
+    (here a file nobody may read, as a clone whose borrowed objects its user cannot open on a server) parks the attempt
+    at once, never sent back to the agent, who cannot fix it."""
+    w, a = wa
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root reads a file whatever its mode")
+    w.agent_commits("health.txt")
+    repo = str(w.repo)
+    # The file goes unreadable after the reviewer's answer, before its verdict is acted on.
+    hook = Path(repo).parent.parent / "unreadable.sh"
+    hook.write_text(f'chmod 000 "{repo}/health.txt"\n')
+    a.gate_env |= {"SUPERVISOR_TEST_HOOK_BEFORE_HOLD": str(hook), "SUPERVISOR_GUARD_RETRY_SECONDS": "0"}
+    a.codex("PASS")
+    a.declare("succeeded_changes", "Added the health endpoint")
+    try:
+        assert a.stop() is None
+    finally:
+        os.chmod(Path(repo) / "health.txt", 0o644)
+    settled(w, a, "failed")
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and "agent-failed" in tags(w) and questions(w) == []
+    assert task.reason == "the state of the work could not be read after the review, so nothing was published"
+    text = last_comment(w)
+    assert "Someone with access to the server" in text and "/continue" in text
+    assert "[GATE]" not in text and repo not in text
+    nothing_published(w)
 
 
 def test_a_final_check_runs_once_after_the_review_and_holds_the_work_until_it_passes(wa, tmp_path):

@@ -1984,6 +1984,11 @@ T2: [acceptance_failure] Codex: the test does not check the status code
 4. [harness_failure] the verifier could not start node"""
 
 
+MOVED = "[GATE] The review passed, but the work changed after it was read, 3 times in a row. Nothing is accepted."
+UNREADABLE = ("[GATE] The review passed, but the state of /srv/ws/acme-platform could not be read, so it cannot be "
+              "shown to be what the reviewer read. Nothing is accepted.")
+
+
 @pytest.mark.parametrize("review_why,note,reason,shown,hidden", [
     ("reviewer unreachable 5x: рецензент (codex) зупинився з кодом 1 at /home/arceus/.codex", "",
      "the reviewer (Codex) could not be reached, so the work was not reviewed", [], ["зупинився", "/home/arceus"]),
@@ -2002,6 +2007,15 @@ T2: [acceptance_failure] Codex: the test does not check the status code
      "nothing is accepted without them.", STALLED,
      "the review accepted the work, but its final checks did not pass or left no readable result, so nothing was "
      "published", [], ["[FINAL CHECKS]", "add-check", "VERDICT"]),
+    ("STATE: COMPLETE\nVERDICT: PASS\n\n" + MOVED, "",
+     "the work kept changing after the review read it, so nothing was published",
+     ["The review finished 3 times in a row", "reviewed again as it stands"], ["[GATE]", "VERDICT"]),
+    # At the round limit the verdict is a FAIL banked as debt, and the guard stops it the same way: not "rounds ran out".
+    (STALLED_WHY + "\n\n" + MOVED, "",
+     "the work kept changing after the review read it, so nothing was published", [], ["[GATE]", "README"]),
+    ("STATE: COMPLETE\nVERDICT: PASS\n\n" + UNREADABLE, "",
+     "the state of the work could not be read after the review, so nothing was published",
+     ["Someone with access to the server should check", "/continue"], ["/srv/ws", "[GATE]", "acme-platform"]),
 ])
 def test_each_stop_of_the_review_gate_says_what_it_was(w, review_why, note, reason, shown, hidden):
     """`needs-user` is many different stops of Bulava's gate; the ticket names the one the receipt names, with only
@@ -2017,6 +2031,31 @@ def test_each_stop_of_the_review_gate_says_what_it_was(w, review_why, note, reas
     assert all(x in text for x in shown), text
     assert not any(x in text for x in hidden), text
     assert "agent-failed" in w.yt.issue_tags["2-1"] and w.gl.mrs == []
+
+
+LONG_PASS = "STATE: COMPLETE\nVERDICT: PASS\n\n" + "\n".join(
+    f"{i}. [related_improvement] health.txt: note number {i} about the endpoint's wording" for i in range(1, 120))
+
+
+@pytest.mark.parametrize("report,last_run,reason", [
+    (json.dumps({"findings": LONG_PASS + "\n\n" + UNREADABLE}), None,
+     "the state of the work could not be read after the review, so nothing was published"),
+    (json.dumps({"findings": LONG_PASS + "\n\n" + MOVED}), None,
+     "the work kept changing after the review read it, so nothing was published"),
+    (json.dumps({"findings": LONG_PASS + "\n\n" + MOVED}), "run-10", GATE_STOPPED),   # another attempt's report
+    ("{not json", None, GATE_STOPPED),
+    (json.dumps({"findings": "STATE: COMPLETE\nVERDICT: PASS\n\nOther text.\n\n" + MOVED}), None, GATE_STOPPED),
+])
+def test_a_stop_at_acceptance_cut_off_the_receipt_is_read_from_the_attempt_s_review(w, report, last_run, reason):
+    """The gate writes its line at the end of the findings, and the receipt keeps their first 4000 bytes: past that,
+    the line is read from this attempt's `review.json`, and only when it is this attempt's and holds the same review."""
+    _review_stopped(w, "", last_run=last_run)
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"].update(review_why=LONG_PASS.encode()[:4000].decode()))
+    (w.cfg.paths.bulava_state / "runs" / "run-9" / "reports" / "review.json").write_text(report)
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "failed" and task.reason == reason
+    assert "[GATE]" not in "\n".join(w.bot_comments())
 
 
 @pytest.mark.parametrize("ledger,churned", [

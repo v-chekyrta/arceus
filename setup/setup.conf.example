@@ -17,7 +17,7 @@ WORKSPACE_MCP_VERSION=2.3.0
 # /var/lib/arceus/bulava.git), or a branch to follow. To update: `git ls-remote <source> refs/heads/main`,
 # check engine/SERVER.md, re-run setup between tasks (it refuses while a task is running).
 BULAVA_SOURCE=https://github.com/Stepanokdev/bulava
-BULAVA_REF=26983229eecdf92732c9cfbefc6a2bba2b1d88de   # main, 1.20.9 (2026-11-24)
+BULAVA_REF=ade0b7b0146217c28e722029b32c9f47c4357746   # main, 1.20.10 (2026-11-25)
 
 # Python packages of this install's own: a tracker, a code host or an advisory register kept outside this
 # repository (docs/integrations.md), whose module config.yaml names in `type`. Pip requirements separated by

@@ -81,6 +81,10 @@ GATE_WORKER_BLOCKER = "worker blocker finding:"
 GATE_STALLED = "(stalled:"
 GATE_FAIL = "VERDICT: FAIL"
 GATE_VERIFIER = "[VERIFIER OVERRIDE]"
+# Two stops at acceptance, after a PASS (Bulava 1.20.10, guard_block and guard_park_unreadable): the gate appends its line
+# to the end of the findings, so a long review can push it past the 4000 bytes the receipt keeps (_gate_said).
+GATE_MOVED = "[GATE] The review passed, but the work changed after it was read"
+GATE_UNREADABLE = re.compile(r"\[GATE\] The review passed, but the state of .+ could not be read")
 GATE_STOPPED = "the review stopped the work without a decision the runner can act on"  # any other `needs-user`
 STALLED_NUDGE = ("Your previous session stopped at its prompt without finishing the turn, and Bulava parked it. "
                  "Pick the task up from where the work stands: finish it, commit in every repository you "
@@ -882,19 +886,35 @@ class Delivery:
             return False
         return all(r.get("clean") and r.get("base_sha") and r.get("reviewed_sha") == r.get("base_sha") for r in repos)
 
-    def _gate_note(self, receipt: dict, attempts: list[dict]) -> str:
-        """The review gate's notes for this attempt (`runs/<run_id>/reports/blocked.md`), or nothing. The note is
-        read only for the run of the receipt, and only when that is the last attempt's: an earlier attempt's note
-        never stands for this one."""
+    def _run_report(self, receipt: dict, attempts: list[dict], name: str) -> str:
+        """A file the review gate wrote for this attempt (`runs/<run_id>/reports/<name>`), or nothing. It is read only
+        for the run of the receipt, and only when that is the last attempt's: an earlier attempt's file never stands
+        for this one."""
         run_id = str(receipt.get("run_id") or "")
         last = (attempts[-1].get("run_id") if attempts else None) or run_id
         if not run_id or run_id != last or "/" in run_id or run_id.startswith("."):
             return ""
         try:
-            note = self.cfg.paths.bulava_state / "runs" / run_id / "reports" / "blocked.md"
-            return note.read_text(errors="replace")
+            return (self.cfg.paths.bulava_state / "runs" / run_id / "reports" / name).read_text(errors="replace")
         except OSError:
             return ""
+
+    def _gate_note(self, receipt: dict, attempts: list[dict]) -> str:
+        """The review gate's notes for this attempt (`blocked.md`), or nothing."""
+        return self._run_report(receipt, attempts, "blocked.md")
+
+    def _gate_said(self, receipt: dict, attempts: list[dict]) -> str:
+        """The review's findings with the gate's own line at their end: the receipt's `review_why` is the first 4000
+        bytes of them, and when a stop at acceptance is not in it, the whole findings from this attempt's
+        `review.json`. A report that cannot be read, or is another run's, adds nothing."""
+        said = receipt.get("review_why") or ""
+        if GATE_MOVED in said or GATE_UNREADABLE.search(said):
+            return said
+        try:
+            full = json.loads(self._run_report(receipt, attempts, "review.json") or "{}").get("findings")
+        except (ValueError, AttributeError):
+            return said
+        return full if isinstance(full, str) and full.startswith(said[:200]) else said
 
     @staticmethod
     def _spelled_option(task: Task, text: str) -> str:
@@ -934,6 +954,27 @@ class Delivery:
         summary = outcome.get("summary") or ""
         said = receipt.get("review_why") or ""
         # Names and exit codes only: what a check printed stays in the run's own logs on the server.
+        if why == "needs-user":
+            # The review passed, and then the gate would not accept it (hooks/review-gate.sh, guard_before_accept):
+            # this is why the attempt stopped, whatever the findings above that line say.
+            full = self._gate_said(receipt, attempts)
+            if GATE_MOVED in full:
+                n = re.search(r"(\d+) times in a row", full.partition(GATE_MOVED)[2])
+                times = f"{n[1]} times in a row" if n else "several times in a row"
+                return ("the work kept changing after the review read it, so nothing was published",
+                        "\n\n".join(x for x in (
+                            f"The review finished {times}, and each time the branch had moved by the time its verdict "
+                            "was to be acted on: a new commit or a change in the working tree. Something keeps changing "
+                            "the work after the review (the agent, or a process it left running). A `/continue` has "
+                            "the work reviewed again as it stands.", summary) if x))
+            if GATE_UNREADABLE.search(full):
+                return ("the state of the work could not be read after the review, so nothing was published",
+                        "\n\n".join(x for x in (
+                            "The review cannot be shown to cover the work as it is now, and the agent cannot fix "
+                            "that. Someone with access to the server should check that the user Arceus runs as can "
+                            "read the task's repositories with git (objects borrowed from another clone through git "
+                            "alternates are a common cause), then reply `/continue` to have the work reviewed again.",
+                            summary) if x))
         if why == "needs-user" and GATE_FINAL in said:
             # The heavy checks registered with `add-check --final` run once the review accepts the work; they did not
             # pass in this attempt or left nothing readable, and nothing is accepted without them. Their evidence is
