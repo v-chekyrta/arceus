@@ -1023,6 +1023,25 @@ def test_sibling_missing_from_the_group_means_no_push_at_all(w):
     assert any("acme-extra: not one of this task's repositories" in c for c in w.bot_comments())
 
 
+def test_an_unchanged_repository_the_task_was_never_given_does_not_stop_publishing(w):
+    take(w)
+    sha = w.agent_commits()
+    # A repository added to the group after the task was taken, left by another task on its own branch.
+    other = w.cfg.paths.workspace / "acme-extra"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+    git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+    git(other, "checkout", "-q", "-b", "agent/ACME-9-other")
+    base = git(other, "rev-parse", "HEAD")
+    extra = {"path": str(other), "branch": "agent/ACME-9-other", "base_sha": base, "reviewed_sha": base,
+             "clean": True}
+    w.settle("ACME-1", "waiting_review")
+    w.set_engine(lambda s: s["tasks"]["ACME-1"]["receipt"]["repos"].append(extra))
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "code_review" and w.remote_branch(task.branch) == sha and len(w.gl.mrs) == 1
+    assert [e["repo"] for e in w.events_named("foreign_repo_unchanged")] == [str(other)]
+
+
 def test_mr_closed_by_a_person_after_a_crash_is_not_recreated(w):
     take(w)
     w.agent_commits()

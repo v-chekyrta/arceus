@@ -187,6 +187,13 @@ class Publisher:
                 problems.append(f"{name}: outside the workspace")
                 continue
             if path not in mine:
+                reviewed, base = r.get("reviewed_sha") or "", r.get("base_sha") or ""
+                if reviewed and reviewed == base:
+                    # A clone the task was never given (one added to the group after the task was taken, or another
+                    # task's) that this task did not change: nothing of it would be published.
+                    self.events.emit("foreign_repo_unchanged", task_id=task.task_id, repo=name,
+                                     branch=r.get("branch"), sha=reviewed)
+                    continue
                 problems.append(f"{name}: not one of this task's repositories")
                 continue
             seen.add(path)
