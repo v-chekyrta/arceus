@@ -29,11 +29,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from arceus_runner import materials, replies
-from arceus_runner.db import ReviewStore, Signal, Task
+from arceus_runner.db import REVIEW_UNDER_WAY, ReviewStore, Signal, Task
 from arceus_runner.engine import EngineError
 from arceus_runner.gitops import GitError
 from arceus_runner.http import BadRequest, NotFound, ServiceError
@@ -184,6 +184,43 @@ class ReviewLoop:
         if self.d.reviewer and only is None:
             # MRs a review judged, of tickets the runner let go of: a merge after them is still checked.
             self.d.reviewer.watch_merges()
+        if only is None:
+            self.watch_failed()
+
+    def watch_failed(self) -> None:
+        """A failed task whose MRs people merged anyway is done, as if they had been merged from Code Review: its
+        branches, notes and containers are then over for cleanup at once, not kept for a `/continue` nobody needs.
+        Only within `continue_window` (later the task is over for cleanup anyway), never while a `/review` of the
+        ticket is under way (its own result follows the MRs), and only once no MR is left open."""
+        window = self.cfg.limits.continue_window
+        for task in self.store.tasks("failed"):
+            if task.people_work or task.research or not task.failed_at_ms:
+                continue
+            if self.d.now() - datetime.fromtimestamp(task.failed_at_ms / 1000, UTC) > window:
+                continue
+            mrs = self.store.task_mrs(task.task_id)
+            if not mrs or self.store.reviews(*REVIEW_UNDER_WAY, task_id=task.task_id):
+                continue
+            try:
+                states: dict[str, str] = {}
+                for mr in mrs:
+                    states[mr.repo] = mr.state
+                    if mr.state != "opened":
+                        continue
+                    st = self.host.mr_status(mr.project_id, mr.iid)
+                    if st.state == "opened":
+                        break  # one still open is enough to wait: the rest are read on a later poll
+                    states[mr.repo] = st.state
+                    self.store.update_mr(task.task_id, mr.repo, state=st.state)
+                    self.events.emit("mr_state", task_id=task.task_id, repo=mr.repo, mr_iid=mr.iid, state=st.state)
+                    if st.state == "merged" and self.d.reviewer:
+                        self.d.reviewer.merged_check(task, mr.project_id, mr.iid, st)
+                else:
+                    merged = [m for m in mrs if states[m.repo] == "merged"]
+                    if merged:  # every MR closed and none merged: still a failure, `/continue` picks it up
+                        self._finished(task, merged, [m for m in mrs if states[m.repo] == "closed"])
+            except ServiceError as e:
+                self.events.emit("review_poll_failed", task_id=task.task_id, reason=str(e))
 
     def _watch(self, task: Task) -> bool:
         """Read every MR of the task. False once the task is over (merged, closed, moved on)."""

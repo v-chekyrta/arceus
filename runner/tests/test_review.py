@@ -1679,6 +1679,52 @@ def test_merged_and_closed_mrs_end_the_task(w):
     assert w.gl.mrs[0]["web_url"] in closed and w.gl.mrs[1]["web_url"] not in closed
 
 
+def failed_in_review(w: World) -> None:
+    """ACME-1 with an MR in each repository, failed in Code Review (its review budget ran out)."""
+    two_mrs(w)
+    w.runner.delivery.fail(w.store.task("ACME-1"), "the review rounds allowed for this task are used up")
+    assert w.store.task("ACME-1").state == "failed"
+
+
+def test_a_failed_task_whose_mrs_people_merged_is_done(w):
+    failed_in_review(w)
+    w.gl.mrs[0]["state"] = "merged"
+    w.tick()
+    assert w.store.task("ACME-1").state == "failed"                               # the other one is still open
+    w.gl.mrs[1]["state"] = "merged"
+    w.tick()
+    task = w.store.task("ACME-1")
+    assert task.state == "done" and task.reason == "merge requests merged" and sends(w) == []
+    assert [s.state for s in w.store.task_mrs("ACME-1")] == ["merged", "merged"]
+    assert len([t for t in w.bot_comments() if "All merge requests of this task are merged" in t]) == 1
+    w.tick()
+    assert len(w.events_named("task_merged")) == 1
+
+
+def test_a_failed_task_with_one_mr_merged_and_the_other_closed_is_done(w):
+    failed_in_review(w)
+    w.gl.mrs[0]["state"] = "merged"
+    close(w, 1)
+    w.tick()
+    assert w.store.task("ACME-1").state == "done"
+
+
+def test_a_failed_task_whose_mrs_people_closed_stays_failed(w):
+    failed_in_review(w)
+    close(w, 0)
+    close(w, 1)
+    w.tick()
+    assert w.store.task("ACME-1").state == "failed"                               # `/continue` still picks it up
+
+
+def test_a_failed_task_past_continue_window_is_not_read_any_more(w):
+    failed_in_review(w)
+    w.now += w.cfg.limits.continue_window + timedelta(minutes=1)
+    w.gl.mrs[0]["state"] = w.gl.mrs[1]["state"] = "merged"
+    w.tick()
+    assert w.store.task("ACME-1").state == "failed"
+
+
 def test_every_mr_closed_stops_and_a_continue_does_not_replay_old_comments(w):
     platform_sha, branch = two_mrs(w)
     w.yt.comment("2-1", "j.doe", "I will close both, start over in the theme")

@@ -2,7 +2,7 @@
 
 Agents leave things behind: stopped containers and their test databases, dev servers whose session is gone, files in the repositories, screenshots. A dirty tree also stops the next ticket (`START_REFUSED`). The runner cleans up by rules; nothing an agent or a model says decides what is removed. The rules and their checks are described in full in [`cleanup.py`](../runner/src/arceus_runner/cleanup.py).
 
-**What goes.** Only what belongs to a task that is over: done, stopped by hand, or failed (or stopped as people closed every MR) longer ago than `continue_window`, since `/continue` still needs its branches, notes and containers. A task that waits for an answer, a review or a security reviewer keeps everything, unless `release_after` is set (below). Ownership comes from:
+**What goes.** Only what belongs to a task that is over: done, stopped by hand, or failed (or stopped as people closed every MR) longer ago than `continue_window`, since `/continue` still needs its branches, notes and containers (a failed task whose MRs people then merge is done, so over at once: [task-lifecycle.md](task-lifecycle.md)). A task that waits for an answer, a review or a security reviewer keeps everything, unless `release_after` is set (below). Ownership comes from:
 
 - the label `arceus.task=<KEY>` the agent puts on what it makes outside a compose file ([agent-notes.md](../config/agent-notes.md));
 - the place: `.arceus/media/<KEY>` (after `keep_media`), `.arceus/notes/<KEY>`, `.arceus/replies/<KEY>`, `.arceus/ticket/<KEY>` (after `keep_notes`), the task's branch;
