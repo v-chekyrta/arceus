@@ -33,6 +33,8 @@ step "assistant tests: the chat, Slack, tickets, memory, attachments and its set
   bash -c 'cd assistant && .venv/bin/python -m pytest -q'
 step "setup: running services are enabled for good, so they come back after a reboot" \
   bash setup/tests/test-autostart.sh
+step "setup: the engine is swapped only when no attempt is live, whatever stale records say" \
+  bash setup/tests/test-engine-busy.sh
 step "setup: claude and codex are only the pinned ones, the sign-ins stay" \
   bash setup/tests/test-agent-tools.sh
 step "setup: the agent's Google MCP server is read-only and acts as the service account" \

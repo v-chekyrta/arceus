@@ -378,11 +378,18 @@ check_bulava() {
   fi
   [ "$(stat -c %U "$BULAVA_DIR")" = root ] && [ -z "$(find "$BULAVA_DIR" -perm /022 -not -type l -print -quit)" ]
 }
-# The engine is only ever swapped between tasks (engine/SERVER.md): never under a running attempt.
+# The engine is only ever swapped between tasks (engine/SERVER.md): never under a running attempt. A
+# `running` record whose session is gone (`attempt_live: false`: a reboot, or a QA run stopped with
+# `arceus-runner qa stop`) has nothing under it to swap, and counting it kept the engine from ever
+# being updated. Asked as the server asks it (SUPERVISOR_PROFILE=server: the engine's tmux server).
 running_bulava_tasks() {
   [ -x "$RUN_HOME/.local/bin/night-shift" ] || return 0
-  runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$RUN_HOME/.local/bin/night-shift" task list --json 2>/dev/null \
-    | jq -r '(if type == "array" then . else (.tasks // []) end)[] | select(.state == "running") | .task_id' 2>/dev/null
+  local t ns=(runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" SUPERVISOR_PROFILE=server "$RUN_HOME/.local/bin/night-shift")
+  for t in $("${ns[@]}" task list --json 2>/dev/null \
+      | jq -r '(if type == "array" then . else (.tasks // []) end)[] | select(.state == "running") | .task_id' 2>/dev/null); do
+    # A record that cannot be shown counts as live: better to wait than to swap under an attempt.
+    "${ns[@]}" task show --task-id "$t" --json 2>/dev/null | jq -e '.attempt_live == false' >/dev/null 2>&1 || echo "$t"
+  done
 }
 apply_bulava() {
   bulava_wanted || return 0
