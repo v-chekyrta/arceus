@@ -49,6 +49,8 @@ step "setup: the assistant runs as its project's user, never beside the old bot;
   bash setup/tests/test-assistant.sh
 step "setup: Grafana follows the console's project and never shows another project's history as its own" \
   bash setup/tests/test-observability-project.sh
+step "setup: Prometheus, Loki and Alloy are recreated when their config changes, also one changed under them" \
+  bash setup/tests/test-observability-reload.sh
 if [ -n "$live" ]; then  # the base image and PyPI: the network, so not in --offline
   step "console: the image builds from console/Dockerfile, with the install's own packages, and runs without root, sudo or secrets" \
     bash setup/tests/test-console-image.sh

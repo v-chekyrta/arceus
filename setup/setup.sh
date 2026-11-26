@@ -99,7 +99,8 @@ CONSOLE_USER="$(stat -c %U "$CONSOLE_PROJECT_DIR" 2>/dev/null || true)"
 CONSOLE_HOME="$(getent passwd "$CONSOLE_USER" | cut -d: -f6)"
 CONSOLE_GROUP="$(id -gn "$CONSOLE_USER" 2>/dev/null || true)"
 # Config files mounted into a container one by one, as service:path-inside:file-in-OBS_DIR. An update
-# replaces the file on disk, but the container keeps reading the one it started with.
+# replaces the file on disk, but the container keeps reading the one it started with; and the service reads
+# it only when it starts, so a file changed in place under a running container is not read either.
 OBS_FILE_MOUNTS=(prometheus:/etc/prometheus/prometheus.yml:prometheus.yml loki:/etc/loki/loki.yaml:loki.yaml
                  alloy:/etc/alloy/config.alloy:config.alloy)
 DOCKER_KEY_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
@@ -995,15 +996,20 @@ obs_running() {
   running="$(docker compose --project-directory "$OBS_DIR" ps --status running --format '{{.Service}}' 2>/dev/null)"
   for s in "${OBS_SERVICES[@]}"; do printf '%s\n' "$running" | grep -qx "$s" || return 1; done
 }
-obs_stale_services() {  # services whose container still reads an older copy of its config file
-  local m svc inside file id pid
+obs_stale_services() {  # services that have not read the current copy of their config file
+  local m svc inside file id pid started
   for m in "${OBS_FILE_MOUNTS[@]}"; do
     svc="${m%%:*}"; inside="${m#*:}"; inside="${inside%:*}"; file="${m##*:}"
     id="$(docker compose --project-directory "$OBS_DIR" ps -q "$svc" 2>/dev/null)"
     pid="$([ -z "$id" ] || docker inspect -f '{{.State.Pid}}' "$id" 2>/dev/null)"
     [ -n "$pid" ] && [ "$pid" != 0 ] || continue  # not running: `up -d` starts it with the current file
     # Through the process's own root: `docker cp` would resolve the mount on the host and see the new file.
-    [ "$(sha256sum < "/proc/$pid/root$inside")" = "$(sha256sum < "$OBS_DIR/$file")" ] || printf '%s\n' "$svc"
+    if [ "$(sha256sum < "/proc/$pid/root$inside")" != "$(sha256sum < "$OBS_DIR/$file")" ]; then
+      printf '%s\n' "$svc"; continue
+    fi
+    # The same file, changed after the service started (an older setup.sh wrote it in place): never read.
+    started="$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null)" +%s 2>/dev/null)" || continue
+    [ "$(stat -c %Y "/proc/$pid/root$inside")" -le "$started" ] || printf '%s\n' "$svc"
   done
 }
 obs_render() {
@@ -1050,6 +1056,17 @@ obs_rendered_ok() {
   fi
   rm -rf "$tmp"; return "$ok"
 }
+# Rendered aside, then only what differs is copied in, as a new file: a running container keeps the file it
+# started with and obs_stale_services sees it. Written in place, the container would see the new text that
+# its service never reads, and nothing would restart it. Without -t an unchanged file is not touched.
+obs_install_files() {
+  local stage rc=0
+  stage="$(mktemp -d)"; chmod 755 "$stage"
+  rsync -a --exclude build_dashboards.py "$REPO_DIR/observability/" "$stage/" && obs_render "$stage" \
+    && rsync -rlp --checksum --delete --exclude build_dashboards.py --exclude .env --exclude .source-sha256 \
+         --exclude secrets "$stage/" "$OBS_DIR/" || rc=$?
+  rm -rf "$stage"; return "$rc"
+}
 check_observability() {
   load_console_settings 2>/dev/null || true  # Grafana's sign-in follows the console's; unreadable: as without it
   [ "$(cat "$OBS_DIR/.source-sha256" 2>/dev/null)" = "$(obs_source_hash)" ] || return 1
@@ -1062,9 +1079,7 @@ check_observability() {
 apply_observability() {
   load_console_settings || true
   install -d -m 755 -o root -g root "$OBS_DIR"
-  rsync -a --delete --exclude build_dashboards.py --exclude .env --exclude .source-sha256 --exclude secrets \
-    "$REPO_DIR/observability/" "$OBS_DIR/"
-  obs_render "$OBS_DIR"
+  obs_install_files
   chown -R root:root "$OBS_DIR"; chmod -R go-w "$OBS_DIR"
   put_file "$OBS_DIR/.env" 644 root:root "$(obs_env)" || true
   if [ ! -s "$DATA_DIR/grafana-admin-password" ]; then
