@@ -681,11 +681,181 @@ def test_a_question_for_the_product_owner_goes_to_people_not_to_the_agent(w):
     assert "could not be confirmed" in note and "changes are needed" not in note
     assert "- whether AC4's 'content' includes Asset Library assets: the PO has to say" in note
     assert "- until that is answered, the reviewer cannot say it meets the ticket" in note
-    assert "Sent to the agent" not in note and "Write `/review` on the ticket to review it again." in note
+    assert "Sent to the agent" not in note and "Answer the question in a comment on the ticket first" in note
     assert approve_calls(w) == [] and w.store.review(RID).outcome == "unverified"
     later(w)
     assert sends(w) == [] and w.store.task("ACME-1").state == "code_review"
     assert w.events_named("review_sent_back") == []
+
+
+QUESTION = {"verdict": "unsure", "requirements_met": False,
+            "unsure_because": "AC1 says an admin sets when a link expires, but a link imported from the old service "
+                              "keeps its own expiry, so the setting is ignored. The ticket does not say "
+                              "whether imported links count.",
+            "question": "Should an imported link keep the expiry an admin sets?",
+            "options": ["No: lock the expiry field for imported links", "Yes: the redirect follows the set expiry"]}
+
+
+def ticket_summary(w: World) -> str:
+    [text] = [t for t in w.bot_comments() if "code review of the merge requests" in t]
+    return text
+
+
+def test_the_ticket_leads_with_the_reviewers_question_and_how_to_answer_it(w):
+    """Unsure about a product decision: the person who asked reads the question, the answers on offer and what to do
+    first, then the outcome; the MR note shows the same question above why it was not confirmed."""
+    publish(w)
+    ask(w)
+    write_verdict(w, summary="It does what the ticket asks for new links.", **QUESTION,
+                  findings=[{"severity": "suggestion", "text": "Assert can_copy in the copy test"}])
+    finish(w)
+    text = ticket_summary(w)
+    lines = text.splitlines()
+    assert lines[0].endswith("the code review needs your answer before it can pass the merge requests.")
+    assert lines[2] == "**Question:** Should an imported link keep the expiry an admin sets?"
+    assert "Possible answers:\n- No: lock the expiry field for imported links\n- Yes: the redirect follows the set expiry" \
+        in text
+    assert "Why the reviewer asks: AC1 says an admin sets when a link expires" in text
+    assert ("Answer in a comment on this ticket (not with `/review`): the agent gets it and changes the code if your "
+            "answer needs that. It gets your comment only, not this question, so write the decision in full, not just "
+            'a yes or no. For example: "Should an imported link keep the expiry an admin sets? No: '
+            'lock the expiry field for imported links." Once the agent has answered and the ticket is back in Code Review, '
+            'write `/review` again, also when it changed nothing.') in text
+    assert text.index("Answer in a comment") < text.index("the review could not confirm it") \
+        < text.index("It does what the ticket asks for new links.")
+    assert "Write `/review` again to repeat the review." not in text
+    assert "Each finding and suggestion is on its merge request, in the review's note." in text
+    [note] = review_notes(w)
+    assert "Question for people: Should an imported link keep the expiry an admin sets?" in note
+    assert "- No: lock the expiry field for imported links" in note
+    assert note.index("Question for people:") < note.index("Why:")
+    assert "- AC1 says an admin sets when a link expires" in note and "Assert can_copy" in note
+    assert ("Not approved. Answer the question in a comment on the ticket first; once the agent has "
+                         "answered and the ticket is back in Code Review, write `/review` there again.\n\n"
+                         "Suggestions (not blocking):\n- Assert can_copy in the copy test") in note
+    later(w)
+    assert sends(w) == [] and w.store.task("ACME-1").state == "code_review"
+
+
+def test_a_reason_without_a_separate_question_is_the_question_and_is_kept_whole(w):
+    """An older reviewer writes only `unsure_because`: it heads the ticket as the question, not cut at 800 characters
+    where the answers usually are."""
+    publish(w)
+    ask(w)
+    because = "Whether imported links count for AC1. " + "The redirect reads their own expiry. " * 20 \
+        + "If they do, lock the field; if not, leave it."
+    write_verdict(w, verdict="unsure", requirements_met=False, unsure_because=because)
+    finish(w)
+    text = ticket_summary(w)
+    assert f"**Question:** {because.strip()}" in text and "Why the reviewer asks" not in text
+    assert "if not, leave it." in review_notes(w)[0]
+
+
+def test_options_are_read_defensively(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, verdict="unsure", unsure_because="whether X", question="Should X?",
+                  options=["a", 7, "", "b", "c", "d", "e"])
+    finish(w)
+    text = ticket_summary(w)
+    assert "Possible answers:\n- a\n- b\n- c\n- d\n" in text and "- e" not in text
+    w.yt.comment("2-1", "j.doe", "/review")
+    w.tick()
+    write_verdict(w, "ACME-1.review-2", verdict="unsure", unsure_because="whether X", question="Should X?",
+                  options="pick one")
+    finish(w, "ACME-1.review-2")
+    assert "Possible answers" not in [t for t in w.bot_comments() if "code review" in t][-1]
+
+
+def test_a_run_that_did_not_finish_asks_nobody_its_question(w):
+    """A reviewer that stopped to ask left a verdict it never finished: its question may be half-formed, so the
+    ticket and the note say to repeat the review instead of asking people to decide it."""
+    publish(w)
+    ask(w)
+    write_verdict(w, **QUESTION)
+    finish(w, state="needs_input", question={"id": "q-9", "text": "Which database?", "options": []})
+    text = ticket_summary(w)
+    assert "needs your answer" not in text and "imported link" not in text
+    assert "Write `/review` again to repeat the review." in text
+    [note] = review_notes(w)
+    assert "Question for people" not in note
+    assert "Write `/review` on the ticket to review it again." in note
+
+
+def test_with_no_automatic_fix_round_the_ticket_says_to_ask_for_the_review_again(tmp_path):
+    """A blocker beside the question, but fix rounds are off: nothing goes to the agent by itself, so the ticket
+    says to ask for the review again once the agent has answered."""
+    w = world(tmp_path, fix_rounds=0)
+    publish(w)
+    ask(w)
+    write_verdict(w, **QUESTION, findings=[{"severity": "blocker", **BACKED, "file": "app/roles.py", "line": 7,
+                                            "text": "Teacher is not replaced"}])
+    finish(w)
+    text = ticket_summary(w)
+    assert "Sent to the agent to fix" not in text and "Nothing was sent to the agent" in text
+    assert "Once the agent has answered and the ticket is back in Code Review, write `/review` again" in text
+    later(w)
+    assert sends(w) == []
+
+
+def test_an_answer_after_the_fix_rounds_own_review_is_read_by_the_review_asked_for_next(w):
+    """The fixes went in a round and its own re-review ran before anyone answered, still unsure. Then the person
+    answers, the agent changes nothing and the ticket is back in Code Review: the `/review` the ticket told them to
+    write runs anew on the same commits, since a comment came since, and reads the decision."""
+    publish(w)
+    ask(w)
+    write_verdict(w, **QUESTION, findings=[{"severity": "blocker", **BACKED, "file": "app/roles.py", "line": 7,
+                                            "text": "Teacher is not replaced"}])
+    finish(w)
+    later(w)
+    sha = fix_and_settle(w, outcome="Teacher replaced")
+    w.gl.mrs[0].update(sha=sha, head_pipeline={"id": 91, "status": "success", "sha": sha, "web_url": "https://gl/p/91"})
+    w.tick()
+    w.tick()
+    assert len(reviews(w)) == 2                              # the round's own re-review, asked by the runner
+    write_verdict(w, rid="ACME-1.review-2", **QUESTION)
+    finish(w, rid="ACME-1.review-2")
+    w.yt.comment("2-1", "j.doe", "Should an imported link keep the expiry an admin sets? "
+                                 "Yes: leave the code as it is.")
+    later(w)
+    later(w)
+    assert "Yes: leave the code as it is." in sends(w)[-1]["argv"][-1]
+    w.settle("ACME-1", "waiting_review", outcome={"summary": "Nothing to change: the decision keeps the code"})
+    w.tick()
+    w.tick()
+    assert w.store.task("ACME-1").state == "code_review"
+    ask(w)
+    assert w.store.review("ACME-1.review-3").state != "refused" and len(reviews(w)) == 3
+    assert "Yes: leave the code as it is." in reviews(w)[-1]["argv"][-1]
+
+
+def test_a_question_without_answers_on_offer_asks_for_the_decision_in_full_without_an_example(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, verdict="unsure", unsure_because="whether active users are frozen too")
+    finish(w)
+    text = ticket_summary(w)
+    assert "so write the decision in full, not just a yes or no. Once the agent has answered" in text
+    assert "For example" not in text
+
+
+def test_a_question_beside_a_blocker_is_asked_on_the_ticket_and_goes_to_the_agent_as_left_open(w):
+    publish(w)
+    ask(w)
+    write_verdict(w, **QUESTION, findings=[{"severity": "blocker", **BACKED, "file": "app/roles.py", "line": 7,
+                                            "text": "Teacher is not replaced"}])
+    finish(w)
+    text = ticket_summary(w)
+    assert "**Question:** Should an imported link keep the expiry an admin sets?" in text
+    # The fix round's own re-review may run before anyone answers: the decision is read only on a new request.
+    assert "Sent to the agent to fix (round 1 of 3)" in text
+    assert "Once the agent has answered and the ticket is back in Code Review, write `/review` again" in text
+    [note] = review_notes(w)
+    assert "Left open for a person to decide: Should an imported link" in note
+    later(w)
+    [send] = sends(w)
+    assert ("Left open for people, not for you to decide in code: Should an imported link keep the expiry "
+            "an admin sets? AC1 says") in send["argv"][-1]
 
 
 @pytest.mark.parametrize("finding", [

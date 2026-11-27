@@ -166,6 +166,8 @@ _REVIEW_WORD = re.compile(r"(?:code[ -]?)?review\b", re.IGNORECASE)
 # A link to a merge request (GitLab), a pull request (GitHub, Gitea) or a Bitbucket one, wherever it points.
 _MR_LINK = re.compile(r"https?://[^\s<>()\[\]{}\"'`|]+?/(?:merge_requests|pull|pull-requests)/\d+", re.IGNORECASE)
 
+MAX_OPTIONS = 4                       # answers a reviewer may offer to its question
+
 SCHEMA_EXAMPLE = """\
 {"summary": "Two or three sentences for the ticket.",
  "mrs": [{"mr": "M1", "verdict": "ready", "requirements_met": true, "build": "passed", "tests": "passed",
@@ -361,7 +363,11 @@ def _load_verdict(path: Path, labels: set[str], max_suggestions: int) -> tuple[d
             "tests": e.get("tests") if e.get("tests") in TESTS else "not_run",
             # The commands and what they showed: a careful review lists many, and a note has room for them.
             "checked": _clean(e.get("checked")),
-            "unsure_because": _clean(e.get("unsure_because"), 800),
+            "unsure_because": _clean(e.get("unsure_because"), 1500),
+            # With "unsure", the decision people make and the answers they can pick: the ticket leads with them.
+            "question": _clean(e.get("question"), 500),
+            "options": [o for o in (_clean(x, 400) for x in (e.get("options") if isinstance(e.get("options"), list)
+                                                             else [])) if o][:MAX_OPTIONS],
             "ui": ui or "not_run",
             "ui_checked": _clean(e.get("ui_checked"), 1500),
             "scope": scope[:MAX_ITEMS * 2],
@@ -1192,8 +1198,9 @@ class ReviewAgent:
                       "so in your result." for f in v.get("findings", [])
                       if f.get("severity") == "fit" and _fit_key(mr, f) not in sent]
             items += [f"Note: {r}." for r in mr["reasons"]]
-            if v.get("verdict") == "unsure" and v.get("unsure_because"):
-                items.append(f"Left open for people, not for you to decide in code: {v['unsure_because']} Keep the "
+            if v.get("verdict") == "unsure" and (v.get("question") or v.get("unsure_because")):
+                asked = " ".join(x for x in (v.get("question"), v.get("unsure_because")) if x)
+                items.append(f"Left open for people, not for you to decide in code: {asked} Keep the "
                              "change to what the ticket asks and say in your result what stays open.")
             parts.append(f"{mr['repo']} ({mr['url']}), reviewed at `{mr['sha'][:12]}`:\n"
                          + "\n".join(f"  - {i}" for i in items or ["see the review note on the MR"]))
@@ -1397,6 +1404,8 @@ class ReviewAgent:
                     reasons.append(f"Arceus has no approver account on {self.host.label}, so it cannot approve")
             mrs.append({k: m[k] for k in ("label", "repo", "project_id", "iid", "url", "sha", "target")} | {
                 "kind": kind, "approve": kind == "ready" and not reasons and self.enabled, "reasons": reasons,
+                # A run that did not finish as asked: its question may be half-formed, so nobody is asked it.
+                "partial": bool(fatal),
                 "stale": bool(changed) and kind != "closed",
                 "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci, "not_needed": not_needed})
         return {"off": not self.enabled, "rules": RULES, "mrs": mrs, "summary": verdict.get("summary") or "",
@@ -1851,12 +1860,22 @@ class ReviewAgent:
             elif fits:
                 lines += ["To bring in line with the project (nothing is broken; once the fix rounds are used up "
                           "this no longer holds up the merge):", *(f"- {self._finding(f)}" for f in fits)]
-            if v and v["verdict"] == "unsure" and v["unsure_because"]:
-                lines += ["", f"Left open for a person to decide: {v['unsure_because']}"]
+            if self._question(v):
+                lines += ["", *self._question(v, "Left open for a person to decide:")]
             lines += ["", "Not approved. " + self._sent_back_words(row, task)]
         else:
-            lines += ["Why:", *(f"- {r}" for r in mr["reasons"] or ["the review did not finish"]), "",
-                      f"Not approved. Write `{self.rc.command}` on the ticket to review it again."]
+            asks = not mr.get("partial") and self._question(v)
+            if asks and v.get("question"):
+                lines += [*self._question(v, "Question for people:", why=False), ""]
+            lines += ["Why:", *(f"- {r}" for r in mr["reasons"] or ["the review did not finish"]), ""]
+            if not asks:
+                lines.append(f"Not approved. Write `{self.rc.command}` on the ticket to review it again.")
+            elif task.people_work:
+                lines.append(f"Not approved. Settle the question with the code's author on the ticket, then write "
+                             f"`{self.rc.command}` there again.")
+            else:
+                lines.append(f"Not approved. Answer the question in a comment on the ticket first; once the agent has "
+                             f"answered and the ticket is back in Code Review, write `{self.rc.command}` there again.")
         if outcome == "changes" and mr["reasons"]:
             lines += ["", *(f"Note: {r}." for r in mr["reasons"])]
         if attention and outcome in ("ready", "changes", "unverified"):
@@ -1876,6 +1895,18 @@ class ReviewAgent:
         if suggestions:
             lines += ["", "Suggestions (not blocking):", *(f"- {self._finding(f)}" for f in suggestions)]
         return "\n".join(lines)[:60000]
+
+    @staticmethod
+    def _question(v: dict | None, head: str = "**Question:**", why: bool = True) -> list[str]:
+        """The decision an unsure reviewer leaves to people, the answers it offers, and why it asks."""
+        if not v or v.get("verdict") != "unsure" or not (v.get("question") or v.get("unsure_because")):
+            return []
+        lines = [f"{head} {v.get('question') or v['unsure_because']}"]
+        if v.get("options"):
+            lines += ["", "Possible answers:", *(f"- {o}" for o in v["options"])]
+        if why and v.get("question") and v.get("unsure_because"):
+            lines += ["", f"Why the reviewer asks: {v['unsure_because']}"]
+        return lines
 
     def _fit_kept(self, task: Task, outcome: str) -> str:
         """Why findings of fit stayed on the note instead of going to the agent."""
@@ -1917,7 +1948,32 @@ class ReviewAgent:
                  "changes": "changes are needed before merge",
                  "unverified": "the review could not confirm it",
                  "closed": "merged or closed while the review ran; nothing posted there"}
-        lines = [f"{who}, code review of the merge requests:", ""]
+        # A question only people can answer comes first, with how to answer it: the rest is what they read after.
+        asked = [mr for mr in result["mrs"] if mr["kind"] in ("unverified", "changes") and not mr.get("stale")
+                 and not mr.get("partial") and self._question(mr["verdict"])] if not result.get("stale") else []
+        lines = []
+        if asked:
+            lines += [f"{who}, the code review needs your answer before it can pass the merge requests.", ""]
+            for mr in asked:
+                head = f"**Question ({mr['repo']}):**" if len(result["mrs"]) > 1 else "**Question:**"
+                lines += [*self._question(mr["verdict"], head), ""]
+            if task.people_work:
+                lines += [f"Settle it with the code's author on this ticket, then write `{self.rc.command}` again.", ""]
+            else:
+                # The agent gets the comment alone, never this question: an answer of "No" would tell it nothing.
+                v = asked[0]["verdict"]
+                q = v.get("question") or ""
+                example = (f' For example: "{q} {v["options"][0]}."' if q and v.get("options") else "")
+                # Whether the answer needs a commit, and whether a fix round's own re-review ran before it, the
+                # review reads the decision only when asked after the agent has answered.
+                lines += [f"Answer in a comment on this ticket (not with `{self.rc.command}`): the agent gets it and "
+                          "changes the code if your answer needs that. It gets your comment only, not this question, "
+                          "so write the decision in full, not just a yes or no." + example +
+                          f" Once the agent has answered and the ticket is back in Code Review, write "
+                          f"`{self.rc.command}` again, also when it changed nothing.", ""]
+            lines.append("The code review of the merge requests:")
+        else:
+            lines += [f"{who}, code review of the merge requests:", ""]
         for mr in result["mrs"]:
             lines.append(f"- {mr['repo']}: {words[self._mr_outcome(row, task, mr) if mr['kind'] != 'closed' else 'closed']}"
                          f". {mr['url']}")
@@ -1933,8 +1989,11 @@ class ReviewAgent:
             lines += ["", "What got in the way: " + "; ".join(result["problems"][:5]) + "."]
         if overall == "changes":
             lines += ["", self._sent_back_words(row, task)]
-        elif overall == "unverified":
+        elif overall == "unverified" and not asked:
             lines += ["", f"Write `{self.rc.command}` again to repeat the review."]
+        if any((mr["verdict"] or {}).get("findings") for mr in result["mrs"] if not mr.get("stale")) \
+                and not result.get("stale"):
+            lines += ["", "Each finding and suggestion is on its merge request, in the review's note."]
         return "\n".join(lines)
 
     def _compose(self, row: ReviewRequest, task: Task, issue: IssueDetails, comments: list[Comment],
@@ -2147,6 +2206,11 @@ class ReviewAgent:
                   "- `unsure_because`: with \"unsure\", what you could not tell and why, in a sentence a person can "
                   "check (\"whether the retry is safe: it depends on the payment provider's idempotency, which is "
                   "not in the repository\"); it is the reason the note gives.",
+                  "- `question` and `options`: with \"unsure\", the one decision people have to make, as a question "
+                  "ending in \"?\" that someone who has not read the code can answer (\"Should an imported link keep "
+                  "its own expiry?\"), and 2 to 4 answers they can pick, each saying in a line what the "
+                  "code would then need (\"No: lock the expiry field for imported links\", \"Yes: leave the code as it "
+                  "is\"). The ticket comment starts with them, so the person asked sees what to answer.",
                   "- `requirements_met`: true or false. `build` (passed, failed, not_run) and `tests` (passed, failed, "
                   "failed_before, not_run, none): what you saw yourself.",
                   "- `checked`: the commands you ran and what they showed, in a line or two.",
