@@ -1408,7 +1408,10 @@ class ReviewAgent:
                 "partial": bool(fatal),
                 "stale": bool(changed) and kind != "closed",
                 "risky": risky, "ci": ci, "verdict": v, "in_ci": in_ci, "not_needed": not_needed})
-        return {"off": not self.enabled, "rules": RULES, "mrs": mrs, "summary": verdict.get("summary") or "",
+        # A run that did not finish as asked backs none of its words: its summary may ask people for what it never
+        # settled, so the ticket shows what got in the way instead.
+        return {"off": not self.enabled, "rules": RULES, "mrs": mrs,
+                "summary": "" if verdict.get("fatal") else verdict.get("summary") or "",
                 "problems": verdict.get("problems") or [], "stale": changed or ""}
 
     def _fit_goes_back(self, task: Task, snap: dict | None = None, fits: list[dict] | None = None) -> bool:
@@ -1861,21 +1864,15 @@ class ReviewAgent:
                 lines += ["To bring in line with the project (nothing is broken; once the fix rounds are used up "
                           "this no longer holds up the merge):", *(f"- {self._finding(f)}" for f in fits)]
             if self._question(v):
-                lines += ["", *self._question(v, "Left open for a person to decide:")]
+                lines += ["", *self._question(v, "Left open for a person to decide:"), "", self._answer_words(task)]
             lines += ["", "Not approved. " + self._sent_back_words(row, task)]
         else:
             asks = not mr.get("partial") and self._question(v)
             if asks and v.get("question"):
                 lines += [*self._question(v, "Question for people:", why=False), ""]
             lines += ["Why:", *(f"- {r}" for r in mr["reasons"] or ["the review did not finish"]), ""]
-            if not asks:
-                lines.append(f"Not approved. Write `{self.rc.command}` on the ticket to review it again.")
-            elif task.people_work:
-                lines.append(f"Not approved. Settle the question with the code's author on the ticket, then write "
-                             f"`{self.rc.command}` there again.")
-            else:
-                lines.append(f"Not approved. Answer the question in a comment on the ticket first; once the agent has "
-                             f"answered and the ticket is back in Code Review, write `{self.rc.command}` there again.")
+            lines.append("Not approved. " + (self._answer_words(task) if asks else
+                                             f"Write `{self.rc.command}` on the ticket to review it again."))
         if outcome == "changes" and mr["reasons"]:
             lines += ["", *(f"Note: {r}." for r in mr["reasons"])]
         if attention and outcome in ("ready", "changes", "unverified"):
@@ -1895,6 +1892,14 @@ class ReviewAgent:
         if suggestions:
             lines += ["", "Suggestions (not blocking):", *(f"- {self._finding(f)}" for f in suggestions)]
         return "\n".join(lines)[:60000]
+
+    def _answer_words(self, task: Task) -> str:
+        """On the MR's note: the question is answered on the ticket, and the review asked for again after that."""
+        if task.people_work:
+            return (f"Settle the question with the code's author on the ticket, then write `{self.rc.command}` there "
+                    "again.")
+        return ("Answer the question in a comment on the ticket first; once the agent has answered and the ticket is "
+                f"back in Code Review, write `{self.rc.command}` there again.")
 
     @staticmethod
     def _question(v: dict | None, head: str = "**Question:**", why: bool = True) -> list[str]:

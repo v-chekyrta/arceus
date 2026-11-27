@@ -772,10 +772,11 @@ def test_a_run_that_did_not_finish_asks_nobody_its_question(w):
     ticket and the note say to repeat the review instead of asking people to decide it."""
     publish(w)
     ask(w)
-    write_verdict(w, **QUESTION)
+    write_verdict(w, summary="Before merging, answer whether imported links keep their expiry.", **QUESTION)
     finish(w, state="needs_input", question={"id": "q-9", "text": "Which database?", "options": []})
     text = ticket_summary(w)
-    assert "needs your answer" not in text and "imported link" not in text
+    assert "needs your answer" not in text and "imported link" not in text and "Before merging" not in text
+    assert "What got in the way: " in text and "stopped to ask" in text
     assert "Write `/review` again to repeat the review." in text
     [note] = review_notes(w)
     assert "Question for people" not in note
@@ -852,6 +853,8 @@ def test_a_question_beside_a_blocker_is_asked_on_the_ticket_and_goes_to_the_agen
     assert "Once the agent has answered and the ticket is back in Code Review, write `/review` again" in text
     [note] = review_notes(w)
     assert "Left open for a person to decide: Should an imported link" in note
+    assert ("Answer the question in a comment on the ticket first; once the agent has answered and the ticket is "
+            "back in Code Review, write `/review` there again.") in note
     later(w)
     [send] = sends(w)
     assert ("Left open for people, not for you to decide in code: Should an imported link keep the expiry "
