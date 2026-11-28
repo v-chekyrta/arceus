@@ -125,7 +125,7 @@ BULAVA_LINE = (' | json | line_format "{{.kind}}  {{.task_id}}  attempt {{.attem
 # run's journal, the agent's activity, and Bulava's task stream (its `kind` is the event label there).
 PROGRESS_EVENTS = ("task_claimed|task_dispatched|task_published|task_failed|task_done|task_needs_input|"
                    "workspace_.*|repo_cloned|engine_.*|agent_.*|attempt_.*|stalled_nudged|answer_sent|"
-                   "review_.*|qa_.*|arch_.*|dispatch_busy|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|"
+                   "review_.*|qa_.*|arch_.*|dispatch_busy|claim_refused|send_busy|followup_waits|progress_unreadable|pushed|mr_ready|"
                    "created|attempt-started|attempt-ended|stale-verdict")
 PROGRESS_LINE = (' | json | line_format `{{if .kind}}engine {{.kind}}  {{.task_id}}  attempt {{.attempt}}'
                  '{{with .disposition}}  verdict {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}'
@@ -300,7 +300,7 @@ def tasks_dashboard():
                                   '| json reason="reason" [$__range]))', grid(14, 4, 10, 9), ds=LOKI,
               rename={"reason": "Reason", "Value #A": "Tasks", "Value": "Tasks"}, legend="No failures in this period"),
         logs("Task timeline", '{source="runner", event=~"task_.*|pushed|mr_ready|answer_sent|attempt_resumed|'
-                              'trigger_rejected|issue_skipped|notify_pending|reconcile_failed|review_.*|mr_state|'
+                              'trigger_rejected|issue_skipped|notify_pending|reconcile_failed|claim_refused|review_.*|mr_state|'
                               'branch_.*"}' + RUNNER_LINE,
              grid(0, 13, 14, 14), desc="Every step the runner took for tickets, newest first."),
         logs("Engine events", '{source="bulava"}' + BULAVA_LINE, grid(14, 13, 10, 14),

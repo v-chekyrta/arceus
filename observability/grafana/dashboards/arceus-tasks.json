@@ -657,7 +657,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{source=\"runner\", event=~\"task_.*|pushed|mr_ready|answer_sent|attempt_resumed|trigger_rejected|issue_skipped|notify_pending|reconcile_failed|review_.*|mr_state|branch_.*\"} | json | line_format \"{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .stage}}  {{.}} · {{$.state}}{{else}}{{with .state}}  {{.}}{{end}}{{end}}{{with .author}}  by {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{with .note}}  — {{.}}{{end}}{{with .summary}}  «{{.}}»{{end}}{{with .url}}  {{.}}{{end}}\"",
+          "expr": "{source=\"runner\", event=~\"task_.*|pushed|mr_ready|answer_sent|attempt_resumed|trigger_rejected|issue_skipped|notify_pending|reconcile_failed|claim_refused|review_.*|mr_state|branch_.*\"} | json | line_format \"{{.event}}{{with .task_id}}  {{.}}{{end}}{{with .stage}}  {{.}} · {{$.state}}{{else}}{{with .state}}  {{.}}{{end}}{{end}}{{with .author}}  by {{.}}{{end}}{{with .reason}}  — {{.}}{{end}}{{with .note}}  — {{.}}{{end}}{{with .summary}}  «{{.}}»{{end}}{{with .url}}  {{.}}{{end}}\"",
           "datasource": {
             "type": "loki",
             "uid": "loki"

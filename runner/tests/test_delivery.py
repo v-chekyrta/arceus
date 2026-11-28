@@ -203,6 +203,45 @@ def take(w: World, n: int = 1, author: str = "j.doe", summary: str = "Fix login 
     return db_id
 
 
+def test_tracker_refusing_in_progress_is_told_on_the_ticket_and_the_task_waits(w):
+    # A YouTrack workflow rule that wants a field filled; the body is longer than the 500 characters the runner keeps.
+    w.yt.state_rules["In Progress"] = {
+        "error": "Field required",
+        "error_description": "Estimation is required, details: Estimation is a required field. Please fill in.",
+        "error_field": "Estimation", "error_rule_name": "estimation_required", "error_issue_id": "2-1",
+        "error_issue_is_draft": False, "error_transitions": [], "error_original_command": "State In Progress",
+        "error_project_custom_field_id": "97-1", "error_type": "workflow", "error_workflow_type": "require",
+        "padding": "x" * 200}
+    take(w)
+    assert w.store.task("ACME-1").state == "claimed"
+    assert not w.calls("dispatch")
+    [refused] = [t for t in w.bot_comments() if "[arceus:claim-refused:" in t]
+    assert "YouTrack refused to move it to In Progress" in refused
+    assert "> Estimation is required, details: Estimation is a required field. Please fill in." in refused
+    assert not any("[arceus:claim]" in t for t in w.bot_comments())
+    assert w.events_named("claim_refused") and not w.events_named("reconcile_failed")
+
+    w.tick()  # still refused: told once, still waiting
+    assert [t for t in w.bot_comments() if "[arceus:claim-refused:" in t] == [refused]
+    assert w.store.task("ACME-1").state == "claimed" and not w.calls("dispatch")
+
+    del w.yt.state_rules["In Progress"]  # someone filled in the estimation
+    w.tick()
+    assert w.store.task("ACME-1").state == "dispatched"
+    assert w.yt.issue_fields["2-1"]["State"] == {"name": "In Progress"}
+    assert any("[arceus:claim]" in t for t in w.bot_comments())
+
+
+def test_refusal_words_reads_the_services_message():
+    from arceus_runner.delivery import refusal_words
+    from arceus_runner.http import BadRequest
+    cut = '{"error":"Field required","error_description":"Estimation is \\"required\\".","error_fi'
+    assert refusal_words(BadRequest("youtrack", "x", 400, cut)) == 'Estimation is "required".'
+    assert refusal_words(BadRequest("github", "x", 422, '{"message":"Validation Failed"}')) == "Validation Failed"
+    assert refusal_words(BadRequest("youtrack", "x", 400, "<html>no</html>")) == "<html>no</html>"
+    assert refusal_words(BadRequest("youtrack", "POST /api: HTTP 400", 400)) == "youtrack: POST /api: HTTP 400"
+
+
 def test_ticket_to_merge_request(w):
     take(w)
     task = w.store.task("ACME-1")

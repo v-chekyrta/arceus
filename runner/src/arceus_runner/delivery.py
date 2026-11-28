@@ -14,6 +14,7 @@ missing instead of doing anything twice:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -477,7 +478,8 @@ class Delivery:
             return
         self.publish_files(task, files, fresh=True)
         self._remember_tags(task, tags)
-        self.claim_on_ticket(task)
+        if not self.claim_on_ticket(task):
+            return
         self.dispatch(task, text, clearance)
 
 
@@ -635,8 +637,23 @@ class Delivery:
         left there can never be taken for this run's answer."""
         return self.cfg.paths.workspace.resolve() / ".arceus" / "notes" / task.task_id / f"answer-{run}.md"
 
-    def claim_on_ticket(self, task: Task) -> None:
-        self.tracker.set_state(task.issue_db_id, self.cfg.tracker.states.in_progress)
+    def claim_on_ticket(self, task: Task) -> bool:
+        """The ticket shows the agent took it. False when the tracker refuses In Progress (a workflow rule that wants
+        a field filled first): the ticket is told why once per refusal, and the task waits, claimed, for the next
+        look; the agent does not start on a ticket its tracker says may not be started yet."""
+        state = self.cfg.tracker.states.in_progress
+        try:
+            self.tracker.set_state(task.issue_db_id, state)
+        except BadRequest as e:
+            words = refusal_words(e)
+            self.events.emit("claim_refused", task_id=task.task_id, state=state, reason=str(e))
+            self.comment_once(task, f"claim-refused:{hashlib.sha256(words.encode()).hexdigest()[:12]}",
+                              f"The agent cannot start on this ticket yet: {self.tracker.label} refused to move it "
+                              f"to {state}.\n\n" + "\n".join(f"> {line}" for line in words.splitlines()) +
+                              f"\n\nOnce the ticket can be moved to {state} (as a rule, by filling in what "
+                              f"{self.tracker.label} asks for above), the agent starts at the runner's next look. "
+                              "Nothing else is needed.")
+            return False
         try:
             self.tracker.assign_to_bot(task.issue_db_id)
         except BadRequest as e:
@@ -647,11 +664,12 @@ class Delivery:
                                              f"{n} {'repository' if n == 1 else 'repositories'} of "
                                              f"{self.host.scope_kind} `{self.host.scope}` and answers here. No merge "
                                              "request will be opened.")
-            return
+            return True
         self.comment_once(task, "claim", f"The agent has taken this ticket: branch `{task.branch}` in the "
                                          f"{n} {'repository' if n == 1 else 'repositories'} of "
                                          f"{self.host.scope_kind} `{self.host.scope}`. It decides which of them "
                                          "the ticket needs; merge requests will appear wherever it changes something.")
+        return True
 
     def dispatch(self, task: Task, text: str, clearance) -> None:
         # Message ids keep the `yt-` prefix they had before trackers were pluggable: the engine dedups by them.
@@ -1918,3 +1936,26 @@ class Delivery:
                 self.events.emit("media_skipped", task_id=task.task_id, detail=f"{m.path.name} on the ticket: {e}")
                 continue
             self.store.action_done(key)
+
+
+def refusal_words(e: ServiceError) -> str:
+    """What a service said when it refused a request, for people: the message in its JSON body (YouTrack's
+    `error_description`, a `message` or an `error`), else the body, else the error. The body is only its start
+    (http.py keeps 500 characters), so a cut-off JSON is read for the message too."""
+    body = (e.body or "").strip()
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    for key in ("error_description", "message", "error"):
+        if isinstance(data, dict):
+            value = data.get(key)
+        else:
+            m = re.search(rf'"{key}"\s*:\s*("(?:[^"\\]|\\.)*")', body)
+            try:
+                value = json.loads(m.group(1)) if m else None
+            except ValueError:
+                value = None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return body or str(e)

@@ -31,6 +31,7 @@ class FakeYouTrack:
         self.files: dict[str, list[dict]] = {}  # issue db id -> every attachment as /attachments lists it, with "data"
         self.prefix = ""  # the installation's path, as YouTrack puts it into an attachment's url ("/youtrack")
         self.reactions: dict[str, list[dict]] = {}  # comment id -> reactions as YouTrack lists them
+        self.state_rules: dict[str, dict] = {}  # state -> the 400 body a workflow rule answers a move into it with
 
     def attach(self, db_id: str, author: str, name: str, data: bytes, comment_id: str | None = None, *,
                mime: str = "", size: int | None = None, **extra) -> str:
@@ -70,6 +71,8 @@ class FakeYouTrack:
                 for f in json.loads(request.content)["customFields"]:
                     if f["name"] == "State" and f["value"]["name"] not in self.states:  # as YouTrack answers it
                         return json_response({"error": "bad request", "error_description": "Unknown state"}, 400)
+                    if f["name"] == "State" and f["value"]["name"] in self.state_rules:
+                        return json_response(self.state_rules[f["value"]["name"]], 400)
                 for f in json.loads(request.content)["customFields"]:
                     self.issue_fields.setdefault(db_id, {})[f["name"]] = f["value"]
                 return json_response({"id": db_id})
