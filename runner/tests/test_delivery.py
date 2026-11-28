@@ -1990,7 +1990,7 @@ def _review_stopped(w, note: str, run_id: str = "run-9", last_run: str | None = 
 
 
 def test_a_review_that_stops_for_a_person_asks_on_the_ticket_and_a_plain_reply_goes_on(w):
-    """GH-914: every reviewer that stopped the work asked for a decision. The ticket gets what they asked as a
+    """Every reviewer that stopped the work asked for a decision. The ticket gets what they asked as a
     question with the needs-input tag, not a failure; a plain reply from an allowed person starts the next round."""
     _review_stopped(w, "\n## 2026-11-16 17:40:00 — session s-0\nReviewer unreachable once.\n" + TEAM_BLOCKED)
     w.tick()
@@ -2309,7 +2309,7 @@ def test_an_earlier_attempt_s_block_never_stands_for_this_one(w):
 
 
 def test_a_stop_without_a_question_says_nothing_is_published_and_what_is_needed(w):
-    """GH-1227: the agent declared `blocked` with no question in words. The ticket said only "the agent needs an
+    """The agent declared `blocked` with no question in words. The ticket said only "the agent needs an
     answer" over its report, and a person redid the work believing the branch was lost."""
     take(w)
     w.set_engine(lambda s: s["tasks"]["ACME-1"].update(
